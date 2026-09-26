@@ -1462,12 +1462,151 @@ def _parse_psi4_precise(text, filename):
     else: sp='HIGHER_ORDER_SADDLE'; rel='UNRELIABLE_FOR_MINIMUM'
     return {'filename':filename,'engine':'Psi4','version':version,'normal_termination':normal,'errors':fatal,'method':method,'basis':basis,'energies':energies,'optimization_energies':opt[-500:],'thermochemistry':tr,'frequencies_cm1':freqs,'imaginary_frequencies_cm1':imag,'stationary_point_status':sp,'thermochemistry_reliability':rel,'ir_spectrum':ir,'tddft_states':td,'orbitals':parse_orbitals(text,'Psi4'),'dipole':parse_dipole(text),'atomic_charges':[],'final_geometry':geometry,'raman_spectrum':[],'system':parse_charge_mult(text),'timings':parse_timings(text,'Psi4')}
 
+def _normalize_analysis_schema(a):
+    """Normalize ORCA/Psi4 parser output to the stable Telegram UI schema.
+
+    ORCA_ENGINE intentionally stores some observables in compact scientific
+    forms (e.g. dipole as a scalar and charge arrays as floats).  The Telegram
+    presentation layer historically expects richer dictionaries.  This adapter
+    is the single compatibility boundary between the scientific parser and UI.
+    """
+    if not isinstance(a, dict):
+        raise TypeError(f"Parser returned {type(a).__name__}, expected dict")
+
+    # Mapping-like sections used by summary/report functions.
+    for key in ('energies','thermochemistry','system','timings'):
+        if not isinstance(a.get(key), dict):
+            a[key] = {}
+
+    # Dipole: ORCA_ENGINE-compatible parser stores magnitude as float.
+    d = a.get('dipole')
+    if isinstance(d, (int, float)):
+        a['dipole'] = {'magnitude_debye': float(d)}
+    elif d is None:
+        a['dipole'] = {}
+    elif not isinstance(d, dict):
+        a['dipole'] = {'raw': str(d)}
+
+    # Geometry must be a list of atom dictionaries.
+    geom = a.get('final_geometry')
+    if not isinstance(geom, list):
+        geom = []
+    clean_geom = []
+    for atom in geom:
+        if isinstance(atom, dict):
+            clean_geom.append(atom)
+        elif isinstance(atom, (list, tuple)) and len(atom) >= 4:
+            clean_geom.append({'element': str(atom[0]), 'x': _float(atom[1]), 'y': _float(atom[2]), 'z': _float(atom[3])})
+    a['final_geometry'] = clean_geom
+    geom = clean_geom
+
+    # Atomic charges: ORCA_ENGINE exposes per-scheme arrays of floats.  Adapt
+    # the selected array to UI records while preserving atomic_charge_sets.
+    charges = a.get('atomic_charges')
+    normalized_charges = []
+    if isinstance(charges, list):
+        for i, item in enumerate(charges):
+            if isinstance(item, dict):
+                q = dict(item)
+                q.setdefault('index', i)
+                if 'element' not in q:
+                    q['element'] = geom[i].get('element','?') if i < len(geom) else '?'
+                if 'charge' in q and q['charge'] is not None:
+                    q['charge'] = float(q['charge'])
+                normalized_charges.append(q)
+            elif isinstance(item, (int, float)):
+                normalized_charges.append({
+                    'index': i,
+                    'element': geom[i].get('element','?') if i < len(geom) else '?',
+                    'charge': float(item),
+                })
+    a['atomic_charges'] = normalized_charges
+
+    # Orbitals are always exposed as {orbitals:[...], homo_ev, lumo_ev, gap_ev}.
+    orb = a.get('orbitals')
+    if isinstance(orb, list):
+        orb = {'orbitals': orb}
+    elif not isinstance(orb, dict):
+        orb = {'orbitals': []}
+    arr = orb.get('orbitals')
+    if not isinstance(arr, list):
+        arr = []
+    clean_orbs = []
+    for i, item in enumerate(arr):
+        if isinstance(item, dict):
+            clean_orbs.append(item)
+        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+            clean_orbs.append({'index': i, 'occ': _float(item[0]), 'eh': _float(item[1]), 'ev': _float(item[2])})
+    orb['orbitals'] = clean_orbs
+    a['orbitals'] = orb
+
+    # TD-DFT states must be dictionaries.  Never pass stray scalar values to
+    # spectrum/report code; this also prevents physically impossible negative
+    # sticks from malformed table captures.
+    states = a.get('tddft_states')
+    clean_states = []
+    if isinstance(states, list):
+        for i, item in enumerate(states, 1):
+            if not isinstance(item, dict):
+                continue
+            s = dict(item)
+            nm = _float(s.get('nm'))
+            ev = _float(s.get('ev'))
+            cm1 = _float(s.get('cm1'))
+            fosc = _float(s.get('f'))
+            if nm is None and cm1 and cm1 > 0: nm = 1.0e7 / cm1
+            if nm is None and ev and ev > 0: nm = 1239.841984 / ev
+            if ev is None and cm1 and cm1 > 0: ev = cm1 / 8065.544005
+            if fosc is None or fosc < 0: continue
+            if nm is None or nm <= 0: continue
+            s['state'] = int(s.get('state') or i)
+            s['nm'] = nm
+            s['ev'] = ev
+            if cm1 is not None: s['cm1'] = cm1
+            s['f'] = fosc
+            clean_states.append(s)
+    a['tddft_states'] = clean_states
+
+    # IR/Raman are normalized to (x, intensity) pairs.
+    for key, xkeys, ykeys in (
+        ('ir_spectrum', ('frequency_cm','frequency_cm1','freq','cm1'), ('intensity_km_mol','intensity','t2','activity')),
+        ('raman_spectrum', ('frequency_cm','frequency_cm1','freq','cm1'), ('activity','intensity','raman_activity')),
+    ):
+        data = a.get(key)
+        clean = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    x = next((_float(item.get(k)) for k in xkeys if item.get(k) is not None), None)
+                    y = next((_float(item.get(k)) for k in ykeys if item.get(k) is not None), None)
+                    if x is not None: clean.append((x, 0.0 if y is None else y))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    x, y = _float(item[0]), _float(item[1])
+                    if x is not None: clean.append((x, 0.0 if y is None else y))
+        a[key] = clean
+
+    for key in ('frequencies_cm1','imaginary_frequencies_cm1','optimization_energies'):
+        vals = a.get(key)
+        if not isinstance(vals, list):
+            a[key] = []
+        else:
+            a[key] = [float(v) for v in vals if isinstance(v,(int,float))]
+
+    if not isinstance(a.get('errors'), list):
+        a['errors'] = [] if a.get('errors') is None else [str(a.get('errors'))]
+    return a
+
+
 def parse_output_text(text, filename='calculation.out'):
     eng=detect_engine(text)
-    if eng=='ORCA': return _parse_orca_precise(text,filename)
-    if eng=='Psi4': return _parse_psi4_precise(text,filename)
-    normal,errors=parse_status(text,eng); method,basis=parse_method_basis(text,eng); freqs,ir=parse_frequencies(text,eng)
-    return {'filename':filename,'engine':eng,'version':detect_version(text,eng),'normal_termination':normal,'errors':errors,'method':method,'basis':basis,'energies':parse_energies(text,eng),'optimization_energies':parse_optimization(text,eng),'thermochemistry':parse_thermo(text,eng),'frequencies_cm1':freqs,'imaginary_frequencies_cm1':[x for x in freqs if x<0],'ir_spectrum':ir,'tddft_states':parse_tddft(text,eng),'orbitals':parse_orbitals(text,eng),'dipole':parse_dipole(text),'atomic_charges':parse_atomic_charges(text),'final_geometry':parse_final_geometry(text),'raman_spectrum':parse_raman(text),'system':parse_charge_mult(text),'timings':parse_timings(text,eng)}
+    if eng=='ORCA':
+        result = _parse_orca_precise(text,filename)
+    elif eng=='Psi4':
+        result = _parse_psi4_precise(text,filename)
+    else:
+        normal,errors=parse_status(text,eng); method,basis=parse_method_basis(text,eng); freqs,ir=parse_frequencies(text,eng)
+        result = {'filename':filename,'engine':eng,'version':detect_version(text,eng),'normal_termination':normal,'errors':errors,'method':method,'basis':basis,'energies':parse_energies(text,eng),'optimization_energies':parse_optimization(text,eng),'thermochemistry':parse_thermo(text,eng),'frequencies_cm1':freqs,'imaginary_frequencies_cm1':[x for x in freqs if x<0],'ir_spectrum':ir,'tddft_states':parse_tddft(text,eng),'orbitals':parse_orbitals(text,eng),'dipole':parse_dipole(text),'atomic_charges':parse_atomic_charges(text),'final_geometry':parse_final_geometry(text),'raman_spectrum':parse_raman(text),'system':parse_charge_mult(text),'timings':parse_timings(text,eng)}
+    return _normalize_analysis_schema(result)
 
 def _gaussian_curve(points, xmin=None, xmax=None, sigma=10.0, normalize=True, n=3000):
     import numpy as np
@@ -1992,7 +2131,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v4.4\n\n"
+        "🧪 Computational Chemistry Bot v4.5\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n        • Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
         "• Send .xyz/.allxyz/.gbw before one or several jobs when needed; the same snapshot is available to the whole batch.\n"
@@ -2168,6 +2307,7 @@ def handle_document(message):
         return
 
     bot.reply_to(message,'Supported files: .inp, .dat, .out, .xyz, .allxyz, .gbw')
+
 
 # ==========================================
 # 🚀 Render Port Binding Hack
