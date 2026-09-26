@@ -1,4 +1,4 @@
-# BUILD: v5.6-PSI4-INSTALL-FIX-20260926
+# BUILD: v5.8-ORCAENGINE-BATCH-THERMO-20260926
 import os
 
 # ============================================================
@@ -31,12 +31,13 @@ import tempfile
 import subprocess
 import threading
 import hashlib
+import math
 import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v5.6
+# Chemistry Telegram/Kaggle Bot v5.7
 # ============================================================
 
 
@@ -179,6 +180,9 @@ MAX_TEXT_OUT = 20 * 1024 * 1024
 user_aux_storage = {}
 user_drive_links = {}
 analysis_sessions = {}
+analysis_group_batches = {}
+analysis_group_lock = threading.RLock()
+ANALYSIS_GROUP_DEBOUNCE_SECONDS = 2.5
 # Protect short-lived shared state used by Telegram handler threads.
 session_lock = threading.RLock()
 state_lock = threading.RLock()
@@ -262,9 +266,10 @@ def snapshot_user_job_context(user_id):
 # Shared analyzer source. It is executed locally and injected into Kaggle jobs.
 # ============================================================
 ANALYZER_MODULE_CODE = r'''
-import os, re, math, json, textwrap
+import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
+REPORT_GENERATOR_VERSION = '5.7.0'
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 KB_J_MOL_K = 8.314462618
@@ -922,26 +927,533 @@ def make_plots(a, outdir):
     return made
 
 
+def _report_fmt(v, digits=6, suffix=''):
+    if v is None:
+        return 'N/A'
+    try:
+        v = float(v)
+        if abs(v) >= 1.0e5 or (abs(v) > 0 and abs(v) < 1.0e-4):
+            s = f'{v:.6e}'
+        else:
+            s = f'{v:.{digits}f}'.rstrip('0').rstrip('.')
+        return s + suffix
+    except Exception:
+        return str(v) + suffix
+
+
+def _format_runtime(seconds):
+    if seconds is None:
+        return 'N/A'
+    try:
+        seconds = int(round(float(seconds)))
+    except Exception:
+        return str(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts=[]
+    if d: parts.append(f'{d} d')
+    if h or d: parts.append(f'{h} h')
+    if m or h or d: parts.append(f'{m} min')
+    parts.append(f'{s} s')
+    return ' '.join(parts)
+
+
+def _pdf_sha256(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as fh:
+        for block in iter(lambda: fh.read(1024*1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
 def build_pdf(a, plots, pdf_path):
+    """Create the canonical ChemBot scientific report.
+
+    This function is intentionally shared by Telegram-side .out analysis and
+    the Kaggle runner. Keeping one implementation prevents the two report
+    styles from drifting apart.
+    """
     from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether
-    styles=getSampleStyleSheet(); mono=ParagraphStyle('mono',parent=styles['BodyText'],fontName='Courier',fontSize=7.5,leading=9)
-    doc=SimpleDocTemplate(pdf_path,pagesize=A4,rightMargin=1.4*cm,leftMargin=1.4*cm,topMargin=1.3*cm,bottomMargin=1.3*cm)
-    story=[Paragraph('Computational Chemistry Results Report',styles['Title']),Spacer(1,8),Paragraph(f"File: {a.get('filename','')}",styles['BodyText'])]
-    meta=[['Engine',a.get('engine')],['Version',a.get('version') or 'N/A'],['Status','Normal termination' if a.get('normal_termination') else 'Not confirmed'],['Method',a.get('method') or 'N/A'],['Basis',a.get('basis') or 'N/A']]
-    tab=Table(meta,colWidths=[4*cm,12*cm]); tab.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.25,colors.grey),('BACKGROUND',(0,0),(0,-1),colors.whitesmoke),('VALIGN',(0,0),(-1,-1),'TOP') ])); story += [Spacer(1,10),tab,Spacer(1,12)]
-    sections=[('Summary',section_summary(a)),('Energies',section_energies(a)),('Thermochemistry',section_thermo(a)),('Vibrational analysis',section_vibrations(a)),('TD-DFT / UV-Vis',section_uv(a)),('Orbital energies',section_orbitals(a)),('Structure, charges and dipole',section_structure(a)),('Diagnostics',section_diagnostics(a))]
-    for title,body in sections:
-        if body and not body.startswith('No '):
-            story += [Paragraph(title,styles['Heading2']),Paragraph(body.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('\n','<br/>'),mono),Spacer(1,10)]
-    for title,path in plots.items():
-        if os.path.exists(path):
-            story += [PageBreak(),Paragraph(title.replace('_',' ').title(),styles['Heading2']),Spacer(1,5),Image(path,width=17*cm,height=10.5*cm)]
-    doc.build(story)
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
+        PageBreak, KeepTogether, LongTable, HRFlowable
+    )
+
+    NAVY = colors.HexColor('#17324D')
+    SLATE = colors.HexColor('#4B5D6B')
+    LIGHT = colors.HexColor('#F3F6F8')
+    MID = colors.HexColor('#D9E1E7')
+    GREEN = colors.HexColor('#1F7A4D')
+    RED = colors.HexColor('#A33A32')
+    TEXT = colors.HexColor('#202830')
+
+    styles=getSampleStyleSheet()
+    title_style=ParagraphStyle(
+        'ReportTitle', parent=styles['Title'], fontName='Helvetica-Bold',
+        fontSize=19, leading=22, textColor=NAVY, alignment=TA_LEFT,
+        spaceAfter=4
+    )
+    subtitle_style=ParagraphStyle(
+        'ReportSubtitle', parent=styles['BodyText'], fontName='Helvetica',
+        fontSize=8.5, leading=11, textColor=SLATE, spaceAfter=8
+    )
+    h1=ParagraphStyle(
+        'SectionH1', parent=styles['Heading2'], fontName='Helvetica-Bold',
+        fontSize=12.2, leading=15, textColor=NAVY, spaceBefore=10, spaceAfter=5
+    )
+    h2=ParagraphStyle(
+        'SectionH2', parent=styles['Heading3'], fontName='Helvetica-Bold',
+        fontSize=9.8, leading=12, textColor=SLATE, spaceBefore=6, spaceAfter=4
+    )
+    body=ParagraphStyle(
+        'ReportBody', parent=styles['BodyText'], fontName='Helvetica',
+        fontSize=8.6, leading=11.3, textColor=TEXT
+    )
+    small=ParagraphStyle(
+        'ReportSmall', parent=body, fontSize=7.3, leading=9.3, textColor=SLATE
+    )
+    caption=ParagraphStyle(
+        'FigureCaption', parent=small, fontSize=7.4, leading=9.4,
+        alignment=TA_CENTER, textColor=SLATE, spaceBefore=4, spaceAfter=7
+    )
+    mono=ParagraphStyle(
+        'ReportMono', parent=body, fontName='Courier', fontSize=6.8, leading=8.4
+    )
+
+    filename=str(a.get('filename') or 'calculation.out')
+    engine=str(a.get('engine') or 'Unknown')
+    version=str(a.get('version') or 'N/A')
+    method=str(a.get('method') or 'N/A')
+    basis=str(a.get('basis') or 'N/A')
+    normal=bool(a.get('normal_termination'))
+    status='NORMAL TERMINATION' if normal else 'TERMINATION NOT CONFIRMED'
+
+    doc=SimpleDocTemplate(
+        pdf_path, pagesize=A4,
+        rightMargin=1.45*cm, leftMargin=1.45*cm,
+        topMargin=1.45*cm, bottomMargin=1.45*cm,
+        title='Computational Chemistry Analysis Report',
+        author='ChemBot'
+    )
+
+    def esc(x):
+        return str(x if x is not None else '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+
+    def cell(x, style=body):
+        return Paragraph(esc(x), style)
+
+    def section_title(label):
+        return [Spacer(1,3), Paragraph(label, h1), HRFlowable(width='100%', thickness=0.6, color=MID, spaceAfter=5)]
+
+    def styled_table(rows, widths=None, header=True, font_size=7.7):
+        converted=[]
+        for ridx,row in enumerate(rows):
+            st = small if ridx or not header else ParagraphStyle(
+                'TmpHdr', parent=small, fontName='Helvetica-Bold',
+                textColor=colors.white, fontSize=7.5, leading=9
+            )
+            converted.append([cell(v, st) for v in row])
+        t=LongTable(converted, colWidths=widths, repeatRows=1 if header else 0, hAlign='LEFT')
+        commands=[
+            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('LEFTPADDING',(0,0),(-1,-1),5),
+            ('RIGHTPADDING',(0,0),(-1,-1),5),
+            ('TOPPADDING',(0,0),(-1,-1),3.5),
+            ('BOTTOMPADDING',(0,0),(-1,-1),3.5),
+            ('GRID',(0,0),(-1,-1),0.25,MID),
+            ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
+            ('FONTSIZE',(0,0),(-1,-1),font_size),
+        ]
+        if header:
+            commands += [
+                ('BACKGROUND',(0,0),(-1,0),NAVY),
+                ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+                ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ]
+            first_data=1
+        else:
+            first_data=0
+        for r in range(first_data, len(rows)):
+            if (r-first_data) % 2:
+                commands.append(('BACKGROUND',(0,r),(-1,r),LIGHT))
+        t.setStyle(TableStyle(commands))
+        return t
+
+    def metric_rows():
+        e=a.get('energies',{}) or {}
+        t=a.get('thermochemistry',{}) or {}
+        o=a.get('orbitals',{}) or {}
+        d=a.get('dipole',{}) or {}
+        timing=a.get('timings',{}) or {}
+        vals=[
+            ('Final electronic energy', _report_fmt(e.get('final_energy_hartree'), 10, ' Eh')),
+            ('Gibbs free energy', _report_fmt(t.get('gibbs_hartree'), 10, ' Eh')),
+            ('HOMO', _report_fmt(o.get('homo_ev'), 4, ' eV')),
+            ('LUMO', _report_fmt(o.get('lumo_ev'), 4, ' eV')),
+            ('HOMO-LUMO gap', _report_fmt(o.get('gap_ev'), 4, ' eV')),
+            ('Dipole magnitude', _report_fmt(d.get('magnitude_debye'), 4, ' D')),
+            ('Runtime', _format_runtime(timing.get('wall_seconds'))),
+        ]
+        return [(k,v) for k,v in vals if not v.startswith('N/A')]
+
+    def add_figure(story, key, label, note=None, max_h=10.3*cm):
+        path=plots.get(key)
+        if not path or not os.path.exists(path):
+            return
+        im=Image(path)
+        max_w=17.0*cm
+        scale=min(max_w/float(im.imageWidth), max_h/float(im.imageHeight))
+        im.drawWidth=im.imageWidth*scale
+        im.drawHeight=im.imageHeight*scale
+        story.append(KeepTogether([
+            Spacer(1,5), im,
+            Paragraph(label + (f' {note}' if note else ''), caption)
+        ]))
+
+    def page_frame(canvas, doc_obj):
+        canvas.saveState()
+        w,h=A4
+        canvas.setStrokeColor(MID)
+        canvas.setLineWidth(0.4)
+        canvas.line(doc_obj.leftMargin, h-0.78*cm, w-doc_obj.rightMargin, h-0.78*cm)
+        canvas.setFont('Helvetica', 7)
+        canvas.setFillColor(SLATE)
+        canvas.drawString(doc_obj.leftMargin, h-0.60*cm, 'ChemBot computational chemistry analysis')
+        right=f'{engine} {version}'
+        canvas.drawRightString(w-doc_obj.rightMargin, h-0.60*cm, right[:55])
+        canvas.line(doc_obj.leftMargin, 0.72*cm, w-doc_obj.rightMargin, 0.72*cm)
+        canvas.drawString(doc_obj.leftMargin, 0.45*cm, filename[:68])
+        canvas.drawRightString(w-doc_obj.rightMargin, 0.45*cm, f'Page {doc_obj.page}')
+        canvas.restoreState()
+
+    story=[]
+    story += [
+        Paragraph('Computational Chemistry Analysis Report', title_style),
+        Paragraph(
+            f'<b>File:</b> {esc(filename)} &nbsp;&nbsp; | &nbsp;&nbsp; '
+            f'<b>Report engine:</b> ChemBot {REPORT_GENERATOR_VERSION}',
+            subtitle_style
+        ),
+    ]
+
+    status_color = GREEN if normal else RED
+    status_tab=Table(
+        [[Paragraph(f'<b>{status}</b>', ParagraphStyle(
+            'StatusText', parent=body, fontName='Helvetica-Bold',
+            fontSize=9.2, textColor=colors.white, alignment=TA_CENTER
+        ))]],
+        colWidths=[17.0*cm], rowHeights=[0.70*cm]
+    )
+    status_tab.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,-1),status_color),
+        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('BOX',(0,0),(-1,-1),0,status_color),
+    ]))
+    story += [status_tab, Spacer(1,8)]
+
+    sysinfo=a.get('system',{}) or {}
+    meta_rows=[
+        ['Engine', engine, 'Version', version],
+        ['Method', method, 'Basis', basis],
+        ['Charge', sysinfo.get('charge','N/A'), 'Multiplicity', sysinfo.get('multiplicity','N/A')],
+        ['Atoms', len(a.get('final_geometry',[]) or []) or 'N/A', 'Runtime', _format_runtime((a.get('timings',{}) or {}).get('wall_seconds'))],
+    ]
+    mt=Table([[cell(x, body) for x in r] for r in meta_rows],
+             colWidths=[2.5*cm,6.0*cm,2.5*cm,6.0*cm])
+    mt.setStyle(TableStyle([
+        ('GRID',(0,0),(-1,-1),0.25,MID),
+        ('BACKGROUND',(0,0),(0,-1),LIGHT),
+        ('BACKGROUND',(2,0),(2,-1),LIGHT),
+        ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
+        ('FONTNAME',(0,0),(0,-1),'Helvetica-Bold'),
+        ('FONTNAME',(2,0),(2,-1),'Helvetica-Bold'),
+        ('FONTSIZE',(0,0),(-1,-1),8),
+        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('LEFTPADDING',(0,0),(-1,-1),5),
+        ('TOPPADDING',(0,0),(-1,-1),4),
+        ('BOTTOMPADDING',(0,0),(-1,-1),4),
+    ]))
+    story += [mt]
+
+    story += section_title('Key results')
+    metrics=metric_rows()
+    if metrics:
+        rows=[['Quantity','Value']] + [[k,v] for k,v in metrics]
+        story += [styled_table(rows,[8.5*cm,8.5*cm]), Spacer(1,5)]
+
+    # Calculation quality / frequency diagnostic
+    freqs=[float(x) for x in (a.get('frequencies_cm1',[]) or []) if x is not None]
+    imag_strict=[x for x in freqs if x < -5.0]
+    near_zero=[x for x in freqs if abs(x) < 5.0]
+    positive=[x for x in freqs if x >= 5.0]
+    if freqs:
+        diag_rows=[
+            ['Frequency diagnostic','Value'],
+            ['Normal-mode entries parsed', str(len(freqs))],
+            ['Near-zero modes (|nu| < 5 cm-1)', str(len(near_zero))],
+            ['Imaginary modes (nu < -5 cm-1)', str(len(imag_strict))],
+            ['Positive modes (nu >= 5 cm-1)', str(len(positive))],
+        ]
+        story += [Paragraph(
+            'Frequency counts are reported separately so translational/rotational near-zero entries are not mislabeled as vibrational modes.',
+            small
+        ), Spacer(1,4), styled_table(diag_rows,[11.5*cm,5.5*cm])]
+
+    # Energies and thermochemistry
+    story += section_title('Energetics and thermochemistry')
+    e=a.get('energies',{}) or {}
+    t=a.get('thermochemistry',{}) or {}
+    energy_rows=[['Quantity','Value','Unit']]
+    if e.get('final_energy_hartree') is not None:
+        energy_rows.append(['Final electronic energy', _report_fmt(e['final_energy_hartree'],10), 'Eh'])
+    thermo_map=[
+        ('temperature_K','Temperature','K',4),
+        ('pressure_atm','Pressure','atm',4),
+        ('zpe_hartree','Zero-point energy','Eh',8),
+        ('thermal_energy_correction_hartree','Thermal energy correction','Eh',8),
+        ('enthalpy_correction_hartree','Enthalpy correction','Eh',8),
+        ('gibbs_correction_hartree','Gibbs correction','Eh',8),
+        ('enthalpy_hartree','Total enthalpy','Eh',10),
+        ('gibbs_hartree','Gibbs free energy','Eh',10),
+        ('entropy_J_mol_K','Entropy','J mol-1 K-1',5),
+    ]
+    for key,label,unit,dig in thermo_map:
+        if t.get(key) is not None:
+            energy_rows.append([label,_report_fmt(t[key],dig),unit])
+    if len(energy_rows)>1:
+        story += [styled_table(energy_rows,[9.0*cm,4.5*cm,3.5*cm])]
+    add_figure(story,'optimization','Figure: optimization energy profile. Energies are shown relative to the minimum parsed optimization energy.')
+
+    # Vibrational analysis
+    if freqs or a.get('ir_spectrum') or a.get('raman_spectrum'):
+        story += section_title('Vibrational spectroscopy')
+        vib_rows=[['Metric','Value']]
+        if freqs:
+            vib_rows += [
+                ['Normal-mode entries parsed', str(len(freqs))],
+                ['Near-zero modes (|nu| < 5 cm-1)', str(len(near_zero))],
+                ['Imaginary modes (nu < -5 cm-1)', str(len(imag_strict))],
+                ['Lowest non-zero mode', _report_fmt(min(positive) if positive else None,2,' cm-1')],
+                ['Highest mode', _report_fmt(max(freqs) if freqs else None,2,' cm-1')],
+            ]
+        story += [styled_table(vib_rows,[11.0*cm,6.0*cm])]
+        if imag_strict:
+            story += [Spacer(1,4), Paragraph(
+                '<b>Imaginary frequencies:</b> ' + ', '.join(f'{x:.2f} cm-1' for x in imag_strict[:20]),
+                small
+            )]
+
+        ir=a.get('ir_spectrum',[]) or []
+        ir_clean=[]
+        for pair in ir:
+            try:
+                f=float(pair[0]); inten=abs(float(pair[1] or 0.0))
+            except Exception:
+                continue
+            if f>0:
+                ir_clean.append((f,inten))
+        if ir_clean:
+            ranked=sorted(ir_clean,key=lambda q:q[1],reverse=True)[:12]
+            mx=max([x[1] for x in ir_clean] or [1.0])
+            peak_rows=[['Frequency (cm-1)','Relative intensity (%)']]
+            for f,inten in ranked:
+                peak_rows.append([f'{f:.2f}', f'{100.0*inten/mx:.1f}' if mx>0 else '0.0'])
+            story += [Spacer(1,6), Paragraph('Strongest calculated IR bands',h2),
+                      styled_table(peak_rows,[8.5*cm,8.5*cm])]
+        add_figure(
+            story,'ir',
+            'Figure: simulated FT-IR-like profile.',
+            'The y-axis is a normalized transmittance-like visualization derived from calculated intensities; it is not experimental %T.'
+        )
+        add_figure(story,'raman','Figure: calculated Raman spectrum.')
+
+    # TD-DFT
+    td=a.get('tddft_states',[]) or []
+    if td:
+        story += section_title('Electronic excitations / TD-DFT')
+        rows=[['State','Energy (eV)','Wavelength (nm)','Oscillator strength']]
+        for s in td[:30]:
+            rows.append([
+                s.get('state',''),
+                _report_fmt(s.get('ev'),4),
+                _report_fmt(s.get('nm'),2),
+                _report_fmt(s.get('f'),6),
+            ])
+        story += [styled_table(rows,[2.2*cm,4.2*cm,4.5*cm,6.1*cm])]
+        if len(td)>30:
+            story += [Paragraph(f'First 30 of {len(td)} parsed excited states are shown.', small)]
+        add_figure(story,'uvvis','Figure: simulated UV-Vis spectrum from parsed TD-DFT transitions.')
+
+    # Orbitals
+    orb=a.get('orbitals',{}) or {}
+    arr=orb.get('orbitals',[]) or []
+    if arr or orb.get('homo_ev') is not None:
+        story += section_title('Frontier molecular orbitals')
+        fr=[['Quantity','Energy (eV)']]
+        if orb.get('homo_ev') is not None: fr.append(['HOMO',_report_fmt(orb.get('homo_ev'),5)])
+        if orb.get('lumo_ev') is not None: fr.append(['LUMO',_report_fmt(orb.get('lumo_ev'),5)])
+        if orb.get('gap_ev') is not None: fr.append(['HOMO-LUMO orbital-energy gap',_report_fmt(orb.get('gap_ev'),5)])
+        story += [styled_table(fr,[11.0*cm,6.0*cm])]
+        desc=a.get('conceptual_dft',{}) or {}
+        if desc:
+            drows=[['Conceptual-DFT descriptor','Value']]
+            descriptor_labels=[
+                ('ionization_potential_ev','Ionization potential, I',' eV'),
+                ('electron_affinity_ev','Electron affinity, A',' eV'),
+                ('chemical_hardness_ev','Chemical hardness, eta',' eV'),
+                ('chemical_potential_ev','Chemical potential, mu',' eV'),
+                ('electronegativity_ev','Electronegativity, chi',' eV'),
+                ('chemical_softness_ev','Chemical softness, S',' eV^-1'),
+                ('electrophilicity_index_ev','Electrophilicity index, omega',' eV'),
+                ('electrodonating_power_ev','Electrodonating power, omega-',' eV'),
+                ('electroaccepting_power_ev','Electroaccepting power, omega+',' eV'),
+                ('net_electrophilicity_ev','Net electrophilicity, Delta omega',' eV'),
+            ]
+            for key,label,suffix in descriptor_labels:
+                if desc.get(key) is not None:
+                    drows.append([label,_report_fmt(desc.get(key),6,suffix)])
+            if len(drows)>1:
+                story += [Spacer(1,6),Paragraph('Conceptual DFT descriptors',h2),styled_table(drows,[11.0*cm,6.0*cm]),
+                          Paragraph('Frontier-orbital approximations using the same Koopmans/Parr-Pearson definitions implemented by ORCA_ENGINE.',small)]
+        if arr:
+            occ=[z for z in arr if (z.get('occ') or 0)>1e-8]
+            vir=[z for z in arr if (z.get('occ') or 0)<=1e-8]
+            frontier=(occ[-6:] if occ else []) + (vir[:6] if vir else [])
+            rows=[['Label','Index','Occ.','Energy (Eh)','Energy (eV)']]
+            homo_idx=occ[-1].get('index') if occ else None
+            lumo_idx=vir[0].get('index') if vir else None
+            for z in frontier:
+                idx=z.get('index')
+                if idx==homo_idx: label='HOMO'
+                elif idx==lumo_idx: label='LUMO'
+                elif homo_idx is not None and idx is not None and idx<homo_idx: label=f'HOMO-{homo_idx-idx}'
+                elif lumo_idx is not None and idx is not None and idx>lumo_idx: label=f'LUMO+{idx-lumo_idx}'
+                else: label=''
+                rows.append([label,idx,_report_fmt(z.get('occ'),2),_report_fmt(z.get('eh'),7),_report_fmt(z.get('ev'),5)])
+            story += [Spacer(1,6), Paragraph('Frontier orbital window',h2),
+                      styled_table(rows,[3.0*cm,2.0*cm,2.0*cm,5.0*cm,5.0*cm])]
+        add_figure(
+            story,'orbitals',
+            'Figure: frontier molecular orbital energy levels.',
+            'The HOMO-LUMO value is an orbital-energy difference, not an electronic excitation energy.'
+        )
+
+    # Molecular properties
+    d=a.get('dipole',{}) or {}
+    charges=a.get('atomic_charges',[]) or []
+    geom=a.get('final_geometry',[]) or []
+    if d or charges or geom:
+        story += section_title('Molecular properties')
+        prop=[['Property','Value']]
+        if sysinfo.get('charge') is not None: prop.append(['Total charge',str(sysinfo.get('charge'))])
+        if sysinfo.get('multiplicity') is not None: prop.append(['Multiplicity',str(sysinfo.get('multiplicity'))])
+        if d.get('magnitude_debye') is not None: prop.append(['Dipole magnitude',_report_fmt(d.get('magnitude_debye'),5,' D')])
+        if geom: prop.append(['Atoms in final Cartesian geometry',str(len(geom))])
+        if charges: prop.append(['Atomic charges parsed',str(len(charges))])
+        story += [styled_table(prop,[10.5*cm,6.5*cm])]
+
+    # Diagnostics
+    story += section_title('Diagnostics')
+    errs=a.get('errors',[]) or []
+    diag=[
+        ['Check','Result'],
+        ['Normal termination detected','Yes' if normal else 'No'],
+        ['Process return code',str(a.get('process_returncode','N/A'))],
+        ['Parsed warning/error lines',str(len(errs))],
+        ['Report generator',REPORT_GENERATOR_VERSION],
+    ]
+    story += [styled_table(diag,[11.5*cm,5.5*cm])]
+    if errs:
+        story += [Spacer(1,5), Paragraph('Last detected diagnostic lines',h2)]
+        for line in errs[-12:]:
+            story.append(Paragraph(esc(line), mono))
+
+    # Appendices for full machine-readable details
+    if charges or geom or arr:
+        story.append(PageBreak())
+        story += section_title('Appendix - detailed numerical data')
+
+    if charges:
+        story += [Paragraph('Atomic charges',h2)]
+        rows=[['Index','Atom','Charge']]
+        for x in charges:
+            rows.append([x.get('index',''),x.get('element',''),_report_fmt(x.get('charge'),7)])
+        story += [styled_table(rows,[3.0*cm,4.0*cm,10.0*cm])]
+
+    if geom:
+        story += [Spacer(1,8), Paragraph('Final Cartesian geometry (Angstrom)',h2)]
+        rows=[['Atom','X','Y','Z']]
+        for x in geom:
+            rows.append([
+                x.get('element',''),
+                _report_fmt(x.get('x'),7),
+                _report_fmt(x.get('y'),7),
+                _report_fmt(x.get('z'),7),
+            ])
+        story += [styled_table(rows,[3.0*cm,4.65*cm,4.65*cm,4.65*cm])]
+
+    if arr:
+        story += [Spacer(1,8), Paragraph('Orbital energies - frontier-centered extract',h2)]
+        occ=[z for z in arr if (z.get('occ') or 0)>1e-8]
+        vir=[z for z in arr if (z.get('occ') or 0)<=1e-8]
+        appendix_arr=(occ[-20:] if occ else []) + (vir[:20] if vir else [])
+        rows=[['Index','Spin','Occ.','Energy (Eh)','Energy (eV)']]
+        for z in appendix_arr:
+            rows.append([
+                z.get('index',''), z.get('spin','restricted'),
+                _report_fmt(z.get('occ'),3), _report_fmt(z.get('eh'),8), _report_fmt(z.get('ev'),6)
+            ])
+        story += [styled_table(rows,[2.0*cm,3.5*cm,2.0*cm,4.8*cm,4.8*cm])]
+        if len(arr)>len(appendix_arr):
+            story += [Paragraph(
+                f'This appendix shows {len(appendix_arr)} frontier-centered orbitals out of {len(arr)} parsed orbitals. '
+                'The complete parsed dataset is preserved in analysis.json.',
+                small
+            )]
+
+    doc.build(story, onFirstPage=page_frame, onLaterPages=page_frame)
     return pdf_path
+
+
+def generate_report_bundle(a, outdir, base_name=None):
+    """Canonical report bundle used identically by local Telegram analysis and Kaggle."""
+    os.makedirs(outdir, exist_ok=True)
+    base=(base_name or Path(str(a.get('filename') or 'calculation')).stem).strip() or 'calculation'
+    plots=make_plots(a,outdir)
+    pdf_path=os.path.join(outdir,base+'_analysis_report.pdf')
+    build_pdf(a,plots,pdf_path)
+
+    enriched=dict(a)
+    enriched['report_generator_version']=REPORT_GENERATOR_VERSION
+    analysis_path=os.path.join(outdir,'analysis.json')
+    with open(analysis_path,'w',encoding='utf-8') as fh:
+        json.dump(enriched,fh,indent=2,ensure_ascii=False)
+
+    manifest={
+        'report_generator_version': REPORT_GENERATOR_VERSION,
+        'filename': a.get('filename'),
+        'engine': a.get('engine'),
+        'pdf': os.path.basename(pdf_path),
+        'pdf_sha256': _pdf_sha256(pdf_path),
+        'plots': {k: os.path.basename(v) for k,v in plots.items() if v and os.path.exists(v)},
+    }
+    manifest_path=os.path.join(outdir,'report_manifest.json')
+    with open(manifest_path,'w',encoding='utf-8') as fh:
+        json.dump(manifest,fh,indent=2,ensure_ascii=False)
+
+    return {
+        'plots':plots,
+        'pdf':pdf_path,
+        'analysis_json':analysis_path,
+        'manifest':manifest_path,
+        'version':REPORT_GENERATOR_VERSION,
+    }
+
 '''
 
 # ============================================================
@@ -2026,7 +2538,114 @@ def make_overlay_plot(analyses, kind, outpath, normalize=True, sigma=None):
     plt.close(fig)
     return outpath
 '''
-ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE
+
+# v5.8 analyzer additions
+ANALYZER_V58_PATCH_CODE = r'''def conceptual_dft_descriptors(a):
+    # ORCA_ENGINE-compatible frontier-orbital descriptors.
+    o=(a or {}).get('orbitals',{}) or {}
+    h=o.get('homo_ev'); l=o.get('lumo_ev')
+    try:
+        h=float(h); l=float(l)
+    except Exception:
+        return {}
+    gap=l-h; ip=-h; ea=-l; eta=gap/2.0; mu=(h+l)/2.0
+    out={
+        'ionization_potential_ev': ip,
+        'electron_affinity_ev': ea,
+        'chemical_hardness_ev': eta,
+        'chemical_potential_ev': mu,
+        'electronegativity_ev': -mu,
+        'chemical_softness_ev': (1.0/gap if gap>0 else None),
+        'electrophilicity_index_ev': ((mu*mu)/(2.0*eta) if eta>0 else None),
+        'electrodonating_power_ev': (((3.0*ip+ea)**2)/(16.0*(ip-ea)) if (ip-ea)>0 else None),
+        'electroaccepting_power_ev': (((ip+3.0*ea)**2)/(16.0*(ip-ea)) if (ip-ea)>0 else None),
+    }
+    wp=out.get('electroaccepting_power_ev'); wm=out.get('electrodonating_power_ev')
+    out['net_electrophilicity_ev']=(wp+wm) if wp is not None and wm is not None else None
+    return out
+
+_parse_output_text_v57=parse_output_text
+def parse_output_text(text,filename='output.out'):
+    a=_parse_output_text_v57(text,filename)
+    a['conceptual_dft']=conceptual_dft_descriptors(a)
+    return a
+
+_section_summary_v57=section_summary
+def section_summary(a):
+    base=_section_summary_v57(a)
+    d=a.get('conceptual_dft',{}) or {}
+    extra=[]
+    for k,label in [('ionization_potential_ev','I'),('electron_affinity_ev','A'),('chemical_hardness_ev','eta'),('chemical_softness_ev','S'),('electronegativity_ev','chi'),('chemical_potential_ev','mu'),('electrophilicity_index_ev','omega')]:
+        v=d.get(k)
+        if v is not None:
+            unit=' eV^-1' if k=='chemical_softness_ev' else ' eV'
+            extra.append(f'{label}: {float(v):.6f}{unit}')
+    dip=(a.get('dipole') or {}).get('magnitude_debye') if isinstance(a.get('dipole'),dict) else None
+    if dip is not None: extra.append(f'Dipole moment: {float(dip):.6f} D')
+    return base + ('\n'+'\n'.join(extra) if extra else '')
+
+_section_orbitals_v57=section_orbitals
+def section_orbitals(a):
+    txt=_section_orbitals_v57(a)
+    d=a.get('conceptual_dft',{}) or {}
+    if not d: return txt
+    rows=['','Conceptual DFT descriptors:']
+    mapping=[('ionization_potential_ev','Ionization potential I','eV'),('electron_affinity_ev','Electron affinity A','eV'),('chemical_hardness_ev','Chemical hardness eta','eV'),('chemical_potential_ev','Chemical potential mu','eV'),('electronegativity_ev','Electronegativity chi','eV'),('chemical_softness_ev','Chemical softness S','eV^-1'),('electrophilicity_index_ev','Electrophilicity index omega','eV'),('electrodonating_power_ev','Electrodonating power omega-','eV'),('electroaccepting_power_ev','Electroaccepting power omega+','eV'),('net_electrophilicity_ev','Net electrophilicity Delta omega','eV')]
+    for k,label,unit in mapping:
+        if d.get(k) is not None: rows.append(f'{label}: {float(d[k]):.8f} {unit}')
+    return txt+'\n'+'\n'.join(rows)
+
+_make_plots_v57=make_plots
+def make_plots(a,outdir):
+    made=_make_plots_v57(a,outdir)
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    o=(a.get('orbitals') or {}).get('orbitals',[]) or []
+    cleaned=[z for z in o if z.get('ev') is not None]
+    occ=[z for z in cleaned if (z.get('occ') or 0.0)>1e-8]
+    vir=[z for z in cleaned if (z.get('occ') or 0.0)<=1e-8]
+    if not occ or not vir: return made
+    show_occ=occ[-4:]; show_vir=vir[:4]; homo=occ[-1]; lumo=vir[0]
+    p=os.path.join(outdir,'orbital_energies.png')
+    fig,ax=plt.subplots(figsize=(7.4,6.4))
+    # Deliberately omit raw orbital indices from the figure. They remain in the PDF table.
+    def _label_positions(levels,min_sep=0.16):
+        vals=[float(z['ev']) for z in levels]
+        if not vals: return []
+        order=sorted(range(len(vals)),key=lambda i: vals[i])
+        placed=[None]*len(vals); last=None
+        for idx in order:
+            y=vals[idx]
+            if last is not None and y-last<min_sep: y=last+min_sep
+            placed[idx]=y; last=y
+        return placed
+    occ_text_y=_label_positions(show_occ)
+    vir_text_y=_label_positions(show_vir)
+    for i,z in enumerate(show_occ):
+        y=float(z['ev']); n=len(show_occ)-1-i; label='HOMO' if n==0 else f'HOMO-{n}'
+        ax.hlines(y,-0.34,-0.08,lw=2.5 if n==0 else 1.35)
+        ax.annotate(label,xy=(-0.34,y),xytext=(-0.41,occ_text_y[i]),ha='right',va='center',fontsize=8,
+                    arrowprops=dict(arrowstyle='-',lw=.45,shrinkA=1,shrinkB=1))
+    for i,z in enumerate(show_vir):
+        y=float(z['ev']); label='LUMO' if i==0 else f'LUMO+{i}'
+        ax.hlines(y,0.08,0.34,lw=2.5 if i==0 else 1.35)
+        ax.annotate(label,xy=(0.34,y),xytext=(0.41,vir_text_y[i]),ha='left',va='center',fontsize=8,
+                    arrowprops=dict(arrowstyle='-',lw=.45,shrinkA=1,shrinkB=1))
+    yh=float(homo['ev']); yl=float(lumo['ev']); gap=yl-yh
+    ax.annotate('',xy=(0.0,yl),xytext=(0.0,yh),arrowprops=dict(arrowstyle='<->',lw=1.1))
+    ax.text(0.025,(yh+yl)/2.0,f'gap = {gap:.2f} eV',va='center',ha='left',fontsize=8.5)
+    ys=[float(z['ev']) for z in show_occ+show_vir]; ymin,ymax=min(ys),max(ys); pad=max(.5,.1*(ymax-ymin if ymax>ymin else 1))
+    ax.set_xlim(-.62,.62); ax.set_ylim(ymin-pad,ymax+pad)
+    ax.set_xticks([-0.21,0.21]); ax.set_xticklabels(['Occupied','Virtual'])
+    ax.set_ylabel('Orbital energy (eV)'); ax.set_title('Frontier molecular orbital energy levels')
+    ax.grid(axis='y',alpha=.12)
+    fig.tight_layout(); fig.savefig(p,dpi=600,bbox_inches='tight'); plt.close(fig)
+    made['orbitals']=p
+    return made
+'''
+
+ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE + "\n" + ANALYZER_V58_PATCH_CODE
 
 exec(ANALYZER_MODULE_CODE, globals())
 
@@ -2447,10 +3066,8 @@ try:
     if rc!=0 and not timeout_triggered: send_msg(f'[Kaggle] Program exited with code {rc}. Results will still be analyzed and returned.')
 
     work='analysis_report'; os.makedirs(work,exist_ok=True)
-    plots=make_plots(analysis,work)
-    pdf_path=os.path.join(work,basename+'_analysis_report.pdf')
-    build_pdf(analysis,plots,pdf_path)
-    with open(os.path.join(work,'analysis.json'),'w',encoding='utf-8') as f: json.dump(analysis,f,indent=2,ensure_ascii=False)
+    bundle=generate_report_bundle(analysis,work,basename)
+    plots=bundle['plots']; pdf_path=bundle['pdf']
 
     send_msg('[Analysis]\n'+section_summary(analysis))
     for name,path in plots.items():
@@ -2469,6 +3086,14 @@ try:
                 if os.path.isfile(src):
                     try: shutil.copy2(src,os.path.join(results_dir,os.path.basename(fn)))
                     except Exception: pass
+
+    # Include the exact same canonical report bundle that was sent to Telegram.
+    report_out=os.path.join(results_dir,'analysis_report')
+    os.makedirs(report_out,exist_ok=True)
+    for rp in [bundle.get('pdf'), bundle.get('analysis_json'), bundle.get('manifest')] + list(bundle.get('plots',{}).values()):
+        if rp and os.path.isfile(rp):
+            try: shutil.copy2(rp, os.path.join(report_out, os.path.basename(rp)))
+            except Exception: pass
     archive=shutil.make_archive(('Psi4_Results_' if is_psi4 else 'ORCA_Results_')+basename,'zip',results_dir)
     transfer=send_results_with_fallback(archive,results_dir)
     status='SUCCESS' if (rc==0 and analysis.get('normal_termination')) else ('TIMEOUT' if timeout_triggered else 'FINISHED WITH WARNINGS/ERROR')
@@ -2605,7 +3230,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v5.6 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v5.7 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -2705,11 +3330,13 @@ def create_analysis_session(chat_id, user_id, filename, text):
     sid=uuid.uuid4().hex[:10]
     d=tempfile.mkdtemp(prefix='chembot_analysis_')
     with render_lock:
-        plots=make_plots(a,d)
-        pdf=os.path.join(d,Path(filename).stem+'_analysis_report.pdf')
-        build_pdf(a,plots,pdf)
+        bundle=generate_report_bundle(a,d,Path(filename).stem)
+        plots=bundle['plots']; pdf=bundle['pdf']
     with session_lock:
-        analysis_sessions[sid]={'chat_id':chat_id,'user_id':user_id,'analysis':a,'dir':d,'plots':plots,'pdf':pdf,'created':time.time()}
+        analysis_sessions[sid]={
+            'chat_id':chat_id,'user_id':user_id,'analysis':a,'dir':d,
+            'plots':plots,'pdf':pdf,'bundle':bundle,'created':time.time()
+        }
         # prune old sessions (>6h)
         for old in list(analysis_sessions):
             if time.time()-analysis_sessions[old]['created']>21600:
@@ -2720,38 +3347,160 @@ def create_analysis_session(chat_id, user_id, filename, text):
 
 
 def _recent_analyses(chat_id, user_id, max_age_seconds=600, max_items=10):
-    now = time.time()
+    now=time.time()
     with session_lock:
-        rows = [x for x in analysis_sessions.values() if x.get('chat_id') == chat_id and x.get('user_id') == user_id and now - x.get('created', 0) <= max_age_seconds]
-    rows = sorted(rows, key=lambda x: x.get('created', 0))[-max_items:]
-    return rows
+        rows=[x for x in analysis_sessions.values() if x.get('chat_id')==chat_id and x.get('user_id')==user_id and now-x.get('created',0)<=max_age_seconds]
+    return sorted(rows,key=lambda x:x.get('created',0))[-max_items:]
 
 
-def _auto_send_recent_overlays(chat_id, user_id, current_sid):
-    rows = _recent_analyses(chat_id, user_id, max_age_seconds=600, max_items=10)
-    if len(rows) < 2:
-        return
-    with session_lock:
-        current = analysis_sessions.get(current_sid)
-    if not current:
-        return
-    sent = 0
-    for kind, sigma, label in [('uv', 10.0, 'TD-DFT / UV-Vis'), ('ir', 12.0, 'FT-IR')]:
-        analyses = [r['analysis'] for r in rows if r['analysis'].get('tddft_states' if kind == 'uv' else 'ir_spectrum')]
-        if len(analyses) < 2:
-            continue
-        out = os.path.join(current['dir'], f'auto_overlay_{kind}.png')
-        with render_lock:
-            p = make_overlay_plot(analyses, kind, out, normalize=True, sigma=sigma)
-        if not p:
-            continue
-        names = ', '.join(Path(a.get('filename', 'spectrum')).stem for a in analyses)
-        caption = f'{label} overlay generated automatically from {len(analyses)} parsed output files.\nFiles: {names}'
-        with open(p, 'rb') as f:
-            bot.send_photo(chat_id, f, caption=caption[:1020])
-        sent += 1
-    if sent:
-        bot.send_message(chat_id, 'Overlay figures were generated automatically because multiple output files were uploaded within the recent batch window.')
+def _send_group_overlays(chat_id,sessions,group_id):
+    analyses=[s['analysis'] for s in sessions]; workdir=sessions[-1]['dir']; produced=[]
+    for kind,sigma,label in [('uv',10.0,'TD-DFT / UV-Vis'),('ir',16.0,'FT-IR')]:
+        compatible=[a for a in analyses if a.get('tddft_states' if kind=='uv' else 'ir_spectrum')]
+        if len(compatible)<2: continue
+        out=os.path.join(workdir,f'group_{group_id}_{kind}_overlay.png')
+        with render_lock: path=make_overlay_plot(compatible,kind,out,normalize=True,sigma=sigma)
+        if path:
+            names=', '.join(Path(a.get('filename','spectrum')).stem for a in compatible)
+            with open(path,'rb') as fh: bot.send_photo(chat_id,fh,caption=(f'{label} comparison · {len(compatible)} files\n{names}')[:1024])
+            produced.append(label)
+    return produced
+
+
+def _finalize_analysis_group(key):
+    with analysis_group_lock: batch=analysis_group_batches.pop(key,None)
+    if not batch: return
+    with session_lock: sessions=[analysis_sessions[sid] for sid in batch.get('sids',[]) if sid in analysis_sessions]
+    if not sessions: return
+    rows=['📚 Combined analysis group',f'Files: {len(sessions)}','']
+    for i,s in enumerate(sessions,1):
+        a=s['analysis']; d=a.get('conceptual_dft',{}) or {}; gap=(a.get('orbitals') or {}).get('gap_ev')
+        rows.append(f"{i}. {a.get('filename')} — {a.get('engine')} — {'OK' if a.get('normal_termination') else 'not confirmed'}")
+        if gap is not None:
+            tail=f'gap={gap:.4f} eV'
+            if d.get('electronegativity_ev') is not None: tail+=f"; chi={d['electronegativity_ev']:.4f} eV"
+            rows.append('   '+tail)
+    bot.send_message(batch['chat_id'],'\n'.join(rows)[:3900])
+    produced=_send_group_overlays(batch['chat_id'],sessions,batch['group_id'])
+    if not produced: bot.send_message(batch['chat_id'],'No spectrum type was present in at least two files, so no overlay was generated.')
+    bot.send_message(batch['chat_id'],'Reaction thermodynamics: /reaction A + B -> C + D\nUse .out filename stems as species names.')
+
+
+def _queue_analysis_group(message,sid):
+    gid=getattr(message,'media_group_id',None)
+    if not gid: return False
+    key=(message.chat.id,message.from_user.id,str(gid))
+    with analysis_group_lock:
+        batch=analysis_group_batches.setdefault(key,{'chat_id':message.chat.id,'user_id':message.from_user.id,'group_id':str(gid),'sids':[],'timer':None})
+        if sid not in batch['sids']: batch['sids'].append(sid)
+        if batch.get('timer'):
+            try: batch['timer'].cancel()
+            except Exception: pass
+        timer=threading.Timer(ANALYSIS_GROUP_DEBOUNCE_SECONDS,_finalize_analysis_group,args=(key,)); timer.daemon=True; batch['timer']=timer; timer.start()
+    return True
+
+
+def _parse_reaction_equation(equation):
+    parts=re.split(r'\s*(?:<=>|<->|-->|->|=>|=)\s*',equation.strip())
+    if len(parts)!=2 or not all(parts): raise ValueError('Use reaction syntax: A + 2 B -> C + D')
+    def side(s):
+        out=[]
+        for raw in s.split('+'):
+            raw=raw.strip(); m=re.match(r'^(?:(\d+(?:\.\d+)?)\s*\*?\s*)?(.+?)$',raw)
+            if not m: raise ValueError('Could not parse reaction term: '+raw)
+            out.append((float(m.group(1) or 1.0),m.group(2).strip()))
+        return out
+    return side(parts[0]),side(parts[1])
+
+
+def _reaction_thermo_from_sessions(chat_id,user_id,equation):
+    reactants,products=_parse_reaction_equation(equation)
+    rows=_recent_analyses(chat_id,user_id,max_age_seconds=21600,max_items=50)
+    byname={Path(x['analysis'].get('filename','')).stem.lower():x['analysis'] for x in rows}
+    def resolve(name):
+        key=Path(name).stem.lower()
+        if key not in byname: raise ValueError(f'No parsed output found for {name!r}; upload its .out first.')
+        return byname[key]
+    def delta(getter):
+        total=0.0
+        for coeff,name in products:
+            v=getter(resolve(name));
+            if v is None: return None
+            total+=coeff*v
+        for coeff,name in reactants:
+            v=getter(resolve(name));
+            if v is None: return None
+            total-=coeff*v
+        return total
+    e=delta(lambda a:(a.get('energies') or {}).get('final_energy_hartree'))
+    e0=delta(lambda a: ((a.get('energies') or {}).get('final_energy_hartree')+(a.get('thermochemistry') or {}).get('zpe_hartree')) if (a.get('energies') or {}).get('final_energy_hartree') is not None and (a.get('thermochemistry') or {}).get('zpe_hartree') is not None else None)
+    h=delta(lambda a:(a.get('thermochemistry') or {}).get('enthalpy_hartree'))
+    g=delta(lambda a:(a.get('thermochemistry') or {}).get('gibbs_hartree'))
+    temps=[]
+    for _,name in reactants+products:
+        t=(resolve(name).get('thermochemistry') or {}).get('temperature_K')
+        if t is not None: temps.append(float(t))
+    temp=temps[0] if temps and max(temps)-min(temps)<1e-4 else None
+    conv=HARTREE_TO_KJMOL
+    out={'equation':equation,'delta_e_kj_mol':e*conv if e is not None else None,'delta_e0_kj_mol':e0*conv if e0 is not None else None,'delta_h_kj_mol':h*conv if h is not None else None,'delta_g_kj_mol':g*conv if g is not None else None,'temperature_K':temp}
+    out['delta_s_j_mol_k']=((h-g)*conv*1000.0/temp) if h is not None and g is not None and temp and temp>0 else None
+    if g is not None and temp and temp>0:
+        try: out['keq']=math.exp(-(g*conv*1000.0)/(8.314462618*temp))
+        except OverflowError: out['keq']=float('inf') if g<0 else 0.0
+    else: out['keq']=None
+    species=[resolve(name) for _,name in reactants+products]
+    warnings=[]
+    levels={(a.get('method') or 'N/A',a.get('basis') or 'N/A') for a in species}
+    if len(levels)>1: warnings.append('Mixed levels of theory detected: '+', '.join(f'{m}/{b}' for m,b in sorted(levels)))
+    if any(not a.get('normal_termination') for a in species): warnings.append('At least one participating calculation does not have confirmed normal termination.')
+    if temps and temp is None: warnings.append('Thermochemistry temperatures are not identical across all species; Delta S and K_eq were not evaluated.')
+    def atom_counts(a):
+        counts={}
+        for row in a.get('final_geometry',[]) or []:
+            try: el=str(row[0])
+            except Exception: continue
+            counts[el]=counts.get(el,0.0)+1.0
+        return counts
+    balance={}
+    known=True
+    for sign,terms in [(-1.0,reactants),(1.0,products)]:
+        for coeff,name in terms:
+            counts=atom_counts(resolve(name))
+            if not counts: known=False; continue
+            for el,n in counts.items(): balance[el]=balance.get(el,0.0)+sign*coeff*n
+    imbalance={k:v for k,v in balance.items() if abs(v)>1e-6}
+    if known and imbalance: warnings.append('Reaction is not atom balanced (products-reactants): '+', '.join(f'{k}{v:+g}' for k,v in sorted(imbalance.items())))
+    charges=[]
+    for sign,terms in [(-1.0,reactants),(1.0,products)]:
+        for coeff,name in terms:
+            q=(resolve(name).get('system') or {}).get('charge')
+            if q is None: charges=[]; break
+            charges.append(sign*coeff*float(q))
+    if charges and abs(sum(charges))>1e-6: warnings.append(f'Reaction is not charge balanced (products-reactants): {sum(charges):+g}.')
+    out['warnings']=warnings
+    return out
+
+
+@bot.message_handler(commands=['reaction'])
+def reaction_command(message):
+    if not authorized(message): return
+    equation=(message.text or '').partition(' ')[2].strip()
+    if not equation:
+        bot.reply_to(message,'Usage: /reaction A + B -> C + D\nNames must match uploaded .out filename stems.'); return
+    try:
+        r=_reaction_thermo_from_sessions(message.chat.id,message.from_user.id,equation)
+        lines=[f"Reaction: {r['equation']}"]
+        for k,label in [('delta_e_kj_mol','Delta Eel'),('delta_e0_kj_mol','Delta(Eel+ZPE)'),('delta_h_kj_mol','Delta H'),('delta_g_kj_mol','Delta G')]:
+            lines.append(f"{label}: {r[k]:.3f} kJ mol^-1" if r.get(k) is not None else f'{label}: unavailable')
+        lines.append(f"Delta S: {r['delta_s_j_mol_k']:.3f} J mol^-1 K^-1" if r.get('delta_s_j_mol_k') is not None else 'Delta S: unavailable')
+        if r.get('temperature_K') is not None: lines.append(f"T: {r['temperature_K']:.2f} K")
+        if r.get('keq') is not None: lines.append(f"K_eq: {r['keq']:.6e}")
+        if r.get('warnings'):
+            lines.append('Warnings:')
+            lines.extend('• '+w for w in r['warnings'])
+        lines.append('Use mutually consistent levels of theory and thermochemical conditions across all species.')
+        bot.reply_to(message,'\n'.join(lines))
+    except Exception as exc: bot.reply_to(message,'Reaction thermodynamics error: '+str(exc))
 
 
 @bot.message_handler(commands=['start'])
@@ -2762,7 +3511,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v5.6\n"
+        "🧪 Computational Chemistry Bot v5.8\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
@@ -2779,7 +3528,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v5.6-PSI4-INSTALL-FIX-20260926\n'
+        'ChemBot build: v5.8-ORCAENGINE-BATCH-THERMO-20260926\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -2896,7 +3645,8 @@ def handle_document(message):
                 return
             bot.reply_to(message,f'🔬 {detected_engine} output detected. Parsing scientific results and generating figures/PDF...')
             sid,a=create_analysis_session(chat_id,uid,original_name,text)
-            bot.send_message(chat_id,section_summary(a),reply_markup=out_menu(sid,a))
+            if not _queue_analysis_group(message,sid):
+                bot.send_message(chat_id,section_summary(a),reply_markup=out_menu(sid,a))
         except Exception as e:
             import traceback
             print('Direct .out analysis failure for', original_name)
@@ -3089,7 +3839,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v5.6 webhook mode active on port {port}.")
+    print(f"CHEMBOT v5.7 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -3130,7 +3880,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v5.6 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v5.7 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
@@ -3138,7 +3888,7 @@ def run_polling():
             raise RuntimeError(
                 "Telegram 409 conflict: another process is already polling this bot token. "
                 "Stop the other local/Render bot instance, or deploy ChemBot as a Render Web Service "
-                "so v5.6 uses webhook mode."
+                "so v5.7 uses webhook mode."
             ) from exc
         raise
 
