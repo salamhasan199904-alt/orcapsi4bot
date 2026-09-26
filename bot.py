@@ -651,7 +651,7 @@ def make_plots(a, outdir):
             ymax = rel.max() if rel.size else 1.0
             pad = max(1.0, 0.05 * (ymax - ymin if ymax > ymin else 1.0))
             ax.set_ylim(max(-pad, ymin - pad), ymax + pad)
-            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['optimization']=p
+            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['optimization']=p
 
     ir=a.get('ir_spectrum',[])
     if ir:
@@ -692,7 +692,7 @@ def make_plots(a, outdir):
             ax.set_xlim(hi, lo)
             ax.set_ylim(0, 1.05)
             ax.grid(alpha=.2)
-            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['ir']=p
+            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['ir']=p
 
     states=[s for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
     if states:
@@ -714,7 +714,7 @@ def make_plots(a, outdir):
             ax.set_title('Simulated UV-Vis spectrum (Gaussian broadening)')
             ax.set_ylim(0, 1.05)
             ax.grid(alpha=.2)
-            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['uvvis']=p
+            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['uvvis']=p
 
     raman=a.get('raman_spectrum',[])
     if raman:
@@ -747,7 +747,7 @@ def make_plots(a, outdir):
             ax.set_xlim(hi, lo)
             ax.set_ylim(0, 1.05)
             ax.grid(alpha=.2)
-            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['raman']=p
+            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['raman']=p
 
     o=a.get('orbitals',{}).get('orbitals',[])
     if o:
@@ -755,48 +755,49 @@ def make_plots(a, outdir):
         cleaned=[z for z in o if z.get('ev') is not None]
         occ=[z for z in cleaned if (z.get('occ') or 0.0) > 1e-8]
         vir=[z for z in cleaned if (z.get('occ') or 0.0) <= 1e-8]
-        subset=[]
-        subset.extend(occ[-8:])
-        subset.extend(vir[:8])
+        show_occ = occ[-6:]
+        show_vir = vir[:6]
+        subset = show_occ + show_vir
         if subset:
             ys=[float(z.get('ev')) for z in subset]
-            fig=plt.figure(figsize=(6.6,7)); ax=fig.add_subplot(111)
-            for z in occ[-8:]:
+            fig=plt.figure(figsize=(6.8,7.2)); ax=fig.add_subplot(111)
+            for z in show_occ:
                 yv=float(z.get('ev'))
-                ax.hlines(yv, -0.35, -0.05, lw=1.6)
-            for z in vir[:8]:
+                lw=2.4 if z is occ[-1] else 1.4
+                ax.hlines(yv, -0.34, -0.08, lw=lw)
+            for z in show_vir:
                 yv=float(z.get('ev'))
-                ax.hlines(yv, 0.05, 0.35, lw=1.6)
+                lw=2.4 if z is vir[0] else 1.4
+                ax.hlines(yv, 0.08, 0.34, lw=lw)
             homo = occ[-1] if occ else None
             lumo = vir[0] if vir else None
             if homo is not None:
                 yv=float(homo.get('ev'))
-                ax.hlines(yv, -0.38, -0.02, lw=2.4)
-                ax.text(-0.42, yv, f"HOMO ({homo.get('index')})\n{yv:.2f} eV", ha='right', va='center', fontsize=8)
+                ax.text(-0.39, yv, f"HOMO\n{yv:.2f} eV", ha='right', va='center', fontsize=9)
             if lumo is not None:
                 yv=float(lumo.get('ev'))
-                ax.hlines(yv, 0.02, 0.38, lw=2.4)
-                ax.text(0.42, yv, f"LUMO ({lumo.get('index')})\n{yv:.2f} eV", ha='left', va='center', fontsize=8)
-            # Annotate only a small frontier subset to avoid unreadable overlap.
-            for z in occ[-4:-1]:
+                ax.text(0.39, yv, f"LUMO\n{yv:.2f} eV", ha='left', va='center', fontsize=9)
+            # Minimal, readable annotation for the nearest levels only.
+            for z in show_occ[-3:-1]:
                 yv=float(z.get('ev'))
-                ax.text(-0.02, yv, str(z.get('index')), ha='right', va='center', fontsize=7)
-            for z in vir[1:4]:
+                ax.text(-0.06, yv, str(z.get('index')), ha='right', va='center', fontsize=7)
+            for z in show_vir[1:3]:
                 yv=float(z.get('ev'))
-                ax.text(0.02, yv, str(z.get('index')), ha='left', va='center', fontsize=7)
+                ax.text(0.06, yv, str(z.get('index')), ha='left', va='center', fontsize=7)
             if homo is not None and lumo is not None:
-                gap = float(lumo.get('ev')) - float(homo.get('ev'))
-                ym = (float(lumo.get('ev')) + float(homo.get('ev'))) / 2.0
-                ax.annotate('', xy=(0.0, float(lumo.get('ev'))), xytext=(0.0, float(homo.get('ev'))), arrowprops=dict(arrowstyle='<->', lw=1.2))
-                ax.text(0.03, ym, f'Gap = {gap:.2f} eV', va='center', fontsize=8)
-            ymin=min(ys); ymax=max(ys); pad=max(0.5, 0.08*(ymax-ymin if ymax>ymin else 1.0))
-            ax.set_xlim(-0.55, 0.55)
+                yh=float(homo.get('ev')); yl=float(lumo.get('ev'))
+                gap = yl - yh
+                xgap = 0.0
+                ax.annotate('', xy=(xgap, yl), xytext=(xgap, yh), arrowprops=dict(arrowstyle='<->', lw=1.2))
+                ax.text(xgap + 0.03, (yl+yh)/2.0, f'ΔE = {gap:.2f} eV', va='center', fontsize=8)
+            ymin=min(ys); ymax=max(ys); pad=max(0.4, 0.10*(ymax-ymin if ymax>ymin else 1.0))
+            ax.set_xlim(-0.5, 0.5)
             ax.set_ylim(ymin-pad, ymax+pad)
             ax.set_xticks([-0.2, 0.2]); ax.set_xticklabels(['Occupied', 'Virtual'])
             ax.set_ylabel('Orbital energy (eV)')
             ax.set_title('Frontier molecular orbital energy levels')
             ax.grid(axis='y',alpha=.15)
-            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['orbitals']=p
+            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['orbitals']=p
     return made
 
 
@@ -1832,29 +1833,76 @@ def _gaussian_curve(points, xmin=None, xmax=None, sigma=10.0, normalize=True, n=
     return grid,yy
 
 def make_overlay_plot(analyses, kind, outpath, normalize=True, sigma=None):
-    import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-    fig=plt.figure(figsize=(10,6)); ax=fig.add_subplot(111); used=0
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig=plt.figure(figsize=(10,6))
+    ax=fig.add_subplot(111)
+    used=0
+
     if kind=='uv':
-        sigma=10.0 if sigma is None else float(sigma); allnm=[]
-        for a in analyses: allnm += [s.get('nm') for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
-        if not allnm: plt.close(fig); return None
-        lo=max(80,min(allnm)-60); hi=min(2500,max(allnm)+60)
+        sigma=10.0 if sigma is None else float(sigma)
+        pts_all=[]
         for a in analyses:
-            pts=[(s.get('nm'),s.get('f')) for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
-            if not pts: continue
-            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=normalize)
-            ax.plot(x,y,lw=1.7,label=Path(a.get('filename','spectrum')).stem); used+=1
-        ax.set_xlabel('Wavelength (nm)'); ax.set_ylabel('Relative intensity' if normalize else 'Oscillator-strength weighted intensity'); ax.set_title(f'TD-DFT / UV-Vis overlay (Gaussian sigma={sigma:g} nm)')
+            pts=[(float(s.get('nm')), max(0.0, float(s.get('f') or 0.0))) for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
+            if pts:
+                pts_all.extend(pts)
+        if not pts_all:
+            plt.close(fig)
+            return None
+        allnm=[p[0] for p in pts_all]
+        lo=max(150.0,min(allnm)-60.0)
+        hi=min(1200.0,max(allnm)+60.0)
+        for a in analyses:
+            pts=[(float(s.get('nm')), max(0.0, float(s.get('f') or 0.0))) for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
+            if not pts:
+                continue
+            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=normalize,n=3000)
+            ax.plot(x,y,lw=1.8,label=Path(a.get('filename','spectrum')).stem)
+            used+=1
+        ax.set_xlim(lo,hi)
+        ax.set_xlabel('Wavelength (nm)')
+        ax.set_ylabel('Relative intensity' if normalize else 'Oscillator-strength weighted intensity')
+        ax.set_title('TD-DFT / UV-Vis overlay')
+        ax.set_ylim(bottom=0)
     else:
         sigma=12.0 if sigma is None else float(sigma)
+        pool=[]
         for a in analyses:
-            pts=[(x,abs(y or 0.0)) for x,y in a.get('ir_spectrum',[]) if x is not None]
-            if not pts: continue
-            x,y=_gaussian_curve(pts,0,4500,sigma=sigma,normalize=normalize,n=4500)
-            ax.plot(x,y,lw=1.6,label=Path(a.get('filename','spectrum')).stem); used+=1
-        ax.set_xlim(4500,0); ax.set_xlabel('Wavenumber (cm$^{-1}$)'); ax.set_ylabel('Relative intensity' if normalize else 'Calculated intensity'); ax.set_title(f'Calculated FT-IR overlay (Gaussian sigma={sigma:g} cm$^{{-1}}$)')
-    if used<2: plt.close(fig); return None
-    ax.legend(fontsize=8); ax.grid(alpha=.2); fig.tight_layout(); fig.savefig(outpath,dpi=240); plt.close(fig); return outpath
+            pts=[(float(x), abs(float(y or 0.0))) for x,y in a.get('ir_spectrum',[]) if x is not None and float(x)>0]
+            if pts:
+                pool.extend(pts)
+        if not pool:
+            plt.close(fig)
+            return None
+        pool_mid=[(f,i) for f,i in pool if 400.0 <= f <= 4000.0]
+        use_pool = pool_mid if pool_mid else pool
+        lo=400.0 if any(400.0 <= f <= 4000.0 for f,_ in use_pool) else max(0.0, min(f for f,_ in use_pool)-80.0)
+        hi=4000.0 if any(400.0 <= f <= 4000.0 for f,_ in use_pool) else max(f for f,_ in use_pool)+80.0
+        for a in analyses:
+            pts=[(float(x), abs(float(y or 0.0))) for x,y in a.get('ir_spectrum',[]) if x is not None and float(x)>0]
+            pts=[(f,i) for f,i in pts if lo <= f <= hi]
+            if not pts:
+                continue
+            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=normalize,n=3600)
+            ax.plot(x,y,lw=1.6,label=Path(a.get('filename','spectrum')).stem)
+            used+=1
+        ax.set_xlim(hi,lo)
+        ax.set_xlabel('Wavenumber (cm$^{-1}$)')
+        ax.set_ylabel('Relative intensity' if normalize else 'Calculated intensity')
+        ax.set_title('Calculated FT-IR overlay')
+        ax.set_ylim(bottom=0)
+    if used<2:
+        plt.close(fig)
+        return None
+    ax.legend(fontsize=8, frameon=False)
+    ax.grid(alpha=.18)
+    fig.tight_layout()
+    fig.savefig(outpath,dpi=300,bbox_inches='tight')
+    plt.close(fig)
+    return outpath
 '''
 ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE
 
@@ -2335,6 +2383,41 @@ def create_analysis_session(chat_id, user_id, filename, text):
                 except Exception: pass
                 analysis_sessions.pop(old,None)
     return sid,a
+
+
+def _recent_analyses(chat_id, user_id, max_age_seconds=600, max_items=10):
+    now = time.time()
+    with session_lock:
+        rows = [x for x in analysis_sessions.values() if x.get('chat_id') == chat_id and x.get('user_id') == user_id and now - x.get('created', 0) <= max_age_seconds]
+    rows = sorted(rows, key=lambda x: x.get('created', 0))[-max_items:]
+    return rows
+
+
+def _auto_send_recent_overlays(chat_id, user_id, current_sid):
+    rows = _recent_analyses(chat_id, user_id, max_age_seconds=600, max_items=10)
+    if len(rows) < 2:
+        return
+    with session_lock:
+        current = analysis_sessions.get(current_sid)
+    if not current:
+        return
+    sent = 0
+    for kind, sigma, label in [('uv', 10.0, 'TD-DFT / UV-Vis'), ('ir', 12.0, 'FT-IR')]:
+        analyses = [r['analysis'] for r in rows if r['analysis'].get('tddft_states' if kind == 'uv' else 'ir_spectrum')]
+        if len(analyses) < 2:
+            continue
+        out = os.path.join(current['dir'], f'auto_overlay_{kind}.png')
+        with render_lock:
+            p = make_overlay_plot(analyses, kind, out, normalize=True, sigma=sigma)
+        if not p:
+            continue
+        names = ', '.join(Path(a.get('filename', 'spectrum')).stem for a in analyses)
+        caption = f'{label} overlay generated automatically from {len(analyses)} parsed output files.\nFiles: {names}'
+        with open(p, 'rb') as f:
+            bot.send_photo(chat_id, f, caption=caption[:1020])
+        sent += 1
+    if sent:
+        bot.send_message(chat_id, 'Overlay figures were generated automatically because multiple output files were uploaded within the recent batch window.')
 
 
 @bot.message_handler(commands=['start'])
