@@ -1,4 +1,4 @@
-# BUILD: v5.5-ORIGINAL-KAGGLE-PUSH-20260926
+# BUILD: v5.6-PSI4-INSTALL-FIX-20260926
 import os
 
 # ============================================================
@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v5.5
+# Chemistry Telegram/Kaggle Bot v5.6
 # ============================================================
 
 
@@ -2256,21 +2256,95 @@ try:
     output_file=basename+'.out'
     if is_psi4:
         send_msg('[Kaggle] Preparing Psi4 environment...')
+
+        PSI4_PREFIX='/kaggle/working/psi4_env'
+
+        def _valid_conda(path):
+            if not path or not os.path.isfile(path):
+                return False
+            try:
+                p=subprocess.run([path,'--version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=20)
+                out=(p.stdout or '').lower()
+                return p.returncode==0 and 'conda' in out
+            except Exception:
+                return False
+
+        def _find_real_conda():
+            # Kaggle commonly ships its real Conda under /opt/conda/bin.
+            # Do NOT trust shutil.which('mamba'): /usr/local/bin/mamba can be
+            # an unrelated Python testing CLI, which caused the previous failure.
+            candidates=[
+                '/opt/conda/bin/conda',
+                '/usr/local/conda/bin/conda',
+                shutil.which('conda'),
+            ]
+            seen=set()
+            for c in candidates:
+                if not c:
+                    continue
+                c=os.path.realpath(c)
+                if c in seen:
+                    continue
+                seen.add(c)
+                if _valid_conda(c):
+                    return c
+            return None
+
+        def _install_psi4_with_conda(conda_exe):
+            # Use an isolated prefix rather than altering Kaggle's base env.
+            # Stable Psi4 1.11 is available for Linux/Python 3.12.
+            packages=['python=3.12','psi4=1.11']
+            for pkg in (PSI4_EXTRAS or []):
+                if pkg not in packages:
+                    packages.append(pkg)
+            cmd_install=[conda_exe,'create','-y','-p',PSI4_PREFIX,'-c','conda-forge']+packages
+            safe_install(cmd_install)
+            return os.path.join(PSI4_PREFIX,'bin','psi4')
+
+        def _install_psi4_standalone():
+            # Official Psi4 standalone installer fallback for Linux x86_64.
+            # It bundles its own Conda/Python, avoiding Kaggle base-env conflicts.
+            url='https://vergil.chemistry.gatech.edu/psicode-download/Psi4conda-1.11-py312-Linux-x86_64.sh'
+            installer='/kaggle/working/Psi4conda-1.11-py312-Linux-x86_64.sh'
+            send_msg('[Kaggle] Conda was not available; using the official Psi4 1.11 standalone installer...')
+            req=urllib.request.Request(url,headers={'User-Agent':'ChemBot/5.6'})
+            with urllib.request.urlopen(req,timeout=1800) as r, open(installer,'wb') as f:
+                shutil.copyfileobj(r,f)
+            if not os.path.exists(installer) or os.path.getsize(installer)<1024*1024:
+                raise RuntimeError('Psi4 standalone installer download failed or was unexpectedly small.')
+            safe_install(['bash',installer,'-b','-p',PSI4_PREFIX])
+            try:
+                os.remove(installer)
+            except OSError:
+                pass
+            conda2=os.path.join(PSI4_PREFIX,'bin','conda')
+            if PSI4_EXTRAS and os.path.isfile(conda2):
+                safe_install([conda2,'install','-y','-p',PSI4_PREFIX,'-c','conda-forge']+list(PSI4_EXTRAS))
+            return os.path.join(PSI4_PREFIX,'bin','psi4')
+
         psi4_exe=shutil.which('psi4')
-        if not psi4_exe:
-            mgr=shutil.which('mamba') or shutil.which('conda')
-            if not mgr:
-                raise RuntimeError('Neither mamba nor conda is available in this Kaggle image, so Psi4 cannot be installed.')
-            safe_install([mgr,'install','-y','-q','-c','conda-forge','psi4'])
-            psi4_exe=shutil.which('psi4')
-        if PSI4_EXTRAS:
-            mgr=shutil.which('mamba') or shutil.which('conda')
-            if not mgr:
-                raise RuntimeError('Psi4 extras were requested but no conda-compatible package manager is available.')
-            safe_install([mgr,'install','-y','-q','-c','conda-forge']+PSI4_EXTRAS)
-        psi4_exe=psi4_exe or shutil.which('psi4')
-        if not psi4_exe:
-            raise RuntimeError('Psi4 installation completed but the psi4 executable was not found on PATH.')
+        if psi4_exe:
+            send_msg('[Kaggle] Existing Psi4 executable found: '+psi4_exe)
+        else:
+            conda_exe=_find_real_conda()
+            if conda_exe:
+                send_msg('[Kaggle] Installing Psi4 1.11 with '+conda_exe+' ...')
+                psi4_exe=_install_psi4_with_conda(conda_exe)
+            else:
+                psi4_exe=_install_psi4_standalone()
+
+        if not os.path.isfile(psi4_exe):
+            raise RuntimeError('Psi4 setup completed but no executable was found at '+str(psi4_exe))
+        try:
+            os.chmod(psi4_exe,0o755)
+        except OSError:
+            pass
+
+        # Smoke-test the exact executable that will run the user's input.
+        probe=subprocess.run([psi4_exe,'--version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=60)
+        if probe.returncode!=0:
+            raise RuntimeError('Psi4 executable failed its version check:\n'+(probe.stdout or '')[-1500:])
+        send_msg('[Kaggle] '+(probe.stdout or 'Psi4 ready').strip().splitlines()[0][:300])
         cmd=[psi4_exe,'-i',INPUT_FILE,'-o',output_file]
     else:
         send_msg('[Kaggle] Preparing ORCA 6 environment from attached Dataset...')
@@ -2531,7 +2605,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v5.5 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v5.6 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -2688,7 +2762,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v5.5\n"
+        "🧪 Computational Chemistry Bot v5.6\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
@@ -2705,7 +2779,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v5.5-ORIGINAL-KAGGLE-PUSH-20260926\n'
+        'ChemBot build: v5.6-PSI4-INSTALL-FIX-20260926\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -3015,7 +3089,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v5.5 webhook mode active on port {port}.")
+    print(f"CHEMBOT v5.6 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -3056,7 +3130,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v5.5 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v5.6 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
@@ -3064,7 +3138,7 @@ def run_polling():
             raise RuntimeError(
                 "Telegram 409 conflict: another process is already polling this bot token. "
                 "Stop the other local/Render bot instance, or deploy ChemBot as a Render Web Service "
-                "so v5.5 uses webhook mode."
+                "so v5.6 uses webhook mode."
             ) from exc
         raise
 
