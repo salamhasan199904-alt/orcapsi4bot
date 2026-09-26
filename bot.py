@@ -9,10 +9,13 @@ import shutil
 import tempfile
 import subprocess
 import threading
+import hashlib
+import signal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v4.4
+# Chemistry Telegram/Kaggle Bot v4.7
 # - ORCA 6.x + Psi4 jobs on Kaggle
 # - Kaggle keeps sending results even if local launcher is closed
 # - Direct .out analysis with interactive Telegram menus
@@ -680,6 +683,69 @@ def build_pdf(a, plots, pdf_path):
 # ============================================================
 ANALYZER_V41_PATCH_CODE = r'''
 FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
+
+def detect_engine(text):
+    """Identify ORCA vs Psi4 from multiple independent output signatures.
+
+    A single banner is not required: partially written ORCA files commonly
+    lack the final termination line, while cropped outputs may omit the ASCII
+    logo.  Weighted signatures avoid routing an ORCA output through the Psi4
+    parser (or the generic fallback) merely because one banner is missing.
+    """
+    u = (text or '').upper()
+    if not u.strip():
+        return 'Unknown'
+
+    orca_markers = (
+        ('O   R   C   A', 10),
+        ('ORCA TERMINATED NORMALLY', 10),
+        ('ORCA TERMINATED ABNORMALLY', 10),
+        ('ORCA PROPERTY CALCULATIONS', 7),
+        ('FINAL SINGLE POINT ENERGY', 7),
+        ('ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS', 7),
+        ('YOUR CALCULATION UTILIZES THE BASIS:', 6),
+        ('CARTESIAN COORDINATES (ANGSTROEM)', 5),
+        ('CARTESIAN COORDINATES (A.U.)', 4),
+        ('DFT DISPERSION CORRECTION', 4),
+        ('MULLIKEN ATOMIC CHARGES', 3),
+        ('HIRSHFELD ANALYSIS', 3),
+        ('VIBRATIONAL FREQUENCIES', 2),
+        ('PROGRAM VERSION', 1),
+    )
+    psi4_markers = (
+        ('PSI4 EXITING SUCCESSFULLY', 10),
+        ('AN OPEN-SOURCE AB INITIO ELECTRONIC STRUCTURE PACKAGE', 10),
+        ('PSI4', 7),
+        ('PSIEXCEPTION', 7),
+        ('@RKS FINAL ENERGY:', 6),
+        ('@UKS FINAL ENERGY:', 6),
+        ('@RHF FINAL ENERGY:', 6),
+        ('@UHF FINAL ENERGY:', 6),
+        ('@DF-RKS FINAL ENERGY:', 6),
+        ('@DF-RHF FINAL ENERGY:', 6),
+        ('IR ACTIV [KM/MOL]', 4),
+        ('GIBBS FREE ENERGY', 2),
+    )
+
+    orca_score = sum(weight for marker, weight in orca_markers if marker in u)
+    psi4_score = sum(weight for marker, weight in psi4_markers if marker in u)
+
+    # Strong explicit identities always win over incidental shared wording.
+    if ('O   R   C   A' in u or 'ORCA TERMINATED' in u) and 'PSI4 EXITING SUCCESSFULLY' not in u:
+        return 'ORCA'
+    if ('PSI4 EXITING SUCCESSFULLY' in u or 'AN OPEN-SOURCE AB INITIO ELECTRONIC STRUCTURE PACKAGE' in u) and 'ORCA TERMINATED' not in u:
+        return 'Psi4'
+
+    if orca_score >= 5 and orca_score > psi4_score:
+        return 'ORCA'
+    if psi4_score >= 5 and psi4_score > orca_score:
+        return 'Psi4'
+
+    # A few ORCA records are sufficiently characteristic even in truncated
+    # files and are safer than returning Unknown.
+    if 'FINAL SINGLE POINT ENERGY' in u or 'YOUR CALCULATION UTILIZES THE BASIS:' in u:
+        return 'ORCA'
+    return 'Unknown'
 
 def _nums(line):
     return [_float(x) for x in re.findall(FLOAT_RE, line)]
@@ -2011,7 +2077,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_WORKER_THREADS)
 _startup_api = KaggleApi()
 _startup_api.authenticate()
 del _startup_api
-print(f"CHEMBOT v4.4 is running with {BOT_WORKER_THREADS} Telegram workers...")
+print(f"CHEMBOT v4.7 is initialized with {BOT_WORKER_THREADS} Telegram workers...")
 
 
 def authorized(message):
@@ -2106,6 +2172,8 @@ def _send_comparison(chat_id,sess,action):
 
 def create_analysis_session(chat_id, user_id, filename, text):
     a=parse_output_text(text,filename)
+    if a.get('engine') not in ('ORCA','Psi4'):
+        raise ValueError('Could not identify this .out file as ORCA or Psi4 output. Send the original text output, not a converted/trimmed report.')
     sid=uuid.uuid4().hex[:10]
     d=tempfile.mkdtemp(prefix='chembot_analysis_')
     with render_lock:
@@ -2131,9 +2199,10 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v4.5\n\n"
+        "🧪 Computational Chemistry Bot v4.7\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
-        "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n        • Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
+        "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
+        "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
         "• Send .xyz/.allxyz/.gbw before one or several jobs when needed; the same snapshot is available to the whole batch.\n"
         "• Psi4 D3/D4/gCP/geomeTRIC dependencies are detected and installed automatically.\n"
         "• Use /clearaux after a batch to clear stored auxiliary files/restart URL.\n"
@@ -2242,10 +2311,18 @@ def handle_document(message):
             info=bot.get_file(message.document.file_id)
             raw=bot.download_file(info.file_path)
             text=raw.decode('utf-8',errors='replace')
-            bot.reply_to(message,'🔬 Output received. Parsing scientific results and generating figures/PDF...')
+            detected_engine=detect_engine(text)
+            if detected_engine not in ('ORCA','Psi4'):
+                bot.reply_to(message,'❌ This .out file could not be identified as ORCA or Psi4 output. Please send the original plain-text .out file without conversion or truncation.')
+                return
+            bot.reply_to(message,f'🔬 {detected_engine} output detected. Parsing scientific results and generating figures/PDF...')
             sid,a=create_analysis_session(chat_id,uid,original_name,text)
             bot.send_message(chat_id,section_summary(a),reply_markup=out_menu(sid,a))
-        except Exception as e: bot.reply_to(message,'Analysis error: '+str(e))
+        except Exception as e:
+            import traceback
+            print('Direct .out analysis failure for', original_name)
+            traceback.print_exc()
+            bot.reply_to(message,'Analysis error: '+str(e))
         return
 
     # Auxiliary job files
@@ -2309,27 +2386,188 @@ def handle_document(message):
     bot.reply_to(message,'Supported files: .inp, .dat, .out, .xyz, .allxyz, .gbw')
 
 
-# ==========================================
-# 🚀 Render Port Binding Hack
-# ==========================================
-from http.server import BaseHTTPRequestHandler, HTTPServer
+# ------------------------- Runtime transport -------------------------
+# Telegram permits only one active getUpdates poller for a bot token. Render
+# performs zero-downtime deploys by starting the new instance before stopping
+# the old one, so long polling can briefly create two pollers and Telegram then
+# returns HTTP 409.  On a Render *web service* we therefore use a webhook.
+# Local/manual runs keep the convenient polling mode.
 
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(b"ChemBot v4.3 is running perfectly!")
 
-def run_dummy_server():
-    # Render assigns a dynamic port via the PORT environment variable
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), DummyHandler)
-    server.serve_forever()
+def _transport_mode():
+    mode = os.environ.get("CHEMBOT_MODE", "auto").strip().lower()
+    if mode in {"webhook", "polling"}:
+        return mode
+    # Render web services expose a public hostname/URL. A manual public URL
+    # can also be supplied for other hosts.
+    if (os.environ.get("CHEMBOT_PUBLIC_URL", "").strip()
+            or os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+            or os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()):
+        return "webhook"
+    return "polling"
 
-# Start the dummy web server in a separate daemon thread
-threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# Start the Telegram bot
+def _webhook_secret():
+    configured = os.environ.get("CHEMBOT_WEBHOOK_SECRET", "").strip()
+    if configured:
+        return configured
+    # Stable across overlapping Render instances, but never printed or exposed.
+    return hashlib.sha256((BOT_TOKEN + "|ChemBot|Webhook|v4.7").encode("utf-8")).hexdigest()[:48]
+
+
+def _webhook_path():
+    configured = os.environ.get("CHEMBOT_WEBHOOK_PATH", "").strip().strip("/")
+    if configured:
+        return "/" + configured
+    token_hash = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:24]
+    return "/telegram/" + token_hash
+
+
+def run_render_webhook():
+    external_url = os.environ.get("CHEMBOT_PUBLIC_URL", "").strip().rstrip("/")
+    if not external_url:
+        external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if not external_url:
+        host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip().strip("/")
+        if host:
+            external_url = "https://" + host
+    if not external_url:
+        raise RuntimeError(
+            "Webhook mode requires CHEMBOT_PUBLIC_URL, RENDER_EXTERNAL_URL, or "
+            "RENDER_EXTERNAL_HOSTNAME. On Render, deploy as a Web Service."
+        )
+
+    secret = _webhook_secret()
+    path = _webhook_path()
+    webhook_url = external_url + path
+    port = int(os.environ.get("PORT", "10000"))
+    max_update_bytes = int(os.environ.get("CHEMBOT_MAX_WEBHOOK_BYTES", str(2 * 1024 * 1024)))
+
+    class TelegramWebhookHandler(BaseHTTPRequestHandler):
+        server_version = "ChemBotWebhook/4.7"
+
+        def log_message(self, fmt, *args):
+            # Keep Render logs compact and avoid printing the secret path.
+            print("[webhook] " + (fmt % args))
+
+        def _reply(self, status, body=b"OK", content_type="text/plain; charset=utf-8"):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/", "/health", "/healthz"):
+                payload = json.dumps({
+                    "ok": True,
+                    "service": "ChemBot",
+                    "version": "4.7",
+                    "transport": "webhook",
+                }).encode("utf-8")
+                return self._reply(200, payload, "application/json; charset=utf-8")
+            return self._reply(404, b"Not Found")
+
+        def do_POST(self):
+            if self.path != path:
+                return self._reply(404, b"Not Found")
+
+            header_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if header_secret != secret:
+                return self._reply(403, b"Forbidden")
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._reply(400, b"Bad Content-Length")
+
+            if content_length <= 0 or content_length > max_update_bytes:
+                return self._reply(413, b"Payload Too Large")
+
+            try:
+                raw = self.rfile.read(content_length)
+                update = telebot.types.Update.de_json(raw.decode("utf-8"))
+                # TeleBot is configured threaded=True; handlers are delegated to
+                # its worker pool, allowing the HTTP request to acknowledge fast.
+                bot.process_new_updates([update])
+            except Exception as exc:
+                print(f"Webhook update processing error: {exc!r}")
+                return self._reply(500, b"Update processing failed")
+
+            return self._reply(200, b"OK")
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), TelegramWebhookHandler)
+
+    # setWebhook replaces any previous webhook atomically. Both the old and new
+    # Render instance use the same URL/secret during zero-downtime deployment,
+    # so there is no getUpdates race and no need to delete the webhook first.
+    ok = bot.set_webhook(
+        url=webhook_url,
+        secret_token=secret,
+        drop_pending_updates=False,
+    )
+    if not ok:
+        server.server_close()
+        raise RuntimeError("Telegram setWebhook returned false.")
+
+    print(f"CHEMBOT v4.7 webhook mode active on port {port}.")
+    print(f"Health check: {external_url}/health")
+
+    shutting_down = threading.Event()
+
+    def _shutdown(signum, frame):
+        del frame
+        if shutting_down.is_set():
+            return
+        shutting_down.set()
+        print(f"Received signal {signum}; shutting down webhook server gracefully...")
+        # Do not delete the webhook: during Render zero-downtime deploy the new
+        # instance is already serving the exact same webhook URL.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _shutdown)
+            except Exception:
+                pass
+
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+        print("Webhook server stopped.")
+
+
+def run_polling():
+    # Polling is intended for one manual/local instance only.  Production
+    # webhooks are NOT removed by default; set CHEMBOT_REMOVE_WEBHOOK_ON_POLL=1
+    # explicitly only when intentionally moving the same token back to polling.
+    remove = os.environ.get("CHEMBOT_REMOVE_WEBHOOK_ON_POLL", "0").strip().lower() not in {"0", "false", "no"}
+    if remove:
+        try:
+            bot.remove_webhook()
+            time.sleep(0.5)
+        except Exception as exc:
+            print(f"Warning: could not remove old webhook before polling: {exc}")
+
+    print("CHEMBOT v4.7 polling mode active. Ensure no other instance uses this bot token.")
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    except telebot.apihelper.ApiTelegramException as exc:
+        if getattr(exc, "error_code", None) == 409 or "other getUpdates request" in str(exc):
+            raise RuntimeError(
+                "Telegram 409 conflict: another process is already polling this bot token. "
+                "Stop the other local/Render bot instance, or deploy ChemBot as a Render Web Service "
+                "so v4.7 uses webhook mode."
+            ) from exc
+        raise
+
+
 if __name__ == '__main__':
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    mode = _transport_mode()
+    print(f"ChemBot transport selected: {mode}")
+    if mode == "webhook":
+        run_render_webhook()
+    else:
+        run_polling()
