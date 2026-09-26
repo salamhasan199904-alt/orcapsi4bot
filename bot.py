@@ -620,37 +620,183 @@ def make_plots(a, outdir):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import numpy as np
     os.makedirs(outdir,exist_ok=True)
     made={}
+
+    def _gaussian_broaden(xvals, yvals, grid, sigma):
+        yy = np.zeros_like(grid, dtype=float)
+        if sigma <= 0:
+            sigma = 1.0
+        for xv, yv in zip(xvals, yvals):
+            if xv is None or yv is None:
+                continue
+            amp = max(0.0, float(yv))
+            yy += amp * np.exp(-0.5 * ((grid - float(xv)) / sigma) ** 2)
+        return yy
+
     opt=a.get('optimization_energies',[])
     if len(opt)>=2:
         p=os.path.join(outdir,'optimization_energy.png')
-        fig=plt.figure(figsize=(8,5)); ax=fig.add_subplot(111); ax.plot(range(1,len(opt)+1),opt,marker='o',ms=3); ax.set_xlabel('Optimization step'); ax.set_ylabel('Energy (Eh)'); ax.set_title('Optimization energy profile'); ax.grid(alpha=.25); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['optimization']=p
+        arr = np.array([float(v) for v in opt if v is not None], dtype=float)
+        if arr.size >= 2:
+            rel = (arr - np.min(arr)) * HARTREE_TO_KJMOL
+            fig=plt.figure(figsize=(8,5)); ax=fig.add_subplot(111)
+            ax.plot(range(1,len(rel)+1), rel, marker='o', ms=3)
+            ax.set_xlabel('Optimization step')
+            ax.set_ylabel('Relative energy (kJ mol$^{-1}$)')
+            ax.set_title('Optimization energy profile')
+            ax.grid(alpha=.25)
+            ymin = min(rel.min(), 0.0)
+            ymax = rel.max() if rel.size else 1.0
+            pad = max(1.0, 0.05 * (ymax - ymin if ymax > ymin else 1.0))
+            ax.set_ylim(max(-pad, ymin - pad), ymax + pad)
+            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['optimization']=p
+
     ir=a.get('ir_spectrum',[])
     if ir:
         p=os.path.join(outdir,'ir_spectrum.png')
-        x=[q[0] for q in ir if q[0] is not None]; y=[abs(q[1] or 0) for q in ir if q[0] is not None]
-        fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111); ax.vlines(x,[0]*len(x),y); ax.set_xlabel('Wavenumber (cm$^{-1}$)'); ax.set_ylabel('Relative intensity'); ax.set_title('Calculated IR spectrum'); ax.invert_xaxis(); ax.grid(alpha=.2); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['ir']=p
+        pairs=[]
+        for q in ir:
+            try:
+                freq=float(q[0]); inten=abs(float(q[1] or 0.0))
+            except Exception:
+                continue
+            if freq > 0 and inten >= 0:
+                pairs.append((freq, inten))
+        # Prefer conventional mid-IR presentation (4000–400 cm^-1) when possible.
+        mid_ir=[(f,i) for f,i in pairs if 400.0 <= f <= 4000.0]
+        use = mid_ir if mid_ir else pairs
+        if use:
+            x=np.array([f for f,_ in use], dtype=float)
+            y=np.array([i for _,i in use], dtype=float)
+            if np.max(y) > 0:
+                y = y / np.max(y)
+            lo = max(0.0, np.min(x) - 120.0)
+            hi = min(4000.0, np.max(x) + 120.0)
+            if mid_ir:
+                lo = max(400.0, lo)
+                hi = min(4000.0, hi)
+            if hi <= lo:
+                lo, hi = float(np.min(x)), float(np.max(x))
+            grid=np.linspace(lo, hi, 3200)
+            yy=_gaussian_broaden(x, y, grid, sigma=12.0)
+            if np.max(yy) > 0:
+                yy = yy / np.max(yy)
+            fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
+            ax.plot(grid, yy, lw=1.6)
+            ax.vlines(x, 0, y, alpha=.20, linewidth=0.6)
+            ax.set_xlabel('Wavenumber (cm$^{-1}$)')
+            ax.set_ylabel('Relative intensity')
+            ax.set_title('Calculated IR spectrum')
+            ax.set_xlim(hi, lo)
+            ax.set_ylim(0, 1.05)
+            ax.grid(alpha=.2)
+            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['ir']=p
+
     states=[s for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
     if states:
         p=os.path.join(outdir,'uvvis_spectrum.png')
-        import numpy as np
-        nms=[s['nm'] for s in states]; lo=max(100,min(nms)-80); hi=min(2000,max(nms)+80); grid=np.linspace(lo,hi,2500); yy=np.zeros_like(grid); sigma=10.0
-        for s in states: yy += max(0.0,s.get('f') or 0.0)*np.exp(-0.5*((grid-s['nm'])/sigma)**2)
-        if yy.max()>0: yy=yy/yy.max()
-        fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111); ax.plot(grid,yy,lw=1.6); ax.vlines(nms,[0]*len(nms),[max(0.0,(s.get('f') or 0.0))/(max([max(0.0,z.get('f') or 0.0) for z in states]) or 1) for s in states],alpha=.45); ax.set_xlabel('Wavelength (nm)'); ax.set_ylabel('Relative intensity'); ax.set_title('Simulated UV-Vis spectrum (Gaussian broadening)'); ax.grid(alpha=.2); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['uvvis']=p
+        nms=np.array([float(s['nm']) for s in states if s.get('nm')], dtype=float)
+        fosc=np.array([max(0.0, float(s.get('f') or 0.0)) for s in states if s.get('nm')], dtype=float)
+        if nms.size:
+            lo=max(100.0, float(np.min(nms))-80.0)
+            hi=min(2000.0, float(np.max(nms))+80.0)
+            grid=np.linspace(lo,hi,2500)
+            yy=_gaussian_broaden(nms, fosc, grid, sigma=10.0)
+            if np.max(yy)>0: yy=yy/np.max(yy)
+            stick = fosc / (np.max(fosc) if np.max(fosc)>0 else 1.0)
+            fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
+            ax.plot(grid,yy,lw=1.6)
+            ax.vlines(nms,0,stick,alpha=.35,linewidth=0.8)
+            ax.set_xlabel('Wavelength (nm)')
+            ax.set_ylabel('Relative intensity')
+            ax.set_title('Simulated UV-Vis spectrum (Gaussian broadening)')
+            ax.set_ylim(0, 1.05)
+            ax.grid(alpha=.2)
+            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['uvvis']=p
+
     raman=a.get('raman_spectrum',[])
     if raman:
         p=os.path.join(outdir,'raman_spectrum.png')
-        x=[q[0] for q in raman]; y=[q[1] for q in raman]
-        fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111); ax.vlines(x,[0]*len(x),y); ax.set_xlabel('Raman shift (cm$^{-1}$)'); ax.set_ylabel('Relative activity'); ax.set_title('Calculated Raman spectrum'); ax.invert_xaxis(); ax.grid(alpha=.2); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['raman']=p
+        pairs=[]
+        for q in raman:
+            try:
+                shift=float(q[0]); act=abs(float(q[1] or 0.0))
+            except Exception:
+                continue
+            if shift > 0 and act >= 0:
+                pairs.append((shift, act))
+        if pairs:
+            x=np.array([f for f,_ in pairs], dtype=float)
+            y=np.array([i for _,i in pairs], dtype=float)
+            if np.max(y) > 0:
+                y = y / np.max(y)
+            lo = max(0.0, np.min(x) - 80.0)
+            hi = np.max(x) + 80.0
+            grid=np.linspace(lo, hi, 3200)
+            yy=_gaussian_broaden(x, y, grid, sigma=10.0)
+            if np.max(yy) > 0:
+                yy = yy / np.max(yy)
+            fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
+            ax.plot(grid, yy, lw=1.6)
+            ax.vlines(x, 0, y, alpha=.20, linewidth=0.6)
+            ax.set_xlabel('Raman shift (cm$^{-1}$)')
+            ax.set_ylabel('Relative activity')
+            ax.set_title('Calculated Raman spectrum')
+            ax.set_xlim(hi, lo)
+            ax.set_ylim(0, 1.05)
+            ax.grid(alpha=.2)
+            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['raman']=p
+
     o=a.get('orbitals',{}).get('orbitals',[])
     if o:
         p=os.path.join(outdir,'orbital_energies.png')
-        subset=o[-40:]; ys=[z.get('ev') for z in subset if z.get('ev') is not None]; labels=[str(z.get('index')) for z in subset if z.get('ev') is not None]
-        fig=plt.figure(figsize=(6,7)); ax=fig.add_subplot(111)
-        for i,(lab,yv) in enumerate(zip(labels,ys)): ax.hlines(yv,0,1,lw=1.2); ax.text(1.02,yv,lab,va='center',fontsize=7)
-        ax.set_xlim(-.1,1.25); ax.set_xticks([]); ax.set_ylabel('Orbital energy (eV)'); ax.set_title('Molecular orbital energy levels'); ax.grid(axis='y',alpha=.15); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['orbitals']=p
+        cleaned=[z for z in o if z.get('ev') is not None]
+        occ=[z for z in cleaned if (z.get('occ') or 0.0) > 1e-8]
+        vir=[z for z in cleaned if (z.get('occ') or 0.0) <= 1e-8]
+        subset=[]
+        subset.extend(occ[-8:])
+        subset.extend(vir[:8])
+        if subset:
+            ys=[float(z.get('ev')) for z in subset]
+            fig=plt.figure(figsize=(6.6,7)); ax=fig.add_subplot(111)
+            for z in occ[-8:]:
+                yv=float(z.get('ev'))
+                ax.hlines(yv, -0.35, -0.05, lw=1.6)
+            for z in vir[:8]:
+                yv=float(z.get('ev'))
+                ax.hlines(yv, 0.05, 0.35, lw=1.6)
+            homo = occ[-1] if occ else None
+            lumo = vir[0] if vir else None
+            if homo is not None:
+                yv=float(homo.get('ev'))
+                ax.hlines(yv, -0.38, -0.02, lw=2.4)
+                ax.text(-0.42, yv, f"HOMO ({homo.get('index')})\n{yv:.2f} eV", ha='right', va='center', fontsize=8)
+            if lumo is not None:
+                yv=float(lumo.get('ev'))
+                ax.hlines(yv, 0.02, 0.38, lw=2.4)
+                ax.text(0.42, yv, f"LUMO ({lumo.get('index')})\n{yv:.2f} eV", ha='left', va='center', fontsize=8)
+            # Annotate only a small frontier subset to avoid unreadable overlap.
+            for z in occ[-4:-1]:
+                yv=float(z.get('ev'))
+                ax.text(-0.02, yv, str(z.get('index')), ha='right', va='center', fontsize=7)
+            for z in vir[1:4]:
+                yv=float(z.get('ev'))
+                ax.text(0.02, yv, str(z.get('index')), ha='left', va='center', fontsize=7)
+            if homo is not None and lumo is not None:
+                gap = float(lumo.get('ev')) - float(homo.get('ev'))
+                ym = (float(lumo.get('ev')) + float(homo.get('ev'))) / 2.0
+                ax.annotate('', xy=(0.0, float(lumo.get('ev'))), xytext=(0.0, float(homo.get('ev'))), arrowprops=dict(arrowstyle='<->', lw=1.2))
+                ax.text(0.03, ym, f'Gap = {gap:.2f} eV', va='center', fontsize=8)
+            ymin=min(ys); ymax=max(ys); pad=max(0.5, 0.08*(ymax-ymin if ymax>ymin else 1.0))
+            ax.set_xlim(-0.55, 0.55)
+            ax.set_ylim(ymin-pad, ymax+pad)
+            ax.set_xticks([-0.2, 0.2]); ax.set_xticklabels(['Occupied', 'Virtual'])
+            ax.set_ylabel('Orbital energy (eV)')
+            ax.set_title('Frontier molecular orbital energy levels')
+            ax.grid(axis='y',alpha=.15)
+            fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['orbitals']=p
     return made
 
 
