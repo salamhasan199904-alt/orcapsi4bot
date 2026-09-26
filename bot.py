@@ -1585,5 +1585,28 @@ def handle_document(message):
     bot.reply_to(message,'Supported files: .inp, .dat, .out, .xyz, .allxyz, .gbw')
 
 
+# ==========================================
+# 🚀 Render Port Binding Hack
+# ==========================================
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b"ChemBot v4.3 is running perfectly!")
+
+def run_dummy_server():
+    # Render assigns a dynamic port via the PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), DummyHandler)
+    server.serve_forever()
+
+# Start the dummy web server in a separate daemon thread
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+# Start the Telegram bot
 if __name__ == '__main__':
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+
