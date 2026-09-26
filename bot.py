@@ -1,4 +1,4 @@
-# BUILD: v5.9-PSI4-REPORTS-20260926
+# BUILD: v6.2.1-FRONTIER-20260926
 import os
 
 # ============================================================
@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v5.9
+# Chemistry Telegram/Kaggle Bot v6.2.1
 # ============================================================
 
 
@@ -168,8 +168,26 @@ from kaggle.api.kaggle_api_extended import KaggleApi
 if not BOT_TOKEN:
     raise RuntimeError("Set CHEMBOT_BOT_TOKEN before running the bot.")
 
-ALLOWED_IDS = {7495822836, -1003907097817, 839801823, -1003925918657, -1003875125323}
-ADMIN_ID = 839801823
+_DEFAULT_ALLOWED_IDS = {7495822836, -1003907097817, 839801823, -1003925918657, -1003875125323}
+
+def _parse_id_set(raw_value, fallback, variable_name):
+    raw_value = str(raw_value or '').strip()
+    if not raw_value:
+        return set(fallback)
+    try:
+        ids = {int(token.strip()) for token in re.split(r'[,;\s]+', raw_value) if token.strip()}
+    except ValueError as exc:
+        raise RuntimeError(f'{variable_name} must contain comma-separated Telegram numeric IDs.') from exc
+    if not ids:
+        raise RuntimeError(f'{variable_name} was set but did not contain any Telegram numeric IDs.')
+    return ids
+
+
+ALLOWED_IDS = _parse_id_set(os.environ.get('CHEMBOT_ALLOWED_IDS'), _DEFAULT_ALLOWED_IDS, 'CHEMBOT_ALLOWED_IDS')
+try:
+    ADMIN_ID = int(os.environ.get('CHEMBOT_ADMIN_ID', '839801823'))
+except ValueError as exc:
+    raise RuntimeError('CHEMBOT_ADMIN_ID must be a Telegram numeric ID.') from exc
 ORCA_DATASET_SLUG = os.environ.get(
     "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0"
 )
@@ -191,7 +209,11 @@ render_lock = threading.RLock()  # Matplotlib/ReportLab rendering is serialized 
 # Telegram can deliver several documents almost simultaneously.  Use enough
 # worker threads to accept a batch, while every Kaggle submission receives its
 # own KaggleApi instance and its own temporary directory.
-BOT_WORKER_THREADS = max(2, int(os.environ.get("CHEMBOT_WORKER_THREADS", "8")))
+try:
+    _requested_worker_threads = int(os.environ.get('CHEMBOT_WORKER_THREADS', '8'))
+except ValueError as exc:
+    raise RuntimeError('CHEMBOT_WORKER_THREADS must be an integer from 2 to 32.') from exc
+BOT_WORKER_THREADS = min(32, max(2, _requested_worker_threads))
 
 # Names used by older ChemBot versions.  They are safe to prune when they are
 # clearly local staging directories, because the Kaggle kernel has already
@@ -269,7 +291,7 @@ ANALYZER_MODULE_CODE = r'''
 import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = '5.9.0'
+REPORT_GENERATOR_VERSION = '6.2.1'
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 KB_J_MOL_K = 8.314462618
@@ -1293,7 +1315,7 @@ def build_pdf(a, plots, pdf_path):
     orb=a.get('orbitals',{}) or {}
     arr=orb.get('orbitals',[]) or []
     if arr or orb.get('homo_ev') is not None:
-        story += section_title('Frontier molecular orbitals')
+        story += section_title('Frontier orbital energies')
         fr=[['Quantity','Energy (eV)']]
         if orb.get('homo_ev') is not None: fr.append(['HOMO',_report_fmt(orb.get('homo_ev'),5)])
         if orb.get('lumo_ev') is not None: fr.append(['LUMO',_report_fmt(orb.get('lumo_ev'),5)])
@@ -1321,26 +1343,16 @@ def build_pdf(a, plots, pdf_path):
                 story += [Spacer(1,6),Paragraph('Conceptual DFT descriptors',h2),styled_table(drows,[11.0*cm,6.0*cm]),
                           Paragraph('Frontier-orbital approximations using the same Koopmans/Parr-Pearson definitions implemented by ORCA_ENGINE.',small)]
         if arr:
-            occ=[z for z in arr if (z.get('occ') or 0)>1e-8]
-            vir=[z for z in arr if (z.get('occ') or 0)<=1e-8]
-            frontier=(occ[-6:] if occ else []) + (vir[:6] if vir else [])
-            rows=[['Label','Index','Occ.','Energy (Eh)','Energy (eV)']]
-            homo_idx=occ[-1].get('index') if occ else None
-            lumo_idx=vir[0].get('index') if vir else None
-            for z in frontier:
-                idx=z.get('index')
-                if idx==homo_idx: label='HOMO'
-                elif idx==lumo_idx: label='LUMO'
-                elif homo_idx is not None and idx is not None and idx<homo_idx: label=f'HOMO-{homo_idx-idx}'
-                elif lumo_idx is not None and idx is not None and idx>lumo_idx: label=f'LUMO+{idx-lumo_idx}'
-                else: label=''
-                rows.append([label,idx,_report_fmt(z.get('occ'),2),_report_fmt(z.get('eh'),7),_report_fmt(z.get('ev'),5)])
+            frontier=_frontier_orbital_records_v62(orb,per_side=6)
+            rows=[['Spin','Label','Index','Occ.','Energy (Eh)','Energy (eV)']]
+            for spin,label,z in frontier:
+                rows.append([spin,label,z.get('index',''),_report_fmt(z.get('occ'),2),_report_fmt(z.get('eh'),7),_report_fmt(z.get('ev'),5)])
             story += [Spacer(1,6), Paragraph('Frontier orbital window',h2),
-                      styled_table(rows,[3.0*cm,2.0*cm,2.0*cm,5.0*cm,5.0*cm])]
+                      styled_table(rows,[2.4*cm,2.6*cm,1.5*cm,1.5*cm,4.5*cm,4.5*cm])]
         add_figure(
             story,'orbitals',
-            'Figure: frontier molecular orbital energy levels.',
-            'The HOMO-LUMO value is an orbital-energy difference, not an electronic excitation energy.'
+            'Figure: frontier orbital energy-level diagram.',
+            'This is an energy diagram from printed orbital data, not a 3D orbital isosurface; the gap is not an excitation energy.'
         )
 
     # Molecular properties
@@ -2606,43 +2618,42 @@ def make_plots(a,outdir):
     occ=[z for z in cleaned if (z.get('occ') or 0.0)>1e-8]
     vir=[z for z in cleaned if (z.get('occ') or 0.0)<=1e-8]
     if not occ or not vir: return made
-    show_occ=occ[-4:]; show_vir=vir[:4]; homo=occ[-1]; lumo=vir[0]
+    # Publication-style plot: emphasize only HOMO and LUMO labels to avoid overlap.
+    show_occ=occ[-3:]; show_vir=vir[:3]; homo=occ[-1]; lumo=vir[0]
     p=os.path.join(outdir,'orbital_energies.png')
-    fig,ax=plt.subplots(figsize=(7.4,6.4))
-    # Deliberately omit raw orbital indices from the figure. They remain in the PDF table.
-    def _label_positions(levels,min_sep=0.16):
-        vals=[float(z['ev']) for z in levels]
-        if not vals: return []
-        order=sorted(range(len(vals)),key=lambda i: vals[i])
-        placed=[None]*len(vals); last=None
-        for idx in order:
-            y=vals[idx]
-            if last is not None and y-last<min_sep: y=last+min_sep
-            placed[idx]=y; last=y
-        return placed
-    occ_text_y=_label_positions(show_occ)
-    vir_text_y=_label_positions(show_vir)
-    for i,z in enumerate(show_occ):
-        y=float(z['ev']); n=len(show_occ)-1-i; label='HOMO' if n==0 else f'HOMO-{n}'
-        ax.hlines(y,-0.34,-0.08,lw=2.5 if n==0 else 1.35)
-        ax.annotate(label,xy=(-0.34,y),xytext=(-0.41,occ_text_y[i]),ha='right',va='center',fontsize=8,
-                    arrowprops=dict(arrowstyle='-',lw=.45,shrinkA=1,shrinkB=1))
-    for i,z in enumerate(show_vir):
-        y=float(z['ev']); label='LUMO' if i==0 else f'LUMO+{i}'
-        ax.hlines(y,0.08,0.34,lw=2.5 if i==0 else 1.35)
-        ax.annotate(label,xy=(0.34,y),xytext=(0.41,vir_text_y[i]),ha='left',va='center',fontsize=8,
-                    arrowprops=dict(arrowstyle='-',lw=.45,shrinkA=1,shrinkB=1))
+    fig,ax=plt.subplots(figsize=(7.2,6.0))
+    for z in show_occ[:-1]:
+        ax.hlines(float(z['ev']),-0.34,-0.12,lw=1.2)
+    ax.hlines(float(homo['ev']),-0.34,-0.12,lw=2.5)
+    for z in show_vir[1:]:
+        ax.hlines(float(z['ev']),0.12,0.34,lw=1.2)
+    ax.hlines(float(lumo['ev']),0.12,0.34,lw=2.5)
+
     yh=float(homo['ev']); yl=float(lumo['ev']); gap=yl-yh
+    ax.annotate('HOMO', xy=(-0.34,yh), xytext=(-0.50,yh), ha='right', va='center', fontsize=9.0,
+                arrowprops=dict(arrowstyle='-', lw=.55, shrinkA=0, shrinkB=0))
+    ax.text(-0.50, yh-0.03*max(1.0,abs(yh)), f'{yh:.2f} eV', ha='right', va='top', fontsize=8.0)
+    ax.annotate('LUMO', xy=(0.34,yl), xytext=(0.50,yl), ha='left', va='center', fontsize=9.0,
+                arrowprops=dict(arrowstyle='-', lw=.55, shrinkA=0, shrinkB=0))
+    ax.text(0.50, yl-0.03*max(1.0,abs(yl)), f'{yl:.2f} eV', ha='left', va='top', fontsize=8.0)
+
+    if len(show_occ) >= 2:
+        ax.text(-0.50, float(show_occ[-2]['ev']), 'HOMO-1', ha='right', va='center', fontsize=7.3, alpha=0.85)
+    if len(show_vir) >= 2:
+        ax.text(0.50, float(show_vir[1]['ev']), 'LUMO+1', ha='left', va='center', fontsize=7.3, alpha=0.85)
+
     ax.annotate('',xy=(0.0,yl),xytext=(0.0,yh),arrowprops=dict(arrowstyle='<->',lw=1.1))
-    ax.text(0.025,(yh+yl)/2.0,f'gap = {gap:.2f} eV',va='center',ha='left',fontsize=8.5)
-    ys=[float(z['ev']) for z in show_occ+show_vir]; ymin,ymax=min(ys),max(ys); pad=max(.5,.1*(ymax-ymin if ymax>ymin else 1))
-    ax.set_xlim(-.62,.62); ax.set_ylim(ymin-pad,ymax+pad)
+    ax.text(0.03,(yh+yl)/2.0,f'gap = {gap:.2f} eV',va='center',ha='left',fontsize=8.5)
+    ys=[float(z['ev']) for z in show_occ+show_vir]
+    ymin,ymax=min(ys),max(ys); pad=max(.75,.18*(ymax-ymin if ymax>ymin else 1.0))
+    ax.set_xlim(-0.78,0.78); ax.set_ylim(ymin-pad,ymax+pad)
     ax.set_xticks([-0.21,0.21]); ax.set_xticklabels(['Occupied','Virtual'])
     ax.set_ylabel('Orbital energy (eV)'); ax.set_title('Frontier molecular orbital energy levels')
     ax.grid(axis='y',alpha=.12)
     fig.tight_layout(); fig.savefig(p,dpi=600,bbox_inches='tight'); plt.close(fig)
     made['orbitals']=p
     return made
+
 '''
 
 # v5.9 Psi4 parser/report hardening
@@ -2693,11 +2704,32 @@ def _psi4_method_basis_v59(text):
 
 def _psi4_orbitals_v59(text):
     groups=[]; current_occ=None; current_spin='restricted'; active=False
+    num_re=r'[-+]?\d*\.\d+(?:[Ee][-+]?\d+)?|[-+]?\d+(?:[Ee][-+]?\d+)?'
+    int_re=r'[-+]?\d+'
+
+    def extract_vals(chunk):
+        tokens=re.findall(num_re, chunk)
+        if not tokens:
+            return []
+        vals=[]
+        if len(tokens) >= 2 and len(tokens) % 2 == 0:
+            pairs=[tokens[i:i+2] for i in range(0,len(tokens),2)]
+            pair_mode=sum(1 for a,b in pairs if re.fullmatch(int_re,a) and ('.' in b or 'E' in b.upper()))
+            if pair_mode >= max(1, len(pairs)//2):
+                vals=[_float(b) for a,b in pairs]
+            else:
+                vals=[_float(x) for x in tokens if ('.' in x or 'E' in x.upper())]
+        else:
+            vals=[_float(x) for x in tokens if ('.' in x or 'E' in x.upper())]
+        vals=[v for v in vals if v is not None and -100.0 <= float(v) <= 20.0]
+        return vals
+
     for raw in text.splitlines():
         line=raw.rstrip(); u=line.upper()
         if 'ORBITAL ENERGIES' in u:
             active=True; current_occ=None; continue
-        if not active: continue
+        if not active:
+            continue
         if groups and current_occ == 0.0 and not line.strip():
             active=False; current_occ=None; continue
         if ('ALPHA' in u and 'ORBITAL' in u): current_spin='alpha'
@@ -2706,27 +2738,61 @@ def _psi4_orbitals_v59(text):
         if m:
             label=m.group(1).upper()
             current_occ=0.0 if 'VIRTUAL' in label else (1.0 if 'SINGLY' in label else 2.0)
-            vals=[_float(x) for x in re.findall(FLOAT_RE,m.group(2))]
-            for v in vals:
-                if v is not None: groups.append((current_spin,current_occ,v))
+            for v in extract_vals(m.group(2)):
+                groups.append((current_spin,current_occ,v))
             continue
         if current_occ is not None and line.strip() and not re.search(r'[A-Za-z]{3,}',line):
-            vals=[_float(x) for x in re.findall(FLOAT_RE,line)]
-            for v in vals:
-                if v is not None: groups.append((current_spin,current_occ,v))
+            for v in extract_vals(line):
+                groups.append((current_spin,current_occ,v))
     if not groups:
         return parse_orbitals(text,'Psi4')
+
     orbitals=[]; spin_counts={}
     for spin,occ,eh in groups:
         spin_counts[spin]=spin_counts.get(spin,0)+1
         orbitals.append({'index':spin_counts[spin],'spin':spin,'occ':occ,'eh':eh,'ev':eh*HARTREE_TO_EV})
+
+    # Sanity cleanup: Psi4 occupied orbital energies for ordinary molecular calculations
+    # should not appear as large positive Hartree values. If such values coexist with
+    # normal negative occupied energies, they are almost certainly parsed indices.
+    occ_all=[o for o in orbitals if (o.get('occ') or 0)>1e-8]
+    if occ_all and any((o.get('eh') or 0) < 0 for o in occ_all) and any((o.get('eh') or 0) > 0.2 for o in occ_all):
+        orbitals=[o for o in orbitals if not ((o.get('occ') or 0)>1e-8 and (o.get('eh') or 0) > 0.2)]
+
+    # Remove obvious parser artefacts: occupied orbitals should not remain as large
+    # positive Hartree values for ordinary neutral molecular calculations. Also drop any
+    # row whose eV is exactly Eh*27.2114 when Eh is an integer-like large positive value,
+    # because that pattern indicates an orbital index leaked into the energy column.
+    filtered=[]
+    for o in orbitals:
+        eh=o.get('eh'); ev=o.get('ev'); occ=o.get('occ') or 0.0
+        if eh is None:
+            continue
+        if occ > 1e-8 and eh > 0.5:
+            continue
+        if occ > 1e-8 and eh > 1.0 and abs(eh-round(eh)) < 1e-6 and ev is not None and abs(ev - eh*HARTREE_TO_EV) < 1e-3:
+            continue
+        filtered.append(o)
+    orbitals = filtered
+
     occs=[x for x in orbitals if (x.get('occ') or 0)>1e-8]
     virs=[x for x in orbitals if (x.get('occ') or 0)<=1e-8]
     out={'orbitals':orbitals[-1000:]}
-    if occs: out['homo_ev']=max(occs,key=lambda z:z['ev'])['ev']
-    if virs: out['lumo_ev']=min(virs,key=lambda z:z['ev'])['ev']
+    if occs:
+        out['homo_ev']=max(occs,key=lambda z:z['ev'])['ev']
+    if virs:
+        out['lumo_ev']=min(virs,key=lambda z:z['ev'])['ev']
     if out.get('homo_ev') is not None and out.get('lumo_ev') is not None:
         out['gap_ev']=out['lumo_ev']-out['homo_ev']
+
+    # Extra sanity fallback for malformed sections.
+    if out.get('homo_ev') is not None and out['homo_ev'] > 2.0:
+        neg_occs=[x for x in occs if (x.get('eh') or 0) < 0.0]
+        if neg_occs:
+            out['homo_ev']=max(neg_occs,key=lambda z:z['ev'])['ev']
+            if out.get('lumo_ev') is not None:
+                out['gap_ev']=out['lumo_ev']-out['homo_ev']
+
     for spin in ('alpha','beta'):
         so=[x for x in orbitals if x.get('spin')==spin and (x.get('occ') or 0)>1e-8]
         sv=[x for x in orbitals if x.get('spin')==spin and (x.get('occ') or 0)<=1e-8]
@@ -2951,7 +3017,7 @@ def _build_psi4_pdf_v59(a, plots, pdf_path):
         for s in td[:40]: rr.append([s.get('state',''),_report_fmt(s.get('ev'),5),_report_fmt(s.get('nm'),2),_report_fmt(s.get('f'),7)])
         story += [table(rr,[2.2*cm,4.3*cm,4.7*cm,5.8*cm])]; fig(story,'uvvis','Figure: simulated UV-Vis profile from parsed Psi4 excited-state transitions.')
     if o.get('homo_ev') is not None or (o.get('orbitals') or []):
-        story += sec('Frontier molecular orbitals')
+        story += sec('Frontier orbital energies')
         fr=[['Quantity','Value']]
         for lbl,k in [('HOMO','homo_ev'),('LUMO','lumo_ev'),('HOMO-LUMO orbital-energy gap','gap_ev'),('Alpha HOMO','alpha_homo_ev'),('Alpha LUMO','alpha_lumo_ev'),('Beta HOMO','beta_homo_ev'),('Beta LUMO','beta_lumo_ev')]:
             if o.get(k) is not None: fr.append([lbl,_report_fmt(o[k],6,' eV')])
@@ -2962,7 +3028,7 @@ def _build_psi4_pdf_v59(a, plots, pdf_path):
             for k,lbl,unit in [('ionization_potential_ev','Ionization potential, I','eV'),('electron_affinity_ev','Electron affinity, A','eV'),('chemical_hardness_ev','Chemical hardness, eta','eV'),('chemical_potential_ev','Chemical potential, mu','eV'),('electronegativity_ev','Electronegativity, chi','eV'),('chemical_softness_ev','Chemical softness, S','eV^-1'),('electrophilicity_index_ev','Electrophilicity index, omega','eV'),('electrodonating_power_ev','Electrodonating power, omega-','eV'),('electroaccepting_power_ev','Electroaccepting power, omega+','eV'),('net_electrophilicity_ev','Net electrophilicity, Delta omega','eV')]:
                 if desc.get(k) is not None: cr.append([lbl,_report_fmt(desc[k],6,' '+unit)])
             story += [Spacer(1,5),Paragraph('Conceptual DFT descriptors',h2),table(cr,[11*cm,6*cm]),Paragraph('These are frontier-orbital approximations. For unrestricted wavefunctions, inspect the alpha/beta frontier levels before interpreting a single combined gap.',small)]
-        fig(story,'orbitals','Figure: frontier orbital energy levels.','The plotted gap is an orbital-energy difference and is not an electronic excitation energy.')
+        fig(story,'orbitals','Figure: frontier orbital energy-level diagram.','This is not a 3D orbital isosurface; the gap is not an electronic excitation energy.')
     charges=a.get('atomic_charges',[]) or []; geom=a.get('final_geometry',[]) or []
     if d or charges or geom:
         story += sec('Molecular properties')
@@ -2988,9 +3054,9 @@ def _build_psi4_pdf_v59(a, plots, pdf_path):
         rr=[['Atom','X','Y','Z']]+[[x.get('element',''),_report_fmt(x.get('x'),7),_report_fmt(x.get('y'),7),_report_fmt(x.get('z'),7)] for x in geom]
         story += [Spacer(1,6),Paragraph('Final Cartesian geometry (Angstrom)',h2),table(rr,[3*cm,4.65*cm,4.65*cm,4.65*cm])]
     if orbarr:
-        occ=[z for z in orbarr if (z.get('occ') or 0)>1e-8]; vir=[z for z in orbarr if (z.get('occ') or 0)<=1e-8]; sel=(occ[-20:] if occ else [])+(vir[:20] if vir else [])
-        rr=[['Index','Spin','Occ.','Energy (Eh)','Energy (eV)']]+[[z.get('index',''),z.get('spin','restricted'),_report_fmt(z.get('occ'),3),_report_fmt(z.get('eh'),8),_report_fmt(z.get('ev'),6)] for z in sel]
-        story += [Spacer(1,6),Paragraph('Frontier-centered orbital energies',h2),table(rr,[2*cm,3.4*cm,2*cm,4.8*cm,4.8*cm])]
+        sel=_frontier_orbital_records_v62(o,per_side=20)
+        rr=[['Spin','Label','Index','Occ.','Energy (Eh)','Energy (eV)']]+[[spin,label,z.get('index',''),_report_fmt(z.get('occ'),3),_report_fmt(z.get('eh'),8),_report_fmt(z.get('ev'),6)] for spin,label,z in sel]
+        story += [Spacer(1,6),Paragraph('Frontier-centered orbital energies',h2),table(rr,[2.4*cm,2.6*cm,1.5*cm,1.5*cm,4.5*cm,4.5*cm])]
     doc.build(story,onFirstPage=frame,onLaterPages=frame)
     return pdf_path
 
@@ -3000,7 +3066,337 @@ def build_pdf(a, plots, pdf_path):
     return _build_pdf_v58(a,plots,pdf_path)
 '''
 
-ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE + "\n" + ANALYZER_V58_PATCH_CODE + "\n" + ANALYZER_V59_PATCH_CODE
+ANALYZER_V62_PATCH_CODE = r'''
+def _frontier_orbital_channels_v62(orb):
+    """Return finite, energy-sorted frontier data separated by spin channel."""
+    if not isinstance(orb, dict):
+        orb = {'orbitals': orb if isinstance(orb, list) else []}
+    raw = orb.get('orbitals', [])
+    if not isinstance(raw, list):
+        raw = []
+    groups = {}
+    explicit_spin = False
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        occ = _float(row.get('occ'))
+        eh = _float(row.get('eh'))
+        ev = _float(row.get('ev'))
+        if ev is None and eh is not None:
+            ev = eh * HARTREE_TO_EV
+        if occ is None or ev is None or not math.isfinite(occ) or not math.isfinite(ev):
+            continue
+        if occ < -1e-7 or occ > 2.0001 or abs(ev) > 10000:
+            continue
+        occ = max(0.0, occ)
+        spin_raw = str(row.get('spin') or 'restricted').strip().lower()
+        if spin_raw in ('alpha', 'a', 'spin-up', 'spin up', 'up') or 'alpha' in spin_raw:
+            spin = 'alpha'; explicit_spin = True
+        elif spin_raw in ('beta', 'b', 'spin-down', 'spin down', 'down') or 'beta' in spin_raw:
+            spin = 'beta'; explicit_spin = True
+        else:
+            spin = 'restricted'
+        item = dict(row)
+        item.update({'occ': occ, 'eh': eh, 'ev': ev, 'spin': spin})
+        groups.setdefault(spin, []).append(item)
+
+    # Some parsers expose frontier values without a complete orbital table.
+    for spin in ('restricted', 'alpha', 'beta'):
+        if spin == 'restricted':
+            frontier_keys = (('homo_ev', 1.0), ('lumo_ev', 0.0))
+        else:
+            frontier_keys = ((f'{spin}_homo_ev', 1.0), (f'{spin}_lumo_ev', 0.0))
+        for key, occ in frontier_keys:
+            ev = _float(orb.get(key))
+            if spin in ('alpha', 'beta') and ev is not None:
+                explicit_spin = True
+            matching_occupancy = any((float(z['occ']) > 1e-8) == (occ > 1e-8) for z in groups.get(spin, []))
+            if ev is not None and math.isfinite(ev) and not matching_occupancy:
+                groups.setdefault(spin, []).append({'index': None, 'occ': occ, 'eh': ev/HARTREE_TO_EV, 'ev': ev, 'spin': spin, '_synthetic': True})
+
+    if not groups:
+        h = _float(orb.get('homo_ev')); l = _float(orb.get('lumo_ev'))
+        if h is not None and math.isfinite(h):
+            groups.setdefault('restricted', []).append({'index': None, 'occ': 1.0, 'eh': h/HARTREE_TO_EV, 'ev': h, 'spin': 'restricted', '_synthetic': True})
+        if l is not None and math.isfinite(l):
+            groups.setdefault('restricted', []).append({'index': None, 'occ': 0.0, 'eh': l/HARTREE_TO_EV, 'ev': l, 'spin': 'restricted', '_synthetic': True})
+
+    # Do not merge alpha and beta MO indices into one artificial sequence.
+    if explicit_spin:
+        groups.pop('restricted', None)
+    ordered = {}
+    for spin in ('restricted', 'alpha', 'beta'):
+        rows = groups.get(spin, [])
+        if not rows:
+            continue
+        rows = sorted(rows, key=lambda z: (float(z['ev']), _float(z.get('index')) if _float(z.get('index')) is not None else -1.0))
+        occupied = [z for z in rows if float(z['occ']) > 1e-8]
+        virtual = [z for z in rows if float(z['occ']) <= 1e-8]
+        ordered[spin] = {'all': rows, 'occupied': occupied, 'virtual': virtual,
+                         'homo': occupied[-1] if occupied else None,
+                         'lumo': virtual[0] if virtual else None}
+    return ordered
+
+
+def _frontier_orbital_records_v62(orb, per_side=6):
+    """Build stable HOMO-n/LUMO+n rows, sorted by actual orbital energy."""
+    try:
+        per_side = max(1, min(100, int(per_side)))
+    except (TypeError, ValueError):
+        per_side = 6
+    output = []
+    for spin, channel in _frontier_orbital_channels_v62(orb).items():
+        occupied = channel['occupied']; virtual = channel['virtual']
+        start = max(0, len(occupied) - per_side)
+        for idx in range(start, len(occupied)):
+            distance = len(occupied) - 1 - idx
+            label = 'HOMO' if distance == 0 else f'HOMO-{distance}'
+            output.append((spin, label, occupied[idx]))
+        for idx, row in enumerate(virtual[:per_side]):
+            label = 'LUMO' if idx == 0 else f'LUMO+{idx}'
+            output.append((spin, label, row))
+    return output
+
+
+def _spread_frontier_labels_v62(items, low, high, minimum_gap):
+    """Move label anchors apart in data coordinates while retaining leaders."""
+    if not items:
+        return []
+    ordered = sorted(items, key=lambda x: float(x[1]['ev']))
+    positions = [float(row['ev']) for _, row in ordered]
+    for i in range(1, len(positions)):
+        positions[i] = max(positions[i], positions[i-1] + minimum_gap)
+    if positions[-1] > high:
+        shift = positions[-1] - high
+        positions = [y - shift for y in positions]
+    if positions[0] < low:
+        shift = low - positions[0]
+        positions = [y + shift for y in positions]
+    return [(ordered[i][0], ordered[i][1], positions[i]) for i in range(len(ordered))]
+
+
+def _plot_frontier_orbitals_v62(analysis, outdir):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    orb = (analysis or {}).get('orbitals') or {}
+    channels = _frontier_orbital_channels_v62(orb)
+    if not channels:
+        return None
+    os.makedirs(outdir, exist_ok=True)
+    names = list(channels)
+    shown = {}
+    all_energy = []
+    for spin in names:
+        ch = channels[spin]
+        shown[spin] = {'occupied': ch['occupied'][-3:], 'virtual': ch['virtual'][:3]}
+        all_energy.extend(float(z['ev']) for z in shown[spin]['occupied'] + shown[spin]['virtual'])
+    if not all_energy:
+        return None
+
+    low, high = min(all_energy), max(all_energy)
+    span = high - low
+    distinct_energy = sorted(set(round(v, 10) for v in all_energy))
+    min_spacing = min((b-a for a,b in zip(distinct_energy, distinct_energy[1:])), default=math.inf)
+    energy_digits = 5 if min_spacing < 0.001 else 3
+    if span < 1.8:
+        center = (high + low) / 2.0
+        low, high = center - 0.9, center + 0.9
+        span = 1.8
+    pad = max(0.24, 0.10 * span)
+    ylow, yhigh = low - pad, high + pad
+    # Each annotation has two text lines. Leave enough room in display space;
+    # closely spaced or degenerate energies must not stack their labels.
+    min_label_gap = min(1.10, max(0.82, 0.075 * span))
+    max_labels = max((max(len(v['occupied']), len(v['virtual'])) for v in shown.values()), default=1)
+    required_plot_span = max(1.8, ((max_labels - 1) * min_label_gap) / 0.78 + 0.18)
+    if (yhigh - ylow) < required_plot_span:
+        center = (yhigh + ylow) / 2.0
+        ylow, yhigh = center - required_plot_span/2.0, center + required_plot_span/2.0
+
+    fig_width = 7.8 if len(names) == 1 else 10.2
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8))
+    occ_color = '#245A9B'
+    vir_color = '#D46A2E'
+    ticks = []
+    ticklabels = []
+    for ci, spin in enumerate(names):
+        channel = channels[spin]
+        selected = shown[spin]
+        base = ci * 2.55
+        xo, xv = base, base + 1.02
+        ticks.extend([xo, xv])
+        if spin == 'restricted':
+            ticklabels.extend(['Occupied', 'Virtual'])
+            linestyle = '-'
+            channel_name = 'Restricted'
+        elif spin == 'alpha':
+            ticklabels.extend(['Occupied α', 'Virtual α'])
+            linestyle = '-'
+            channel_name = 'Alpha spin'
+        else:
+            ticklabels.extend(['Occupied β', 'Virtual β'])
+            linestyle = '--'
+            channel_name = 'Beta spin'
+
+        occ_rows = selected['occupied']; vir_rows = selected['virtual']
+        for z in occ_rows:
+            energy = float(z['ev'])
+            lw = 2.6 if z is channel['homo'] else 1.45
+            ax.hlines(energy, xo-0.16, xo+0.16, color=occ_color, lw=lw, linestyle=linestyle, zorder=3)
+        for z in vir_rows:
+            energy = float(z['ev'])
+            lw = 2.6 if z is channel['lumo'] else 1.45
+            ax.hlines(energy, xv-0.16, xv+0.16, color=vir_color, lw=lw, linestyle=linestyle, zorder=3)
+
+        occ_labels = []
+        for distance, z in enumerate(reversed(occ_rows)):
+            label = 'HOMO' if distance == 0 else f'HOMO-{distance}'
+            occ_labels.append((label, z))
+        occ_labels.reverse()
+        vir_labels = [('LUMO' if i == 0 else f'LUMO+{i}', z) for i, z in enumerate(vir_rows)]
+        label_low = ylow + 0.07*span
+        label_high = yhigh - 0.10*span
+        for label, z, ytext in _spread_frontier_labels_v62(occ_labels, label_low, label_high, min_label_gap):
+            y = float(z['ev'])
+            ax.annotate(f'{label}\n{y:.{energy_digits}f} eV', xy=(xo-0.16, y), xytext=(xo-0.25, ytext),
+                        textcoords='data', ha='right', va='center', fontsize=7.1, color='#23313F',
+                        arrowprops={'arrowstyle':'-', 'lw':0.55, 'color':occ_color, 'shrinkA':1.5, 'shrinkB':1.5},
+                        annotation_clip=False, zorder=4)
+        for label, z, ytext in _spread_frontier_labels_v62(vir_labels, label_low, label_high, min_label_gap):
+            y = float(z['ev'])
+            ax.annotate(f'{label}\n{y:.{energy_digits}f} eV', xy=(xv+0.16, y), xytext=(xv+0.25, ytext),
+                        textcoords='data', ha='left', va='center', fontsize=7.1, color='#23313F',
+                        arrowprops={'arrowstyle':'-', 'lw':0.55, 'color':vir_color, 'shrinkA':1.5, 'shrinkB':1.5},
+                        annotation_clip=False, zorder=4)
+
+        homo, lumo = channel['homo'], channel['lumo']
+        if homo is not None and lumo is not None:
+            yh, yl = float(homo['ev']), float(lumo['ev'])
+            gap_x = (xo + xv) / 2.0
+            gap_low, gap_high = min(yh, yl), max(yh, yl)
+            ax.vlines(gap_x, gap_low, gap_high, color='#687583', lw=0.9, zorder=2)
+            ax.hlines([yh, yl], gap_x-0.055, gap_x+0.055, color='#687583', lw=0.9, zorder=2)
+            gap = yl-yh
+            gap_digits = 5 if abs(gap) < 0.001 else 3
+            ax.text(gap_x, yhigh - 0.035*span, f'Δε ({channel_name}) = {gap:.{gap_digits}f} eV',
+                    ha='center', va='top', fontsize=7.0, color='#4B5D6B',
+                    bbox={'facecolor':'white', 'edgecolor':'none', 'alpha':0.88, 'pad':1.1})
+
+    left = -1.38
+    right = (len(names)-1)*2.55 + 2.42
+    ax.set_xlim(left, right)
+    ax.set_ylim(ylow, yhigh)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(ticklabels, fontsize=8)
+    ax.set_ylabel('Orbital energy (eV)')
+    ax.set_title('Frontier orbital energy levels', pad=13, fontsize=12, weight='semibold')
+    ax.grid(axis='y', color='#D7DEE5', linewidth=0.65, alpha=0.72)
+    ax.set_axisbelow(True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#9AA6B2')
+    ax.spines['bottom'].set_color('#9AA6B2')
+    ax.tick_params(axis='y', labelsize=8, colors='#34495E')
+    fig.text(0.5, 0.012, 'Energy-level diagram reconstructed from output energies and occupations; 3D isosurfaces are not available from this plot.',
+             ha='center', va='bottom', fontsize=6.8, color='#667684')
+    fig.tight_layout(rect=(0.01, 0.045, 0.99, 0.97))
+    path = os.path.join(outdir, 'orbital_energies.png')
+    try:
+        fig.savefig(path, dpi=400, bbox_inches='tight', facecolor='white')
+    finally:
+        plt.close(fig)
+    return path
+
+
+_make_plots_v62_base = make_plots
+def make_plots(a, outdir):
+    """Preserve spectrum plots and replace the legacy frontier diagram."""
+    safe_analysis = dict(a or {})
+    safe_analysis['orbitals'] = {'orbitals': []}
+    made = _make_plots_v62_base(safe_analysis, outdir)
+    orbital_path = _plot_frontier_orbitals_v62(a, outdir)
+    if orbital_path:
+        made['orbitals'] = orbital_path
+    return made
+
+
+_parse_output_v62_base = parse_output_text
+def parse_output_text(text, filename='output.out'):
+    """Recompute reported frontiers from validated energies, not print order."""
+    analysis = _parse_output_v62_base(text, filename)
+    if not isinstance(analysis, dict):
+        return analysis
+    orb = analysis.get('orbitals')
+    if not isinstance(orb, dict):
+        return analysis
+    channels = _frontier_orbital_channels_v62(orb)
+    if not channels:
+        return analysis
+    occupied = [float(ch['homo']['ev']) for ch in channels.values() if ch.get('homo') is not None]
+    virtual = [float(ch['lumo']['ev']) for ch in channels.values() if ch.get('lumo') is not None]
+    if occupied:
+        orb['homo_ev'] = max(occupied)
+    else:
+        orb.pop('homo_ev', None)
+    if virtual:
+        orb['lumo_ev'] = min(virtual)
+    else:
+        orb.pop('lumo_ev', None)
+    if occupied and virtual:
+        orb['gap_ev'] = orb['lumo_ev'] - orb['homo_ev']
+    else:
+        orb.pop('gap_ev', None)
+    for spin in ('alpha', 'beta'):
+        channel = channels.get(spin, {})
+        for suffix, field in (('homo', 'homo'), ('lumo', 'lumo')):
+            key = f'{spin}_{suffix}_ev'
+            item = channel.get(field)
+            if item is not None:
+                orb[key] = float(item['ev'])
+            else:
+                orb.pop(key, None)
+    analysis['orbitals'] = orb
+    analysis['conceptual_dft'] = conceptual_dft_descriptors(analysis)
+    return analysis
+
+
+def section_orbitals(a):
+    """Present the same energy-sorted, spin-resolved frontier data as the plot."""
+    orb = (a or {}).get('orbitals') or {}
+    lines = []
+    for key in ('homo_ev', 'lumo_ev', 'gap_ev'):
+        value = _float(orb.get(key))
+        if value is not None and math.isfinite(value):
+            lines.append(f'{key}: {value:.8f} eV')
+    records = _frontier_orbital_records_v62(orb, per_side=20)
+    if records:
+        lines.append('')
+        lines.append('Spin | Label | Index | Occupancy | Energy (Eh) | Energy (eV)')
+        for spin, label, row in records:
+            lines.append(f"{spin} | {label} | {row.get('index','')} | {fmt(row.get('occ'),5)} | {fmt(row.get('eh'),8)} | {fmt(row.get('ev'),8)}")
+        lines.append('Orbital energies do not provide 3D orbital isosurfaces.')
+    descriptors = (a or {}).get('conceptual_dft') or {}
+    mapping = [
+        ('ionization_potential_ev','Ionization potential I','eV'),
+        ('electron_affinity_ev','Electron affinity A','eV'),
+        ('chemical_hardness_ev','Chemical hardness eta','eV'),
+        ('chemical_potential_ev','Chemical potential mu','eV'),
+        ('electronegativity_ev','Electronegativity chi','eV'),
+        ('chemical_softness_ev','Chemical softness S','eV^-1'),
+        ('electrophilicity_index_ev','Electrophilicity index omega','eV'),
+        ('electrodonating_power_ev','Electrodonating power omega-','eV'),
+        ('electroaccepting_power_ev','Electroaccepting power omega+','eV'),
+        ('net_electrophilicity_ev','Net electrophilicity Delta omega','eV'),
+    ]
+    extra = [f'{label}: {float(descriptors[key]):.8f} {unit}' for key,label,unit in mapping if descriptors.get(key) is not None]
+    if extra:
+        lines.extend(['','Conceptual DFT descriptors:'] + extra)
+    return '\n'.join(lines) if lines else 'No valid orbital-energy table was recognized.'
+'''
+
+ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE + "\n" + ANALYZER_V58_PATCH_CODE + "\n" + ANALYZER_V59_PATCH_CODE + "\n" + ANALYZER_V62_PATCH_CODE
 
 exec(ANALYZER_MODULE_CODE, globals())
 
@@ -3585,11 +3981,15 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v5.9 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v6.2.1 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
-    return message.chat.id in ALLOWED_IDS or message.from_user.id in ALLOWED_IDS
+    chat = getattr(message, 'chat', None)
+    sender = getattr(message, 'from_user', None)
+    chat_id = getattr(chat, 'id', None)
+    user_id = getattr(sender, 'id', None)
+    return chat_id in ALLOWED_IDS or user_id in ALLOWED_IDS
 
 
 def split_send(chat_id, text, title=None):
@@ -3605,7 +4005,7 @@ def out_menu(session_id, a):
     buttons = [
         ("📋 Summary", "summary"), ("⚡ Energies", "energy"),
         ("🌡 Thermochemistry", "thermo"), ("〰️ Vibrations / IR", "vib"),
-        ("🌈 TD-DFT / UV-Vis", "uv"), ("🧬 Orbitals", "orb"), ("⚛️ Structure / Charges", "structure"),
+        ("🌈 TD-DFT / UV-Vis", "uv"), ("🧬 Frontier energies", "orb"), ("⚛️ Structure / Charges", "structure"),
         ("📈 Optimization", "optplot"), ("🩺 Diagnostics", "diag"),
         ("📄 Full PDF", "pdf"), ("🖼 All plots", "plots"),
         ("📊 Compare spectra", "compare"),
@@ -3866,7 +4266,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v5.9\n"
+        "🧪 Computational Chemistry Bot v6.2.1\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
@@ -3883,7 +4283,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v5.9-PSI4-REPORTS-20260926\n'
+        'ChemBot build: v6.2.1-FRONTIER-20260926\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -3943,7 +4343,7 @@ def callback(call):
             elif action=='thermo': bot.send_message(call.message.chat.id,"Choose thermochemical data:",reply_markup=thermo_menu(sid))
             elif action=='vib': bot.send_message(call.message.chat.id,"Choose vibrational output:",reply_markup=spectrum_menu(sid))
             elif action=='uv': bot.send_message(call.message.chat.id,"Choose electronic-spectrum output:",reply_markup=uv_menu(sid))
-            elif action=='orb': split_send(call.message.chat.id,section_orbitals(a),'🧬 Molecular orbitals')
+            elif action=='orb': split_send(call.message.chat.id,section_orbitals(a),'🧬 Frontier orbital energies')
             elif action=='structure': split_send(call.message.chat.id,section_structure(a),'⚛️ Structure / charges / dipole')
             elif action=='diag': split_send(call.message.chat.id,section_diagnostics(a),'🩺 Diagnostics')
             elif action=='optplot':
@@ -3974,7 +4374,9 @@ def callback(call):
                     with open(p,'rb') as f: bot.send_photo(call.message.chat.id,f,caption='Simulated UV-Vis spectrum')
                 else: bot.send_message(call.message.chat.id,'No UV-Vis plot is available.')
     except Exception as e:
-        try: bot.answer_callback_query(call.id,"Error: "+str(e)[:150],show_alert=True)
+        error_id=uuid.uuid4().hex[:10]
+        print('Callback failure reference',error_id,':',repr(e))
+        try: bot.answer_callback_query(call.id,'Could not complete this action. Please retry.',show_alert=True)
         except Exception: pass
 
 
@@ -4006,7 +4408,8 @@ def handle_document(message):
             import traceback
             print('Direct .out analysis failure for', original_name)
             traceback.print_exc()
-            bot.reply_to(message,'Analysis error: '+str(e))
+            error_id=uuid.uuid4().hex[:10]
+            bot.reply_to(message,'Analysis failed while processing this output. Please retry or resend it. Reference: '+error_id)
         return
 
     # Auxiliary job files
@@ -4194,7 +4597,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v5.9 webhook mode active on port {port}.")
+    print(f"CHEMBOT v6.2.1 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -4235,7 +4638,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v5.9 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v6.2.1 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
@@ -4243,7 +4646,7 @@ def run_polling():
             raise RuntimeError(
                 "Telegram 409 conflict: another process is already polling this bot token. "
                 "Stop the other local/Render bot instance, or deploy ChemBot as a Render Web Service "
-                "so v5.7 uses webhook mode."
+                "so the configured webhook transport can be used."
             ) from exc
         raise
 
