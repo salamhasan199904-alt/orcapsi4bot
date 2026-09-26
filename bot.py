@@ -1,3 +1,4 @@
+# BUILD: v4.8-Q1-FTIR-MO-FIXED-20260926
 import os
 import re
 import sys
@@ -664,7 +665,7 @@ def make_plots(a, outdir):
                 continue
             if freq > 0 and inten >= 0:
                 pairs.append((freq, inten))
-        # Prefer conventional mid-IR presentation (4000–400 cm^-1) when possible.
+        # Prefer conventional mid-IR presentation (4000–400 cm^-1).
         mid_ir=[(f,i) for f,i in pairs if 400.0 <= f <= 4000.0]
         use = mid_ir if mid_ir else pairs
         if use:
@@ -672,26 +673,25 @@ def make_plots(a, outdir):
             y=np.array([i for _,i in use], dtype=float)
             if np.max(y) > 0:
                 y = y / np.max(y)
-            lo = max(0.0, np.min(x) - 120.0)
-            hi = min(4000.0, np.max(x) + 120.0)
-            if mid_ir:
-                lo = max(400.0, lo)
-                hi = min(4000.0, hi)
+            lo = 400.0 if mid_ir else max(0.0, np.min(x) - 120.0)
+            hi = 4000.0 if mid_ir else float(np.max(x) + 120.0)
             if hi <= lo:
                 lo, hi = float(np.min(x)), float(np.max(x))
-            grid=np.linspace(lo, hi, 3200)
-            yy=_gaussian_broaden(x, y, grid, sigma=12.0)
+            grid=np.linspace(lo, hi, 3600)
+            yy=_gaussian_broaden(x, y, grid, sigma=16.0)
             if np.max(yy) > 0:
                 yy = yy / np.max(yy)
+            trans = 100.0 - 92.0 * yy
+            sticks = 100.0 - 35.0 * y
             fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
-            ax.plot(grid, yy, lw=1.6)
-            ax.vlines(x, 0, y, alpha=.20, linewidth=0.6)
+            ax.plot(grid, trans, lw=1.8)
+            ax.vlines(x, 100.0, sticks, alpha=.12, linewidth=0.6)
             ax.set_xlabel('Wavenumber (cm$^{-1}$)')
-            ax.set_ylabel('Relative intensity')
-            ax.set_title('Calculated IR spectrum')
+            ax.set_ylabel('Transmittance (%)')
+            ax.set_title('Simulated FT-IR spectrum')
             ax.set_xlim(hi, lo)
-            ax.set_ylim(0, 1.05)
-            ax.grid(alpha=.2)
+            ax.set_ylim(0, 102)
+            ax.grid(alpha=.18)
             fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['ir']=p
 
     states=[s for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
@@ -761,6 +761,18 @@ def make_plots(a, outdir):
         if subset:
             ys=[float(z.get('ev')) for z in subset]
             fig=plt.figure(figsize=(6.8,7.2)); ax=fig.add_subplot(111)
+
+            def _spread_positions(yvals, min_sep=0.12):
+                if not yvals:
+                    return []
+                out=[float(yvals[0])]
+                for yv in yvals[1:]:
+                    yv=float(yv)
+                    if yv - out[-1] < min_sep:
+                        yv = out[-1] + min_sep
+                    out.append(yv)
+                return out
+
             for z in show_occ:
                 yv=float(z.get('ev'))
                 lw=2.4 if z is occ[-1] else 1.4
@@ -773,17 +785,20 @@ def make_plots(a, outdir):
             lumo = vir[0] if vir else None
             if homo is not None:
                 yv=float(homo.get('ev'))
-                ax.text(-0.39, yv, f"HOMO\n{yv:.2f} eV", ha='right', va='center', fontsize=9)
+                ax.text(-0.40, yv, f"HOMO\n{yv:.2f} eV", ha='right', va='center', fontsize=9)
             if lumo is not None:
                 yv=float(lumo.get('ev'))
-                ax.text(0.39, yv, f"LUMO\n{yv:.2f} eV", ha='left', va='center', fontsize=9)
-            # Minimal, readable annotation for the nearest levels only.
-            for z in show_occ[-3:-1]:
+                ax.text(0.40, yv, f"LUMO\n{yv:.2f} eV", ha='left', va='center', fontsize=9)
+            occ_lab = show_occ[-3:-1]
+            vir_lab = show_vir[1:3]
+            occ_text_y = _spread_positions([float(z.get('ev')) for z in occ_lab], min_sep=0.11)
+            vir_text_y = _spread_positions([float(z.get('ev')) for z in vir_lab], min_sep=0.11)
+            for z, yt in zip(occ_lab, occ_text_y):
                 yv=float(z.get('ev'))
-                ax.text(-0.06, yv, str(z.get('index')), ha='right', va='center', fontsize=7)
-            for z in show_vir[1:3]:
+                ax.annotate(str(z.get('index')), xy=(-0.08, yv), xytext=(-0.02, yt), textcoords='data', ha='right', va='center', fontsize=7, arrowprops=dict(arrowstyle='-', lw=0.5, shrinkA=0, shrinkB=0))
+            for z, yt in zip(vir_lab, vir_text_y):
                 yv=float(z.get('ev'))
-                ax.text(0.06, yv, str(z.get('index')), ha='left', va='center', fontsize=7)
+                ax.annotate(str(z.get('index')), xy=(0.08, yv), xytext=(0.02, yt), textcoords='data', ha='left', va='center', fontsize=7, arrowprops=dict(arrowstyle='-', lw=0.5, shrinkA=0, shrinkB=0))
             if homo is not None and lumo is not None:
                 yh=float(homo.get('ev')); yl=float(lumo.get('ev'))
                 gap = yl - yh
@@ -1868,7 +1883,7 @@ def make_overlay_plot(analyses, kind, outpath, normalize=True, sigma=None):
         ax.set_title('TD-DFT / UV-Vis overlay')
         ax.set_ylim(bottom=0)
     else:
-        sigma=12.0 if sigma is None else float(sigma)
+        sigma=16.0 if sigma is None else float(sigma)
         pool=[]
         for a in analyses:
             pts=[(float(x), abs(float(y or 0.0))) for x,y in a.get('ir_spectrum',[]) if x is not None and float(x)>0]
@@ -1886,14 +1901,15 @@ def make_overlay_plot(analyses, kind, outpath, normalize=True, sigma=None):
             pts=[(f,i) for f,i in pts if lo <= f <= hi]
             if not pts:
                 continue
-            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=normalize,n=3600)
-            ax.plot(x,y,lw=1.6,label=Path(a.get('filename','spectrum')).stem)
+            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=True,n=3600)
+            trans = 100.0 - 92.0 * y
+            ax.plot(x,trans,lw=1.5,label=Path(a.get('filename','spectrum')).stem)
             used+=1
         ax.set_xlim(hi,lo)
         ax.set_xlabel('Wavenumber (cm$^{-1}$)')
-        ax.set_ylabel('Relative intensity' if normalize else 'Calculated intensity')
-        ax.set_title('Calculated FT-IR overlay')
-        ax.set_ylim(bottom=0)
+        ax.set_ylabel('Transmittance (%)')
+        ax.set_title('Simulated FT-IR overlay')
+        ax.set_ylim(0,102)
     if used<2:
         plt.close(fig)
         return None
@@ -2428,7 +2444,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v4.7\n\n"
+        "🧪 Computational Chemistry Bot v4.8\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
         "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
@@ -2739,7 +2755,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v4.7 webhook mode active on port {port}.")
+    print(f"CHEMBOT v4.8 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -2788,7 +2804,7 @@ def run_polling():
             raise RuntimeError(
                 "Telegram 409 conflict: another process is already polling this bot token. "
                 "Stop the other local/Render bot instance, or deploy ChemBot as a Render Web Service "
-                "so v4.7 uses webhook mode."
+                "so v4.8 uses webhook mode."
             ) from exc
         raise
 
