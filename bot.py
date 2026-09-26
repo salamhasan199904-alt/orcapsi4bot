@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v4.3
+# Chemistry Telegram/Kaggle Bot v4.4
 # - ORCA 6.x + Psi4 jobs on Kaggle
 # - Kaggle keeps sending results even if local launcher is closed
 # - Direct .out analysis with interactive Telegram menus
@@ -635,7 +635,7 @@ def make_plots(a, outdir):
         nms=[s['nm'] for s in states]; lo=max(100,min(nms)-80); hi=min(2000,max(nms)+80); grid=np.linspace(lo,hi,2500); yy=np.zeros_like(grid); sigma=10.0
         for s in states: yy += max(0.0,s.get('f') or 0.0)*np.exp(-0.5*((grid-s['nm'])/sigma)**2)
         if yy.max()>0: yy=yy/yy.max()
-        fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111); ax.plot(grid,yy,lw=1.6); ax.vlines(nms,[0]*len(nms),[(s.get('f') or 0.0)/(max([z.get('f') or 0.0 for z in states]) or 1) for s in states],alpha=.45); ax.set_xlabel('Wavelength (nm)'); ax.set_ylabel('Relative intensity'); ax.set_title('Simulated UV-Vis spectrum (Gaussian broadening)'); ax.grid(alpha=.2); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['uvvis']=p
+        fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111); ax.plot(grid,yy,lw=1.6); ax.vlines(nms,[0]*len(nms),[max(0.0,(s.get('f') or 0.0))/(max([max(0.0,z.get('f') or 0.0) for z in states]) or 1) for s in states],alpha=.45); ax.set_xlabel('Wavelength (nm)'); ax.set_ylabel('Relative intensity'); ax.set_title('Simulated UV-Vis spectrum (Gaussian broadening)'); ax.grid(alpha=.2); fig.tight_layout(); fig.savefig(p,dpi=220); plt.close(fig); made['uvvis']=p
     raman=a.get('raman_spectrum',[])
     if raman:
         p=os.path.join(outdir,'raman_spectrum.png')
@@ -690,106 +690,691 @@ def _last_match_value(text, pattern, group='value', flags=re.I | re.M):
     try: return _float(ms[-1].group(group))
     except Exception: return _float(ms[-1].group(1))
 
-def _parse_orca_precise(text, filename):
-    F=FLOAT_RE
-    normal=bool(re.search(r'ORCA\s+TERMINATED\s+NORMALLY',text,re.I))
-    fatal_rx=re.compile(r'(?:ORCA\s+finished\s+by\s+error\s+termination|\bORCA\s+TERMINATED\s+ABNORMALLY\b|\bTERMINATED\s+ABNORMALLY\b|\bAn\s+error\s+has\s+occurred\b|\bINPUT\s+ERROR\b|\bABORTING\s+THE\s+RUN\b|\bUNRECOGNIZED\s+OR\s+DUPLICATED\s+KEYWORD)',re.I)
-    errors=[ln.strip() for ln in text.splitlines() if fatal_rx.search(ln)]
-    m=re.search(r'Program Version\s+(\d+(?:\.\d+)*)',text,re.I); version=m.group(1) if m else None
-    basis=method=dispersion=solvent=solvation=None
-    ms=list(re.finditer(r'Your calculation utilizes the basis:\s*(?P<basis>.*)$',text,re.I|re.M))
-    if ms: basis=ms[-1].group('basis').strip()
-    xm=list(re.finditer(r'Exchange Functional\s+Exchange\s*\.+\s*(?P<value>\S+)',text,re.I))
-    cm=list(re.finditer(r'Correlation Functional\s+Correlation\s*\.+\s*(?P<value>\S+)',text,re.I))
-    if xm:
-        method=xm[-1].group('value')
-        if cm: method += '/' + cm[-1].group('value')
-    elif re.search(r'\bHF\s+CALCULATION\b',text,re.I): method='HF'
-    elif re.search(r'\bCOMPOSITE\s+CALCULATION\b',text,re.I): method='Composite method'
-    dm=list(re.finditer(r'(?:vdW-correction\s*:|Dispersion\s+correction\s*\.+)\s*(?P<value>D3BJ|D4|DFT-D3)',text,re.I))
-    if dm: dispersion=dm[-1].group('value')
-    sm=list(re.finditer(r'SMD\s+(?:Solvation\s+Model\s+.*\s+Solvent\s*:|solvent\s*\.+)\s*(?P<solvent>\S+)',text,re.I))
-    cp=list(re.finditer(r'CPCM\s+Solvation\s+Model\s+.*\s+Solvent\s*:\s*(?P<solvent>\S+)',text,re.I))
-    if sm: solvation='SMD'; solvent=sm[-1].group('solvent')
-    elif cp: solvation='CPCM'; solvent=cp[-1].group('solvent')
-    energies={}
-    sp=_last_match_value(text,rf'FINAL SINGLE POINT ENERGY\s+(?P<value>{F})')
-    if sp is not None:
-        energies['final_energy_hartree']=sp; energies['final_energy_kj_mol']=sp*HARTREE_TO_KJMOL; energies['final_energy_ev']=sp*HARTREE_TO_EV
-    opt=[_float(x) for x in re.findall(rf'FINAL SINGLE POINT ENERGY\s+({F})',text,re.I) if _float(x) is not None]
-    tr={}
-    pats={
-      'temperature_K':rf'^\s*Temperature\s*\.+\s*(?P<value>{F})\s*K\b',
-      'pressure_atm':rf'^\s*Pressure\s*\.+\s*(?P<value>{F})\s*atm\b',
-      'zpe_hartree':rf'(?:(?:Non-thermal|Total)\s+)?Zero[ -]point (?:vibrational )?energy\s*\.*\s*(?P<value>{F})\s*Eh',
-      'thermal_energy_hartree':rf'Total thermal energy\s*\.+\s*(?P<value>{F})\s*Eh',
-      'thermal_energy_correction_hartree':rf'Thermal energy correction\s*\.+\s*(?P<value>{F})\s*Eh',
-      'enthalpy_correction_hartree':rf'Thermal\s+(?:Enthalpy|[Ee]nthalpy)\s+correction\s*\.+\s*(?P<value>{F})\s*Eh',
-      'gibbs_correction_hartree':rf'Thermal(?: Gibbs)?\s+(?:free\s+)?[Ee]nergy correction\s*\.+\s*(?P<value>{F})\s*Eh',
-      'enthalpy_hartree':rf'(?:Total|Final)(?:\s+thermal)?\s+enthalpy\s*\.*\s*(?P<value>{F})\s*Eh',
-      'gibbs_hartree':rf'(?:Final|Total)\s+Gibbs\s+(?:free\s+)?(?:energy|enthalpy)\s*\.*\s*(?P<value>{F})\s*Eh',
-      'entropy_term_hartree':rf'Final entropy term\s*\.*\s*(?P<value>{F})\s*Eh',
-      'entropy_correction_hartree':rf'Total entropy correction\s*\.*\s*(?P<value>{F})\s*Eh',
-      'S_vib_cal_mol_K':rf'S_vib\s*\.+\s*(?P<value>{F})\s*cal/mol-K',
-      'S_rot_cal_mol_K':rf'S_rot\s*\.+\s*(?P<value>{F})\s*cal/mol-K',
-      'S_trans_cal_mol_K':rf'S_trans\s*\.+\s*(?P<value>{F})\s*cal/mol-K',
-      'S_elec_cal_mol_K':rf'S_elec\s*\.+\s*(?P<value>{F})\s*cal/mol-K'}
-    for k,rx in pats.items():
-        v=_last_match_value(text,rx)
-        if v is not None: tr[k]=v
-    for k in list(tr):
-        if k.endswith('_hartree'): tr[k.replace('_hartree','_kj_mol')]=tr[k]*HARTREE_TO_KJMOL
-    sent=[tr.get(k) for k in ('S_vib_cal_mol_K','S_rot_cal_mol_K','S_trans_cal_mol_K','S_elec_cal_mol_K') if tr.get(k) is not None]
-    if sent: tr['entropy_cal_mol_K']=sum(sent); tr['entropy_J_mol_K']=sum(sent)*4.184
-    qrrho=re.search(r'(quasi[ \-]?RRHO\s+method\s+of\s+Grimme|Grimme[ \-]?quasi[ \-]?RRHO|Standard-RRHO|modified\s+free\s+rotor)',text,re.I)
-    if qrrho: tr['thermo_treatment']=qrrho.group(1)
-    cutoff=_last_match_value(text,rf'Frequency cutoff for the RRHO\s*\.+\s*(?P<value>{F})\s*cm\*\*-1')
-    if cutoff is not None: tr['rrho_cutoff_cm1']=cutoff
-    geometry=parse_final_geometry(text)
-    freqs=[]; in_freq=False
-    freq_row=re.compile(rf'^\s*\d+:\s*(?P<cm>{F})(?:\s*cm\*\*-1|\s*cm\^-1|\s*cm-1)?(?P<imag>\s*(?:\*\*\*imaginary\s+mode\*\*\*|\(imaginary\s+mode\)|imaginary))?',re.I)
+def _orca_input_method(text):
+    """Recover the user-requested ORCA method from the echoed SimpleInput line.
+
+    ORCA's descriptive Exchange/Correlation lines may report component
+    functionals (e.g. PBE/PBE) even when the actual hybrid method is PBE0.
+    The echoed input keyword is therefore authoritative when available.
+    """
+    candidates = []
     for line in text.splitlines():
-        if re.search(r'\b(?:VIBRATIONAL\s+FREQUENCIES|3N-6\s+VIBRATIONAL\s+FREQUENCIES|3N-5\s+VIBRATIONAL\s+FREQUENCIES)\b',line,re.I):
-            in_freq=True; freqs=[]; continue
-        if in_freq and re.search(r'\bIR\s+SPECTRUM\b|\bTHERMOCHEMISTRY\b|\bNORMAL\s+MODES\b',line,re.I):
-            in_freq=False; continue
-        if in_freq:
-            m=freq_row.match(line)
+        m = re.match(r'^\s*\|\s*\d+>\s*!\s*(.+)$', line)
+        if m:
+            candidates.append(m.group(1))
+        else:
+            m = re.match(r'^\s*!\s+(.+)$', line)
             if m:
-                v=_float(m.group('cm'))
-                if v is not None:
-                    if m.group('imag') and v>0: v=-v
-                    freqs.append(v)
-    ir=[]; in_ir=False
+                candidates.append(m.group(1))
+
+    # Most specific patterns first. Canonical spelling is preserved.
+    method_patterns = [
+        (r'\bDLPNO-CCSD\(T\)\b', 'DLPNO-CCSD(T)'),
+        (r'\bDLPNO-CCSD\b', 'DLPNO-CCSD'),
+        (r'\bCCSD\(T\)\b', 'CCSD(T)'),
+        (r'\bCCSD\b', 'CCSD'),
+        (r'\bNEVPT2\b', 'NEVPT2'),
+        (r'\bCASSCF\b', 'CASSCF'),
+        (r'\bRI-?MP2\b', 'RI-MP2'),
+        (r'\bMP2\b', 'MP2'),
+        (r'\bCAM-?B3LYP\b', 'CAM-B3LYP'),
+        (r'\bB3LYP\b', 'B3LYP'),
+        (r'\bPBE0\b', 'PBE0'),
+        (r'\bM06-?2X\b', 'M06-2X'),
+        (r'\bM06-?L\b', 'M06-L'),
+        (r'\bM06\b', 'M06'),
+        (r'\b(?:w|ω)B97X-?D4\b', 'wB97X-D4'),
+        (r'\b(?:w|ω)B97X\b', 'wB97X'),
+        (r'\b(?:w|ω)B97M-?V\b', 'wB97M-V'),
+        (r'\br2SCAN-?3C\b', 'r2SCAN-3C'),
+        (r'\bB97-?3C\b', 'B97-3C'),
+        (r'\bTPSSh\b', 'TPSSh'),
+        (r'\bTPSS\b', 'TPSS'),
+        (r'\bBP86\b', 'BP86'),
+        (r'\bBLYP\b', 'BLYP'),
+        (r'\brevPBE\b', 'revPBE'),
+        (r'\bPBE\b', 'PBE'),
+        (r'\bHF\b', 'HF'),
+    ]
+    for line in candidates:
+        for rx, canonical in method_patterns:
+            if re.search(rx, line, re.I):
+                return canonical
+
+    # Fallback: search only the early input/header region, not the whole
+    # calculation tables, to avoid misidentifying component functional names.
+    head = '\n'.join(text.splitlines()[:500])
+    for rx, canonical in method_patterns:
+        if re.search(rx, head, re.I):
+            return canonical
+    return None
+
+
+def _orca_split_jobs(text):
+    """Split ORCA output into logical job blocks using ORCA_ENGINE semantics."""
+    jobs, cur = [], []
+    seen = False
     for line in text.splitlines():
-        if re.search(r'\bIR\s+SPECTRUM\b',line,re.I): in_ir=True; ir=[]; continue
-        if in_ir:
-            m=re.match(rf'^\s*(?P<mode>\d+):\s*(?P<freq>{F})\s+(?P<t2>{F})',line,re.I)
-            if m: ir.append((_float(m.group('freq')),_float(m.group('t2')) or 0.0)); continue
-            if ir and re.search(r'\bRAMAN\s+SPECTRUM\b',line,re.I): in_ir=False
-    td=[]; active=False; state_idx=0
-    for line in text.splitlines():
-        u=line.upper()
-        if 'SOC CORRECTED ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS' in u: active=False; continue
-        if 'ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS' in u and 'SOC CORRECTED' not in u:
-            active=True; td=[]; state_idx=0; continue
-        if active:
-            mt=re.match(rf'^\s*\S+\s+->\s+\S+\s+(?P<ev>{F})\s+(?P<cm>{F})\s+(?P<nm>{F})\s+(?P<fosc>{F})(?:\s|$)',line,re.I)
-            m=re.match(rf'^\s*\d+\s+(?P<cm>{F})\s+(?P<nm>{F})\s+(?P<fosc>{F})(?:\s|$)',line,re.I)
-            mm=mt or m
+        stripped = line.strip()
+        starts = ('$new_job' in stripped.lower()) or ('O   R   C   A' in stripped and seen)
+        if starts and cur:
+            jobs.append('\n'.join(cur))
+            cur = []
+            seen = False
+        cur.append(line)
+        if stripped and (
+            'FINAL SINGLE POINT ENERGY' in stripped.upper()
+            or 'Program Version' in stripped
+            or 'CARTESIAN COORDINATES' in stripped.upper()
+            or 'ORCA TERMINATED' in stripped.upper()
+        ):
+            seen = True
+    if cur:
+        jobs.append('\n'.join(cur))
+    return [j for j in jobs if j.strip()]
+
+
+def _orca_parse_one_job(text, filename):
+    """ORCA parser compatible with chemistry-web-lab/orca_engine state machine.
+
+    The section reset rules, table anchors, thermochemistry labels, TD-DFT
+    absorption table, coordinate-unit handling, charge tables, and stationary
+    point classification mirror ORCA_ENGINE. The output is adapted only to the
+    Telegram bot's historical dictionary schema.
+    """
+    F = FLOAT_RE
+    lines = text.splitlines()
+
+    # ---------- scalar/global observables ----------
+    normal = None
+    errors = []
+    version = None
+    basis = None
+    method = None
+    exchange = None
+    correlation = None
+    dispersion = None
+    solvation = None
+    solvent = None
+    charge = None
+    multiplicity = None
+    dipole = None
+    s2_actual = None
+    s2_ideal = None
+
+    thermo = {}
+    final_energy = None
+    optimization_energies = []
+
+    # ---------- stateful/final-section observables ----------
+    state = 'SEARCHING'
+    coord_unit = None
+    final_geometry = []
+    current_geometry = []
+    orbitals_all = []
+    current_orbitals = []
+    current_spin = 'restricted'
+    td_cm = []
+    td_fosc = []
+    freqs = []
+    imag = []
+    ir = []
+    charge_type = None
+    atomic_charge_sets = {}
+    expecting_basis = False
+
+    # Regexes copied/aligned to ORCA_ENGINE RegexLibrary.
+    rx_version = re.compile(r'Program Version\s+(?P<version>\d+(?:\.\d+)*)', re.I)
+    rx_basis = re.compile(r'Your calculation utilizes the basis:\s*(?P<basis>.*)$', re.I)
+    rx_exchange = re.compile(r'Exchange Functional\s+Exchange\s*\.+\s*(?P<value>\S+)', re.I)
+    rx_corr = re.compile(r'Correlation Functional\s+Correlation\s*\.+\s*(?P<value>\S+)', re.I)
+    rx_disp = re.compile(r'\bDFT\s+DISPERSION\s+CORRECTION\b|(?:vdW-correction\s*:|Dispersion\s+correction\s*\.+)\s*(?P<value>D3BJ|D4|DFT-D3)', re.I)
+    rx_solvent = re.compile(r'Solvent:\s*(?P<solvent>\S+)', re.I)
+    rx_cpcm = re.compile(r'CPCM\s+Solvation\s+Model\s+.*\s+Solvent\s*:\s*(?P<solvent>\S+)', re.I)
+    rx_smd = re.compile(r'SMD\s+(?:Solvation\s+Model\s+.*\s+Solvent\s*:|solvent\s*\.+)\s*(?P<solvent>\S+)', re.I)
+    rx_solvation = re.compile(r'utilizes the\s+(?P<model>\w+)\s+solvation module', re.I)
+    rx_charge = re.compile(r'Total Charge\s+Charge\s*\.+\s*(?P<value>[-+]?\d+)', re.I)
+    rx_mult = re.compile(r'Multiplicity\s+Mult\s*\.+\s*(?P<value>\d+)', re.I)
+    rx_temp = re.compile(rf'^\s*Temperature\s*\.+\s*(?P<value>{F})\s*K\b', re.I)
+    rx_press = re.compile(rf'^\s*Pressure\s*\.+\s*(?P<value>{F})\s*atm\b', re.I)
+    rx_sp = re.compile(rf'FINAL SINGLE POINT ENERGY\s+(?P<value>{F})', re.I)
+    rx_zpe = re.compile(rf'(?:(?:Non-thermal|Total)\s+)?Zero[ -]point (?:vibrational )?energy\s*\.*\s*(?P<value>{F})\s*Eh', re.I)
+    rx_thermal_e = re.compile(rf'Total thermal energy\s*\.+\s*(?P<value>{F})\s*Eh', re.I)
+    rx_thermal_corr = re.compile(rf'Thermal energy correction\s*\.+\s*(?P<value>{F})\s*Eh', re.I)
+    rx_hcorr = re.compile(rf'Thermal\s+(?:Enthalpy|[Ee]nthalpy)\s+correction\s*\.+\s*(?P<value>{F})\s*Eh', re.I)
+    rx_gcorr = re.compile(rf'Thermal(?: Gibbs)?\s+(?:free\s+)?[Ee]nergy correction\s*\.+\s*(?P<value>{F})\s*Eh', re.I)
+    rx_g = re.compile(rf'(?:Final|Total)\s+Gibbs\s+(?:free\s+)?(?:energy|enthalpy)\s*\.*\s*(?P<value>{F})\s*Eh', re.I)
+    rx_h = re.compile(rf'(?:Total|Final)(?:\s+thermal)?\s+enthalpy\s*\.*\s*(?P<value>{F})\s*Eh', re.I)
+    rx_entropy_term = re.compile(rf'Final entropy term\s*\.*\s*(?P<value>{F})\s*Eh', re.I)
+    rx_entropy_corr = re.compile(rf'Total entropy correction\s*\.*\s*(?P<value>{F})\s*Eh', re.I)
+    rx_svib = re.compile(rf'S_vib\s*\.+\s*(?P<value>{F})\s*cal/mol-K', re.I)
+    rx_srot = re.compile(rf'S_rot\s*\.+\s*(?P<value>{F})\s*cal/mol-K', re.I)
+    rx_strans = re.compile(rf'S_trans\s*\.+\s*(?P<value>{F})\s*cal/mol-K', re.I)
+    rx_selec = re.compile(rf'S_elec\s*\.+\s*(?P<value>{F})\s*cal/mol-K', re.I)
+    rx_qrrho = re.compile(r'(?P<treatment>quasi[ \-]?RRHO\s+method\s+of\s+Grimme|Grimme[ \-]?quasi[ \-]?RRHO|Standard-RRHO|modified\s+free\s+rotor)', re.I)
+    rx_qcut = re.compile(rf'Frequency cutoff for the RRHO\s*\.+\s*(?P<value>{F})\s*cm\*\*-1', re.I)
+    rx_dipole = re.compile(rf'(?:Total\s+Dipole\s+Moment\s*:\s*|Magnitude\s*\(\s*Debye\s*\)\s*:\s*)(?P<value>{F})', re.I)
+    rx_s2 = re.compile(rf'(?<!Ideal\s)<\s*S\*\*2\s*>\s*:\s*(?P<value>{F})', re.I)
+    rx_s2i = re.compile(rf'Ideal\s*<\s*S\*\*2\s*>\s*:\s*(?P<value>{F})', re.I)
+    rx_normal = re.compile(r'ORCA\s+TERMINATED\s+NORMALLY', re.I)
+    rx_fatal = re.compile(r'(?:ORCA\s+finished\s+by\s+error\s+termination|\bORCA\s+TERMINATED\s+ABNORMALLY\b|\bTERMINATED\s+ABNORMALLY\b|\bAn\s+error\s+has\s+occurred\b|\bINPUT\s+ERROR\b|\bABORTING\s+THE\s+RUN\b|\bUNRECOGNIZED\s+OR\s+DUPLICATED\s+KEYWORD)', re.I)
+
+    rx_coord = re.compile(r'\bCARTESIAN\s+COORDINATES\b', re.I)
+    rx_coord_ang = re.compile(r'\bCARTESIAN\s+COORDINATES\s*\(\s*ANGSTROEM\s*\)', re.I)
+    rx_coord_au = re.compile(r'\bCARTESIAN\s+COORDINATES\s*\(\s*A\.U\.\s*\)', re.I)
+    rx_orbsec = re.compile(r'\b(?:ORBITAL\s+ENERGIES|MOLECULAR\s+ORBITALS|MO\s+ENERGIES|MOLECULAR\s+ORBITAL\s+ENERGIES)\b', re.I)
+    rx_spin_up = re.compile(r'\b(?:SPIN\s+UP\s+ORBITALS|ALPHA\s+(?:MOLECULAR\s+)?ORBITALS)\b', re.I)
+    rx_spin_dn = re.compile(r'\b(?:SPIN\s+DOWN\s+ORBITALS|BETA\s+(?:MOLECULAR\s+)?ORBITALS)\b', re.I)
+    rx_orbrow = re.compile(rf'^\s*(?P<idx>\d+)\s+(?P<occ>{F})\s+(?P<eh>{F})(?:\s+(?P<ev>{F}))?(?:\s|$)', re.I)
+
+    rx_tdsec = re.compile(r'(?<!CORRECTED\s)\bABSORPTION\s+SPECTRUM\s+VIA\s+TRANSITION\s+ELECTRIC\s+DIPOLE\s+MOMENTS\b', re.I)
+    rx_tdsoc = re.compile(r'\bSOC\s+CORRECTED\s+ABSORPTION\s+SPECTRUM\s+VIA\s+TRANSITION\s+ELECTRIC\s+DIPOLE\s+MOMENTS\b', re.I)
+    rx_td = re.compile(rf'^\s*\d+\s+(?P<cm>{F})\s+(?P<nm>{F})\s+(?P<fosc>{F})(?:\s|$)', re.I)
+    rx_tdtrans = re.compile(rf'^\s*\S+\s+->\s+\S+\s+(?P<ev>{F})\s+(?P<cm>{F})\s+(?P<nm>{F})\s+(?P<fosc>{F})(?:\s|$)', re.I)
+
+    rx_freqsec = re.compile(r'\b(?:VIBRATIONAL\s+FREQUENCIES|3N-6\s+VIBRATIONAL\s+FREQUENCIES|3N-5\s+VIBRATIONAL\s+FREQUENCIES)\b', re.I)
+    rx_freqrow = re.compile(rf'^\s*\d+:\s*(?P<cm>{F})(?:\s*cm\*\*-1|\s*cm\^-1|\s*cm-1)?(?P<imag>\s*(?:\*\*\*imaginary\s+mode\*\*\*|\(imaginary\s+mode\)|imaginary))?', re.I)
+    rx_irsec = re.compile(r'\bIR\s+SPECTRUM\b', re.I)
+    rx_irrow = re.compile(rf'^\s*(?P<mode>\d+):\s*(?P<freq>{F})\s+(?P<t2>{F})', re.I)
+
+    rx_hirsh = re.compile(r'\bHIRSHFELD\s+(?:ANALYSIS|CHARGES|POPULATION\s+ANALYSIS)\b', re.I)
+    rx_mull = re.compile(r'\bMULLIKEN\s+(?:ATOMIC\s+)?(?:CHARGES|POPULATION\s+ANALYSIS)\b', re.I)
+    rx_loew = re.compile(r'\bL[OÖ]EWDIN\s+(?:ATOMIC\s+)?(?:CHARGES|POPULATION\s+ANALYSIS)\b', re.I)
+    rx_chelpg = re.compile(r'\bCHELPG\s+(?:CHARGES|POPULATION\s+ANALYSIS)\b', re.I)
+    rx_mayer = re.compile(r'\bMAYER\s+POPULATION(?:\s+ANALYSIS)?\b', re.I)
+    rx_chg_colon = re.compile(rf'^\s*(?P<idx>\d+)\s+(?P<elem>[A-Za-z]{{1,3}})\s*:\s*(?P<charge>{F})', re.I)
+    rx_chg_table = re.compile(rf'^\s*(?P<idx>\d+)\s+(?P<elem>[A-Za-z]{{1,3}})\s+(?P<charge>{F})(?:\s+(?P<spin>{F}))?', re.I)
+    rx_mayerrow = re.compile(rf'^\s*(?P<idx>\d+)\s+(?P<elem>[A-Za-z]{{1,3}}):?\s+(?P<na>{F})\s+(?P<za>{F})\s+(?P<qa>{F})(?:\s+(?P<va>{F}))?', re.I)
+
+    def table_noise(line):
+        s = line.strip()
+        u = s.upper()
+        return (bool(s) and set(s) <= {'-'}) or u.startswith(('NO ', 'STATE')) or 'E(EH)' in u or 'E(EV)' in u or 'CM**-1' in u
+
+    def major(line):
+        u = line.strip().upper()
+        return ('FINAL SINGLE POINT ENERGY' in u or 'TOTAL RUN TIME' in u or 'ORCA TERMINATED' in u
+                or u.startswith(('=> NOW LEAVING', 'CIS/TD-DFT', 'ORCA PROPERTY CALCULATIONS')))
+
+    def coord_from_line(line):
+        parts = line.split()
+        if len(parts) < 4:
+            return None
+        try:
+            x, y, z = map(float, parts[-3:])
+        except Exception:
+            return None
+        for tok in parts[:-3]:
+            m = re.fullmatch(r'(?P<sym>[A-Za-z]{1,3})(?P<ghost>:?)', tok)
+            if m:
+                sym = m.group('sym').capitalize() + (':' if m.group('ghost') else '')
+                return {'element':sym, 'x':x, 'y':y, 'z':z}
+        return None
+
+    # SimpleInput recovery is authoritative for hybrid names such as PBE0.
+    input_method = _orca_input_method(text)
+
+    # Track a next-line basis label like ORCA_ENGINE.
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # ---------- global dispatch ----------
+        m = rx_version.search(stripped)
+        if m: version = m.group('version')
+
+        for key, rx in (
+            ('thermal_energy_hartree', rx_thermal_e),
+            ('thermal_energy_correction_hartree', rx_thermal_corr),
+            ('enthalpy_correction_hartree', rx_hcorr),
+            ('gibbs_correction_hartree', rx_gcorr),
+            ('zpe_hartree', rx_zpe),
+            ('gibbs_hartree', rx_g),
+            ('enthalpy_hartree', rx_h),
+            ('entropy_term_hartree', rx_entropy_term),
+            ('entropy_correction_hartree', rx_entropy_corr),
+            ('S_vib_cal_mol_K', rx_svib),
+            ('S_rot_cal_mol_K', rx_srot),
+            ('S_trans_cal_mol_K', rx_strans),
+            ('S_elec_cal_mol_K', rx_selec),
+        ):
+            mm = rx.search(stripped)
             if mm:
-                state_idx+=1; cmv=_float(mm.group('cm')); nmv=_float(mm.group('nm')); fosc=_float(mm.group('fosc')) or 0.0
-                ev=_float(mm.group('ev')) if mt else (cmv/8065.544005 if cmv is not None else None)
-                td.append({'state':state_idx,'ev':ev,'cm1':cmv,'nm':nmv,'f':fosc})
-    if not td: td=parse_tddft(text,'ORCA')
-    imag=[x for x in freqs if x < -1e-6]; expected=3*len(geometry) if geometry else None
-    if not normal and errors: sp_status='FAILED_CALCULATION'; thermo_rel='FAILED_CALCULATION'
-    elif not freqs: sp_status='NO_FREQUENCY_CALCULATION'; thermo_rel='ELECTRONIC_ONLY'
-    elif expected and len(freqs)<expected: sp_status='INCOMPLETE_FREQUENCIES'; thermo_rel='INCOMPLETE_FREQUENCIES'
-    elif len(imag)==0: sp_status='LIKELY_MINIMUM'; thermo_rel='HIGH'
-    elif len(imag)==1: sp_status='TRANSITION_STATE'; thermo_rel='TRANSITION_STATE'
-    else: sp_status='HIGHER_ORDER_SADDLE'; thermo_rel='UNRELIABLE_FOR_MINIMUM'
-    return {'filename':filename,'engine':'ORCA','version':version,'normal_termination':normal,'errors':errors,'method':method,'basis':basis,'dispersion':dispersion,'solvation_model':solvation,'solvent':solvent,'energies':energies,'optimization_energies':opt[-500:],'thermochemistry':tr,'frequencies_cm1':freqs[-5000:],'imaginary_frequencies_cm1':imag,'expected_frequency_count':expected,'stationary_point_status':sp_status,'thermochemistry_reliability':thermo_rel,'ir_spectrum':ir[-5000:],'tddft_states':td[:5000],'orbitals':parse_orbitals(text,'ORCA'),'dipole':parse_dipole(text),'atomic_charges':parse_atomic_charges(text),'final_geometry':geometry,'raman_spectrum':parse_raman(text),'system':parse_charge_mult(text),'timings':parse_timings(text,'ORCA')}
+                thermo[key] = _float(mm.group('value'))
+
+        m = rx_temp.search(stripped)
+        if m: thermo['temperature_K'] = _float(m.group('value'))
+        m = rx_press.search(stripped)
+        if m: thermo['pressure_atm'] = _float(m.group('value'))
+        m = rx_qrrho.search(stripped)
+        if m: thermo['thermo_treatment'] = m.group('treatment')
+        m = rx_qcut.search(stripped)
+        if m: thermo['rrho_cutoff_cm1'] = _float(m.group('value'))
+
+        m = rx_charge.search(stripped)
+        if m: charge = int(m.group('value'))
+        m = rx_mult.search(stripped)
+        if m: multiplicity = int(m.group('value'))
+        m = rx_solvation.search(stripped)
+        if m: solvation = m.group('model')
+        m = rx_dipole.search(stripped)
+        if m: dipole = _float(m.group('value'))
+        m = rx_s2.search(stripped)
+        if m: s2_actual = _float(m.group('value'))
+        m = rx_s2i.search(stripped)
+        if m: s2_ideal = _float(m.group('value'))
+
+        m = rx_sp.search(stripped)
+        if m:
+            final_energy = _float(m.group('value'))
+            if final_energy is not None:
+                optimization_energies.append(final_energy)
+
+        if rx_normal.search(stripped):
+            normal = True
+        if rx_fatal.search(stripped):
+            normal = False
+            errors.append(stripped)
+
+        # ---------- section-state handlers ----------
+        if state == 'COORDINATES':
+            if table_noise(stripped):
+                continue
+            c = coord_from_line(stripped)
+            if c:
+                current_geometry.append(c)
+                continue
+            if current_geometry:
+                if coord_unit == 'angstrom' or not final_geometry:
+                    final_geometry = current_geometry[:]
+            current_geometry = []
+            state = 'SEARCHING'
+            # fall through to re-dispatch this line
+
+        if state == 'ORBITALS':
+            if rx_spin_up.search(stripped):
+                current_spin = 'alpha'
+                continue
+            if rx_spin_dn.search(stripped):
+                current_spin = 'beta'
+                continue
+            if rx_orbsec.search(stripped) or table_noise(stripped):
+                continue
+            m = rx_orbrow.search(stripped)
+            if m:
+                eh = _float(m.group('eh'))
+                ev = _float(m.group('ev')) if m.group('ev') is not None else (eh * HARTREE_TO_EV if eh is not None else None)
+                current_orbitals.append({
+                    'index': int(m.group('idx')), 'occ': _float(m.group('occ')),
+                    'eh': eh, 'ev': ev, 'spin': current_spin
+                })
+                continue
+            if current_orbitals:
+                orbitals_all = current_orbitals[:]
+            current_orbitals = []
+            current_spin = 'restricted'
+            state = 'SEARCHING'
+
+        if state == 'TDDFT':
+            if rx_tdsoc.search(stripped):
+                if td_cm:
+                    state = 'SEARCHING'
+                continue
+            if rx_tdsec.search(stripped) or table_noise(stripped):
+                continue
+            m = rx_tdtrans.search(stripped) or rx_td.search(stripped)
+            if m:
+                cmv = _float(m.group('cm'))
+                fosc = _float(m.group('fosc'))
+                # Proper ORCA absorption rows have non-negative oscillator strengths.
+                if cmv is not None and cmv > 0 and fosc is not None and fosc >= 0:
+                    td_cm.append(cmv)
+                    td_fosc.append(fosc)
+                continue
+            if td_cm or major(stripped):
+                state = 'SEARCHING'
+
+        if state == 'FREQUENCIES':
+            if rx_freqsec.search(stripped) or (set(stripped) <= {'-','='}):
+                continue
+            m = rx_freqrow.search(stripped)
+            if m:
+                v = _float(m.group('cm'))
+                if v is not None:
+                    if m.group('imag') and v > 0:
+                        v = -v
+                    freqs.append(v)
+                    if v < 0:
+                        imag.append(v)
+                continue
+            # ORCA_ENGINE re-dispatches any recognized section header.
+            if (rx_irsec.search(stripped) or rx_tdsec.search(stripped) or rx_coord.search(stripped)
+                or rx_orbsec.search(stripped) or rx_hirsh.search(stripped) or rx_mull.search(stripped)
+                or rx_loew.search(stripped) or rx_chelpg.search(stripped) or rx_mayer.search(stripped)
+                or major(stripped) or 'THERMOCHEMISTRY' in stripped.upper()):
+                state = 'SEARCHING'
+            else:
+                continue
+
+        if state == 'IR':
+            if rx_irsec.search(stripped) or (set(stripped) <= {'-','='}):
+                continue
+            u = stripped.upper()
+            if 'MODE' in u and 'FREQ' in u:
+                continue
+            m = rx_irrow.search(stripped)
+            if m:
+                freq = _float(m.group('freq'))
+                inten = _float(m.group('t2'))
+                if freq is not None and inten is not None:
+                    ir.append((freq, inten))
+                    if freq < 0 and freq not in imag:
+                        imag.append(freq)
+                    if len(freqs) < len(ir):
+                        freqs.append(freq)
+                continue
+            if (rx_tdsec.search(stripped) or rx_freqsec.search(stripped) or rx_coord.search(stripped)
+                or rx_orbsec.search(stripped) or rx_hirsh.search(stripped) or rx_mull.search(stripped)
+                or rx_loew.search(stripped) or rx_chelpg.search(stripped) or rx_mayer.search(stripped)
+                or major(stripped) or 'THERMOCHEMISTRY' in u):
+                state = 'SEARCHING'
+            else:
+                continue
+
+        if state == 'CHARGES':
+            u = stripped.upper()
+            # A new recognized section ends charge parsing.
+            if (rx_coord.search(stripped) or rx_orbsec.search(stripped) or rx_tdsec.search(stripped)
+                or rx_freqsec.search(stripped) or rx_irsec.search(stripped) or major(stripped)):
+                state = 'SEARCHING'
+            elif 'SUM OF ATOMIC CHARGES' in u or 'SUM OF CHARGES' in u:
+                state = 'SEARCHING'
+                continue
+            elif u.startswith('TOTAL CHARGES') or u.startswith('ATOM') or ('ZA' in u and 'QA' in u) or set(stripped) <= {'-','='}:
+                continue
+            else:
+                if charge_type == 'mayer':
+                    mm = rx_mayerrow.search(stripped)
+                    if mm:
+                        atomic_charge_sets.setdefault('mayer', []).append(_float(mm.group('qa')))
+                        atomic_charge_sets.setdefault('mayer_valence', []).append(_float(mm.group('va')) or 0.0)
+                        continue
+                mm = rx_chg_colon.search(stripped) or rx_chg_table.search(stripped)
+                if mm:
+                    atomic_charge_sets.setdefault(charge_type or 'unknown', []).append(_float(mm.group('charge')))
+                    continue
+                if not table_noise(stripped):
+                    state = 'SEARCHING'
+
+        # ---------- SEARCHING dispatch ----------
+        if state != 'SEARCHING':
+            continue
+
+        if expecting_basis:
+            basis = stripped
+            expecting_basis = False
+            continue
+
+        m = rx_basis.search(stripped)
+        if m:
+            b = m.group('basis').strip()
+            if b: basis = b
+            else: expecting_basis = True
+            continue
+
+        m = rx_exchange.search(stripped)
+        if m:
+            exchange = m.group('value')
+            if not method or method in ('DFT','HF'):
+                method = exchange
+            elif exchange not in method:
+                method = method + '/' + exchange
+            continue
+
+        m = rx_corr.search(stripped)
+        if m:
+            correlation = m.group('value')
+            if not method or method in ('DFT','HF'):
+                method = correlation
+            elif correlation not in method:
+                method = method + '/' + correlation
+            continue
+
+        if re.search(r'\bDFT\s+CALCULATION\b', stripped, re.I):
+            if not method: method = 'DFT'
+            continue
+        if re.search(r'\bHF\s+CALCULATION\b', stripped, re.I):
+            if not method: method = 'HF'
+            continue
+        if re.search(r'\bCOMPOSITE\s+CALCULATION\b', stripped, re.I):
+            method = 'Composite'
+            continue
+
+        m = rx_disp.search(stripped)
+        if m:
+            dispersion = m.group('value') or 'Present'
+            continue
+
+        m = rx_smd.search(stripped)
+        if m:
+            solvation = 'SMD'; solvent = m.group('solvent')
+            continue
+        m = rx_cpcm.search(stripped)
+        if m:
+            solvation = 'CPCM'; solvent = m.group('solvent')
+            continue
+        m = rx_solvent.search(stripped)
+        if m:
+            solvent = m.group('solvent')
+            continue
+
+        if rx_coord.search(stripped):
+            if rx_coord_ang.search(stripped):
+                coord_unit = 'angstrom'
+            elif rx_coord_au.search(stripped):
+                # ORCA_ENGINE keeps Angstrom coordinates when both are printed.
+                if final_geometry:
+                    continue
+                coord_unit = 'bohr'
+            else:
+                coord_unit = None
+            current_geometry = []
+            state = 'COORDINATES'
+            continue
+
+        if rx_spin_up.search(stripped):
+            current_spin = 'alpha'; state = 'ORBITALS'
+            continue
+        if rx_spin_dn.search(stripped):
+            current_spin = 'beta'; state = 'ORBITALS'
+            continue
+        if rx_orbsec.search(stripped):
+            current_spin = 'restricted'
+            current_orbitals = []
+            state = 'ORBITALS'
+            continue
+
+        if rx_tdsoc.search(stripped):
+            # ORCA_ENGINE deliberately excludes SOC-corrected table from the
+            # ordinary electric-dipole spectrum to prevent concatenation.
+            continue
+        if rx_tdsec.search(stripped):
+            td_cm, td_fosc = [], []
+            state = 'TDDFT'
+            continue
+
+        if rx_freqsec.search(stripped):
+            freqs, imag = [], []
+            state = 'FREQUENCIES'
+            continue
+
+        if rx_irsec.search(stripped):
+            ir = []
+            state = 'IR'
+            continue
+
+        if rx_hirsh.search(stripped):
+            charge_type='hirshfeld'; atomic_charge_sets['hirshfeld']=[]; state='CHARGES'; continue
+        if rx_mull.search(stripped):
+            charge_type='mulliken'; atomic_charge_sets['mulliken']=[]; state='CHARGES'; continue
+        if rx_loew.search(stripped):
+            charge_type='loewdin'; atomic_charge_sets['loewdin']=[]; state='CHARGES'; continue
+        if rx_chelpg.search(stripped):
+            charge_type='chelpg'; atomic_charge_sets['chelpg']=[]; state='CHARGES'; continue
+        if rx_mayer.search(stripped):
+            charge_type='mayer'; atomic_charge_sets['mayer']=[]; atomic_charge_sets['mayer_valence']=[]; state='CHARGES'; continue
+
+    # Flush unfinished sections at EOF.
+    if state == 'COORDINATES' and current_geometry:
+        if coord_unit == 'angstrom' or not final_geometry:
+            final_geometry = current_geometry[:]
+    if state == 'ORBITALS' and current_orbitals:
+        orbitals_all = current_orbitals[:]
+
+    # The echoed SimpleInput method is authoritative for names such as PBE0.
+    if input_method:
+        method = input_method
+
+    # Reconstruct total H/G like ORCA_ENGINE when only corrections are present.
+    if thermo.get('enthalpy_hartree') is None and final_energy is not None and thermo.get('enthalpy_correction_hartree') is not None:
+        thermo['enthalpy_hartree'] = final_energy + thermo['enthalpy_correction_hartree']
+    if thermo.get('gibbs_hartree') is None and final_energy is not None and thermo.get('gibbs_correction_hartree') is not None:
+        thermo['gibbs_hartree'] = final_energy + thermo['gibbs_correction_hartree']
+    if thermo.get('entropy_term_hartree') is None and thermo.get('entropy_correction_hartree') is not None:
+        thermo['entropy_term_hartree'] = -thermo['entropy_correction_hartree']
+
+    # Derived units only; raw ORCA values remain intact.
+    for k in list(thermo):
+        if k.endswith('_hartree') and thermo[k] is not None:
+            thermo[k.replace('_hartree','_kj_mol')] = thermo[k] * HARTREE_TO_KJMOL
+    sent = [thermo.get(k) for k in ('S_vib_cal_mol_K','S_rot_cal_mol_K','S_trans_cal_mol_K','S_elec_cal_mol_K') if thermo.get(k) is not None]
+    if sent:
+        thermo['entropy_cal_mol_K'] = sum(sent)
+        thermo['entropy_J_mol_K'] = sum(sent) * 4.184
+
+    energies = {}
+    if final_energy is not None:
+        energies = {
+            'final_energy_hartree': final_energy,
+            'final_energy_kj_mol': final_energy * HARTREE_TO_KJMOL,
+            'final_energy_ev': final_energy * HARTREE_TO_EV,
+        }
+
+    # TDDFT: ORCA_ENGINE stores cm^-1 + fosc. Convert only after exact parsing.
+    td = []
+    for idx, (cmv, fosc) in enumerate(zip(td_cm, td_fosc), 1):
+        if cmv and cmv > 0 and fosc is not None and fosc >= 0:
+            td.append({
+                'state': idx,
+                'cm1': cmv,
+                'ev': cmv / 8065.544005,
+                'nm': 1.0e7 / cmv,
+                'f': fosc,
+            })
+
+    # Frontier orbitals from final retained ORBITAL ENERGIES section.
+    occupied = [o for o in orbitals_all if (o.get('occ') or 0.0) > 1e-8 and o.get('ev') is not None]
+    virtual = [o for o in orbitals_all if (o.get('occ') or 0.0) <= 1e-8 and o.get('ev') is not None]
+    homo = occupied[-1]['ev'] if occupied else None
+    lumo = virtual[0]['ev'] if virtual else None
+    orb = {
+        'orbitals': orbitals_all[-500:],
+        'homo_ev': homo,
+        'lumo_ev': lumo,
+        'gap_ev': (lumo - homo) if homo is not None and lumo is not None else None,
+    }
+
+    # ORCA_ENGINE classifies completeness against total 3N frequency records.
+    real_atoms = [a for a in final_geometry if not str(a.get('element','')).endswith(':') and str(a.get('element','')).upper() != 'DA']
+    expected = 3 * len(real_atoms) if len(real_atoms) >= 2 else (0 if real_atoms else None)
+    if normal is False or (errors and normal is not True):
+        sp_status='FAILED_CALCULATION'; thermo_rel='FAILED_CALCULATION'
+    elif not freqs:
+        sp_status='NO_FREQUENCY_CALCULATION'; thermo_rel='ELECTRONIC_ONLY'
+    elif expected is not None and expected > 0 and len(freqs) < expected:
+        sp_status='INCOMPLETE_FREQUENCIES'; thermo_rel='INCOMPLETE_FREQUENCIES'
+    elif len(imag) == 0:
+        sp_status='LIKELY_MINIMUM'; thermo_rel='HIGH'
+    elif len(imag) == 1:
+        sp_status='TRANSITION_STATE'; thermo_rel='TRANSITION_STATE'
+    else:
+        sp_status='HIGHER_ORDER_SADDLE'; thermo_rel='UNRELIABLE_FOR_MINIMUM'
+
+    # Keep charge sets separated instead of mixing Mulliken/Hirshfeld/etc.
+    atomic_charges = []
+    preferred = None
+    for name in ('hirshfeld','mulliken','loewdin','chelpg','mayer'):
+        if atomic_charge_sets.get(name):
+            preferred = name
+            atomic_charges = atomic_charge_sets[name]
+            break
+
+    system = {'charge':charge, 'multiplicity':multiplicity}
+    if s2_actual is not None: system['s2_actual'] = s2_actual
+    if s2_ideal is not None: system['s2_ideal'] = s2_ideal
+
+    return {
+        'filename': filename,
+        'engine': 'ORCA',
+        'version': version,
+        'normal_termination': normal is True,
+        'errors': errors,
+        'method': method,
+        'method_components': {'exchange': exchange, 'correlation': correlation},
+        'basis': basis,
+        'dispersion': dispersion,
+        'solvation_model': solvation,
+        'solvent': solvent,
+        'energies': energies,
+        'optimization_energies': optimization_energies[-500:],
+        'thermochemistry': thermo,
+        'frequencies_cm1': freqs[-5000:],
+        'imaginary_frequencies_cm1': imag[-5000:],
+        'expected_frequency_count': expected,
+        'stationary_point_status': sp_status,
+        'thermochemistry_reliability': thermo_rel,
+        'ir_spectrum': ir[-5000:],
+        'tddft_states': td[:5000],
+        'orbitals': orb,
+        'dipole': dipole,
+        'atomic_charges': atomic_charges,
+        'atomic_charge_type': preferred,
+        'atomic_charge_sets': atomic_charge_sets,
+        'final_geometry': final_geometry,
+        'raman_spectrum': parse_raman(text),
+        'system': system,
+        'timings': parse_timings(text,'ORCA'),
+    }
+
+
+def _parse_orca_precise(text, filename):
+    """Parse ORCA using ORCA_ENGINE-compatible logical job blocks.
+
+    The final job is the primary Telegram result, exactly as the existing UI
+    expects, while job count and compact block summaries are retained for
+    diagnostics and multi-job outputs.
+    """
+    blocks = _orca_split_jobs(text)
+    parsed = [_orca_parse_one_job(b, filename) for b in blocks]
+    parsed = [p for p in parsed if p]
+    if not parsed:
+        return _orca_parse_one_job(text, filename)
+    primary = parsed[-1]
+    primary['orca_job_blocks_count'] = len(parsed)
+    if len(parsed) > 1:
+        primary['orca_job_blocks'] = [
+            {
+                'index': i+1,
+                'method': p.get('method'),
+                'basis': p.get('basis'),
+                'normal_termination': p.get('normal_termination'),
+                'final_energy_hartree': p.get('energies',{}).get('final_energy_hartree'),
+                'tddft_states': len(p.get('tddft_states',[])),
+                'frequencies': len(p.get('frequencies_cm1',[])),
+            } for i,p in enumerate(parsed)
+        ]
+    return primary
 
 def _parse_psi4_vibrations(text):
     freqs=[]; ir=[]; pending=[]
@@ -1287,7 +1872,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_WORKER_THREADS)
 _startup_api = KaggleApi()
 _startup_api.authenticate()
 del _startup_api
-print(f"CHEMBOT v4.3 is running with {BOT_WORKER_THREADS} Telegram workers...")
+print(f"CHEMBOT v4.4 is running with {BOT_WORKER_THREADS} Telegram workers...")
 
 
 def authorized(message):
@@ -1407,7 +1992,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v4.3\n\n"
+        "🧪 Computational Chemistry Bot v4.4\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n        • Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
         "• Send .xyz/.allxyz/.gbw before one or several jobs when needed; the same snapshot is available to the whole batch.\n"
@@ -1584,7 +2169,6 @@ def handle_document(message):
 
     bot.reply_to(message,'Supported files: .inp, .dat, .out, .xyz, .allxyz, .gbw')
 
-
 # ==========================================
 # 🚀 Render Port Binding Hack
 # ==========================================
@@ -1609,4 +2193,3 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # Start the Telegram bot
 if __name__ == '__main__':
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-
