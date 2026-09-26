@@ -1,4 +1,4 @@
-# BUILD: v5.8-ORCAENGINE-BATCH-THERMO-20260926
+# BUILD: v5.9-PSI4-REPORTS-20260926
 import os
 
 # ============================================================
@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v5.7
+# Chemistry Telegram/Kaggle Bot v5.9
 # ============================================================
 
 
@@ -269,7 +269,7 @@ ANALYZER_MODULE_CODE = r'''
 import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = '5.7.0'
+REPORT_GENERATOR_VERSION = '5.9.0'
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 KB_J_MOL_K = 8.314462618
@@ -2645,7 +2645,362 @@ def make_plots(a,outdir):
     return made
 '''
 
-ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE + "\n" + ANALYZER_V58_PATCH_CODE
+# v5.9 Psi4 parser/report hardening
+ANALYZER_V59_PATCH_CODE = r'''
+def _psi4_last_match(text, patterns):
+    for rx in patterns:
+        ms=list(re.finditer(rx,text,re.I|re.M))
+        if ms:
+            return ms[-1]
+    return None
+
+def _psi4_method_basis_v59(text):
+    method=None; basis=None; reference=None
+    for rx in [
+        r'(?m)^\s*DFT Functional\s*[:=]\s*([^\n]+)',
+        r'(?m)^\s*Functional\s*[:=]\s*([^\n]+)',
+        r'(?m)^\s*DFT Potential\s*[:=]\s*([^\n]+)',
+        r'(?m)^\s*Method\s*[:=]\s*([A-Za-z0-9+*()_\-]+)',
+    ]:
+        m=_psi4_last_match(text,[rx])
+        if m:
+            val=m.group(1).strip().split()[0]
+            if val and len(val)<40:
+                method=val; break
+    if not method:
+        m=_psi4_last_match(text,[
+            r'@(?P<m>(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF|MP2|MP3|CCSD(?:\(T\))?))\s+Final Energy:',
+            r'(?P<m>CCSD(?:\(T\))?|MP2|MP3)\s+(?:total\s+)?energy\s*[:=]'
+        ])
+        if m:
+            method=m.groupdict().get('m') or m.group(1)
+    m=_psi4_last_match(text,[
+        r'(?m)^\s*Reference\s*[:=]\s*([A-Za-z0-9_\-]+)',
+        r'(?m)^\s*SCF Type\s*[:=]\s*([A-Za-z0-9_\-]+)'
+    ])
+    if m: reference=m.group(1).strip()
+    for rx in [
+        r'(?m)^\s*BASIS\s*[:=]\s*([^\s#]+)',
+        r'(?m)^\s*Basis Set\s*[:=]\s*([^\n]+)',
+        r'(?m)^\s*basis\s+([A-Za-z0-9+*()_\-]+)'
+    ]:
+        m=_psi4_last_match(text,[rx])
+        if m:
+            basis=m.group(1).strip().strip('"\'')
+            if len(basis)>80: basis=basis.split()[0]
+            break
+    return method,basis,reference
+
+def _psi4_orbitals_v59(text):
+    groups=[]; current_occ=None; current_spin='restricted'; active=False
+    for raw in text.splitlines():
+        line=raw.rstrip(); u=line.upper()
+        if 'ORBITAL ENERGIES' in u:
+            active=True; current_occ=None; continue
+        if not active: continue
+        if groups and current_occ == 0.0 and not line.strip():
+            active=False; current_occ=None; continue
+        if ('ALPHA' in u and 'ORBITAL' in u): current_spin='alpha'
+        elif ('BETA' in u and 'ORBITAL' in u): current_spin='beta'
+        m=re.search(r'(DOUBLY\s+OCCUPIED|SINGLY\s+OCCUPIED|OCCUPIED|VIRTUAL)\s*:\s*(.*)$',line,re.I)
+        if m:
+            label=m.group(1).upper()
+            current_occ=0.0 if 'VIRTUAL' in label else (1.0 if 'SINGLY' in label else 2.0)
+            vals=[_float(x) for x in re.findall(FLOAT_RE,m.group(2))]
+            for v in vals:
+                if v is not None: groups.append((current_spin,current_occ,v))
+            continue
+        if current_occ is not None and line.strip() and not re.search(r'[A-Za-z]{3,}',line):
+            vals=[_float(x) for x in re.findall(FLOAT_RE,line)]
+            for v in vals:
+                if v is not None: groups.append((current_spin,current_occ,v))
+    if not groups:
+        return parse_orbitals(text,'Psi4')
+    orbitals=[]; spin_counts={}
+    for spin,occ,eh in groups:
+        spin_counts[spin]=spin_counts.get(spin,0)+1
+        orbitals.append({'index':spin_counts[spin],'spin':spin,'occ':occ,'eh':eh,'ev':eh*HARTREE_TO_EV})
+    occs=[x for x in orbitals if (x.get('occ') or 0)>1e-8]
+    virs=[x for x in orbitals if (x.get('occ') or 0)<=1e-8]
+    out={'orbitals':orbitals[-1000:]}
+    if occs: out['homo_ev']=max(occs,key=lambda z:z['ev'])['ev']
+    if virs: out['lumo_ev']=min(virs,key=lambda z:z['ev'])['ev']
+    if out.get('homo_ev') is not None and out.get('lumo_ev') is not None:
+        out['gap_ev']=out['lumo_ev']-out['homo_ev']
+    for spin in ('alpha','beta'):
+        so=[x for x in orbitals if x.get('spin')==spin and (x.get('occ') or 0)>1e-8]
+        sv=[x for x in orbitals if x.get('spin')==spin and (x.get('occ') or 0)<=1e-8]
+        if so: out[f'{spin}_homo_ev']=max(so,key=lambda z:z['ev'])['ev']
+        if sv: out[f'{spin}_lumo_ev']=min(sv,key=lambda z:z['ev'])['ev']
+    return out
+
+def _psi4_dipole_v59(text):
+    d=parse_dipole(text)
+    m=_psi4_last_match(text,[
+        r'X\s*[:=]\s*('+FLOAT_RE+r').*?Y\s*[:=]\s*('+FLOAT_RE+r').*?Z\s*[:=]\s*('+FLOAT_RE+r').*?(?:TOTAL|MAGNITUDE)\s*[:=]\s*('+FLOAT_RE+r')',
+        r'Dipole Moment.*?\n\s*X\s+Y\s+Z\s+Total\s*\n\s*('+FLOAT_RE+r')\s+('+FLOAT_RE+r')\s+('+FLOAT_RE+r')\s+('+FLOAT_RE+r')'
+    ])
+    if m:
+        vals=[_float(m.group(i)) for i in range(1,5)]
+        d['vector']=vals[:3]; d['magnitude_debye']=vals[3]
+    return d
+
+def _psi4_charges_v59(text):
+    charges=[]; active=False
+    for raw in text.splitlines():
+        u=raw.upper()
+        if 'MULLIKEN CHARGES' in u or 'MULLIKEN ATOMIC CHARGES' in u:
+            active=True; charges=[]; continue
+        if active:
+            m=re.match(r'^\s*(\d+)\s+([A-Za-z]{1,3})\s+(.*)$',raw)
+            if m:
+                vals=[_float(x) for x in re.findall(FLOAT_RE,m.group(3))]
+                vals=[v for v in vals if v is not None]
+                if vals:
+                    charges.append({'index':int(m.group(1)),'element':m.group(2),'charge':vals[-1]})
+            elif charges and (not raw.strip() or 'LOEWDIN' in u or 'DIPOLE' in u):
+                break
+    return charges[-2000:]
+
+def _psi4_thermo_v59(text, electronic_energy=None):
+    t={}
+    def last(patterns): return _last_number(text,patterns)
+    temp=last([r'Temperature\s*[:=]\s*('+FLOAT_RE+r')\s*(?:\[?K\]?)',r'at\s*('+FLOAT_RE+r')\s*\[K\]'])
+    if temp is not None: t['temperature_K']=temp
+    p_atm=last([r'Pressure\s*[:=]\s*('+FLOAT_RE+r')\s*(?:atm|\[atm\])'])
+    if p_atm is None:
+        p_pa=last([r'Pressure\s*[:=]\s*('+FLOAT_RE+r')\s*(?:Pa|\[Pa\])'])
+        if p_pa is not None: p_atm=p_pa/101325.0
+    if p_atm is not None: t['pressure_atm']=p_atm
+    zpe=last([r'Zero[- ]point(?: vibrational)? energy\s*[:=]?\s*('+FLOAT_RE+r')\s*\[?Eh\]?',r'ZPE(?:_vib)?\s*[:=]\s*('+FLOAT_RE+r')\s*(?:Eh|Hartree)'])
+    if zpe is not None: t['zpe_hartree']=zpe
+    patterns={
+      'energy_0K_hartree':[r'Energy \(0 K\)\s+('+FLOAT_RE+r')\s+('+FLOAT_RE+r')\s*$',r'Total E,?\s*(?:Electronic energy)?\s*at\s*0(?:\.0+)?\s*\[K\]\s*('+FLOAT_RE+r')\s*\[Eh\]'],
+      'internal_energy_hartree':[r'Internal energy\s+('+FLOAT_RE+r')\s+('+FLOAT_RE+r')\s*$',r'Total E,?\s*Internal energy.*?('+FLOAT_RE+r')\s*\[Eh\]'],
+      'enthalpy_hartree':[r'Enthalpy\s+('+FLOAT_RE+r')\s+('+FLOAT_RE+r')\s*$',r'Total H,?\s*Enthalpy at\s*'+FLOAT_RE+r'\s*\[K\]\s*('+FLOAT_RE+r')\s*\[Eh\]'],
+      'gibbs_hartree':[r'Gibbs Free Energy\s+('+FLOAT_RE+r')\s+('+FLOAT_RE+r')\s*$',r'Total G,?\s*Free enthalpy at\s*'+FLOAT_RE+r'\s*\[K\]\s*('+FLOAT_RE+r')\s*\[Eh\]'],
+    }
+    for key,arr in patterns.items():
+        for rx in arr:
+            ms=list(re.finditer(rx,text,re.I|re.M))
+            if ms:
+                vals=[_float(x) for x in ms[-1].groups() if x is not None]; vals=[x for x in vals if x is not None]
+                if vals: t[key]=vals[-1]
+                break
+    corr_patterns={
+      'thermal_energy_correction_hartree':[r'Thermal correction to (?:Energy|E)\s*[:=]\s*('+FLOAT_RE+r')'],
+      'enthalpy_correction_hartree':[r'Thermal correction to (?:Enthalpy|H)\s*[:=]\s*('+FLOAT_RE+r')'],
+      'gibbs_correction_hartree':[r'Thermal correction to (?:Gibbs Free Energy|G)\s*[:=]\s*('+FLOAT_RE+r')'],
+    }
+    for key,arr in corr_patterns.items():
+        v=last(arr)
+        if v is not None: t[key]=v
+    if electronic_energy is not None:
+        if t.get('energy_0K_hartree') is None and zpe is not None: t['energy_0K_hartree']=electronic_energy+zpe
+        if t.get('internal_energy_hartree') is None and t.get('thermal_energy_correction_hartree') is not None: t['internal_energy_hartree']=electronic_energy+t['thermal_energy_correction_hartree']
+        if t.get('enthalpy_hartree') is None and t.get('enthalpy_correction_hartree') is not None: t['enthalpy_hartree']=electronic_energy+t['enthalpy_correction_hartree']
+        if t.get('gibbs_hartree') is None and t.get('gibbs_correction_hartree') is not None: t['gibbs_hartree']=electronic_energy+t['gibbs_correction_hartree']
+    T=t.get('temperature_K'); H=t.get('enthalpy_hartree'); G=t.get('gibbs_hartree')
+    if T and H is not None and G is not None and T>0: t['entropy_J_mol_K']=(H-G)*HARTREE_TO_KJMOL*1000.0/T
+    for k in list(t):
+        if k.endswith('_hartree'): t[k.replace('_hartree','_kj_mol')]=t[k]*HARTREE_TO_KJMOL
+    return t
+
+def _parse_psi4_precise_v59(text, filename):
+    F=FLOAT_RE
+    version=None
+    for rx in [r'Psi4\s+([0-9][\w.\-]+)',r'Psi4\s+Version\s*[:=]?\s*([0-9][\w.\-]+)']:
+        m=re.search(rx,text,re.I)
+        if m: version=m.group(1); break
+    normal=bool(re.search(r'Psi4\s+exiting successfully',text,re.I))
+    fatal=[ln.strip() for ln in text.splitlines() if re.search(r'(PSIEXCEPTION|TRACEBACK|FATAL ERROR|SEGMENTATION FAULT|OUT OF MEMORY|CONVERGENCE FAILURE)',ln,re.I)]
+    method,basis,reference=_psi4_method_basis_v59(text)
+    energies={}
+    fm=list(re.finditer(r'@(?P<method>(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF|MP2|MP3|CCSD(?:\(T\))?))\s+Final Energy:\s*(?P<e>'+F+r')',text,re.I))
+    final=_float(fm[-1].group('e')) if fm else None
+    correlated=[]
+    for rx in [r'CCSD\(T\)\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'CCSD\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'MP3\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'MP2\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'Current Energy\s*[:=]\s*('+F+r')',r'Final Energy\s*[:=]\s*('+F+r')']:
+        v=_last_number(text,[rx])
+        if v is not None: correlated.append(v)
+    if correlated: final=correlated[-1]
+    if final is not None:
+        energies.update(final_energy_hartree=final,final_energy_kj_mol=final*HARTREE_TO_KJMOL,final_energy_ev=final*HARTREE_TO_EV)
+    for key,arr in {
+        'reference_energy_hartree':[r'Reference Energy\s*[:=]\s*('+F+r')',r'SCF total energy\s*[:=]\s*('+F+r')'],
+        'correlation_energy_hartree':[r'Correlation Energy\s*[:=]\s*('+F+r')',r'(?:MP2|CCSD) correlation energy\s*[:=]\s*('+F+r')'],
+        'nuclear_repulsion_hartree':[r'Nuclear Repulsion Energy\s*[:=]\s*('+F+r')']}.items():
+        v=_last_number(text,arr)
+        if v is not None: energies[key]=v
+    opt=[]
+    for m in re.finditer(r'@(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF)\s+Final Energy:\s*('+F+r')',text,re.I):
+        v=_float(m.group(1))
+        if v is not None and (not opt or abs(v-opt[-1])>1e-12): opt.append(v)
+    freqs,ir=_parse_psi4_vibrations(text); td=_parse_psi4_tddft(text); tr=_psi4_thermo_v59(text,final)
+    blocks=[]; cur=[]; active=False
+    for line in text.splitlines():
+        if re.search(r'(?:Final optimized geometry|Geometry \(in Angstrom\)|Cartesian Geometry \(in Angstrom\))',line,re.I):
+            if cur: blocks.append(cur)
+            cur=[]; active=True; continue
+        if active:
+            m=re.match(r'^\s*(?:\d+\s+)?([A-Za-z]{1,3})\s+('+F+r')\s+('+F+r')\s+('+F+r')\s*$',line)
+            if m: cur.append({'element':m.group(1),'x':_float(m.group(2)),'y':_float(m.group(3)),'z':_float(m.group(4))}); continue
+            if cur and not line.strip(): blocks.append(cur); cur=[]; active=False
+    if cur: blocks.append(cur)
+    geometry=blocks[-1] if blocks else []
+    imag=[x for x in freqs if x < -5.0]
+    if not normal and fatal: sp='FAILED_CALCULATION'; rel='FAILED_CALCULATION'
+    elif not freqs: sp='NO_FREQUENCY_CALCULATION'; rel='ELECTRONIC_ONLY'
+    elif len(imag)==0: sp='LIKELY_MINIMUM'; rel='HIGH'
+    elif len(imag)==1: sp='TRANSITION_STATE'; rel='TRANSITION_STATE'
+    else: sp='HIGHER_ORDER_SADDLE'; rel='UNRELIABLE_FOR_MINIMUM'
+    out={'filename':filename,'engine':'Psi4','version':version,'normal_termination':normal,'errors':fatal,'method':method,'basis':basis,'energies':energies,'optimization_energies':opt[-500:],'thermochemistry':tr,'frequencies_cm1':freqs,'imaginary_frequencies_cm1':imag,'stationary_point_status':sp,'thermochemistry_reliability':rel,'ir_spectrum':ir,'tddft_states':td,'orbitals':_psi4_orbitals_v59(text),'dipole':_psi4_dipole_v59(text),'atomic_charges':_psi4_charges_v59(text),'final_geometry':geometry,'raman_spectrum':[],'system':parse_charge_mult(text),'timings':parse_timings(text,'Psi4'),'psi4_details':{'reference':reference}}
+    return _normalize_analysis_schema(out)
+
+_parse_output_text_v58_for_v59=parse_output_text
+def parse_output_text(text,filename='output.out'):
+    if detect_engine(text)=='Psi4':
+        a=_parse_psi4_precise_v59(text,filename); a['conceptual_dft']=conceptual_dft_descriptors(a); return a
+    return _parse_output_text_v58_for_v59(text,filename)
+
+_build_pdf_v58=build_pdf
+def _build_psi4_pdf_v59(a, plots, pdf_path):
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether, LongTable, HRFlowable
+    NAVY=colors.HexColor('#17324D'); SLATE=colors.HexColor('#4B5D6B'); LIGHT=colors.HexColor('#F3F6F8'); MID=colors.HexColor('#D9E1E7'); GREEN=colors.HexColor('#1F7A4D'); RED=colors.HexColor('#A33A32'); TEXT=colors.HexColor('#202830')
+    styles=getSampleStyleSheet()
+    title=ParagraphStyle('P9Title',parent=styles['Title'],fontName='Helvetica-Bold',fontSize=18.5,leading=22,textColor=NAVY,alignment=TA_LEFT,spaceAfter=4)
+    sub=ParagraphStyle('P9Sub',parent=styles['BodyText'],fontSize=8.3,leading=10.5,textColor=SLATE,spaceAfter=8)
+    h1=ParagraphStyle('P9H1',parent=styles['Heading2'],fontName='Helvetica-Bold',fontSize=12,leading=14.5,textColor=NAVY,spaceBefore=9,spaceAfter=4)
+    h2=ParagraphStyle('P9H2',parent=styles['Heading3'],fontName='Helvetica-Bold',fontSize=9.6,leading=11.5,textColor=SLATE,spaceBefore=5,spaceAfter=3)
+    body=ParagraphStyle('P9Body',parent=styles['BodyText'],fontSize=8.4,leading=10.8,textColor=TEXT)
+    small=ParagraphStyle('P9Small',parent=body,fontSize=7.2,leading=9.1,textColor=SLATE)
+    cap=ParagraphStyle('P9Cap',parent=small,alignment=TA_CENTER,spaceBefore=3,spaceAfter=6)
+    mono=ParagraphStyle('P9Mono',parent=body,fontName='Courier',fontSize=6.7,leading=8.2)
+    filename=str(a.get('filename') or 'psi4.out'); version=str(a.get('version') or 'N/A'); normal=bool(a.get('normal_termination'))
+    doc=SimpleDocTemplate(pdf_path,pagesize=A4,rightMargin=1.4*cm,leftMargin=1.4*cm,topMargin=1.42*cm,bottomMargin=1.42*cm,title='Psi4 Computational Chemistry Analysis Report',author='ChemBot')
+    def esc(x): return str(x if x is not None else '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    def cell(x,sty=body): return Paragraph(esc(x),sty)
+    def sec(txt): return [Spacer(1,3),Paragraph(txt,h1),HRFlowable(width='100%',thickness=.55,color=MID,spaceAfter=5)]
+    def table(rows,widths=None,header=True):
+        hh=ParagraphStyle('P9TH',parent=small,fontName='Helvetica-Bold',textColor=colors.white,fontSize=7.3,leading=8.7)
+        data=[[cell(v,hh if header and r==0 else small) for v in row] for r,row in enumerate(rows)]
+        t=LongTable(data,colWidths=widths,repeatRows=1 if header else 0,hAlign='LEFT')
+        cmds=[('VALIGN',(0,0),(-1,-1),'MIDDLE'),('GRID',(0,0),(-1,-1),.25,MID),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),3.4),('BOTTOMPADDING',(0,0),(-1,-1),3.4)]
+        if header: cmds += [('BACKGROUND',(0,0),(-1,0),NAVY),('TEXTCOLOR',(0,0),(-1,0),colors.white)]
+        first=1 if header else 0
+        for r in range(first,len(rows)):
+            if (r-first)%2: cmds.append(('BACKGROUND',(0,r),(-1,r),LIGHT))
+        t.setStyle(TableStyle(cmds)); return t
+    def fig(story,key,label,note=None,maxh=9.6*cm):
+        p=plots.get(key)
+        if not p or not os.path.exists(p): return
+        im=Image(p); scale=min(17*cm/im.imageWidth,maxh/im.imageHeight); im.drawWidth*=scale; im.drawHeight*=scale
+        story.append(KeepTogether([Spacer(1,5),im,Paragraph(label+((' '+note) if note else ''),cap)]))
+    def frame(canvas,d):
+        canvas.saveState(); w,h=A4; canvas.setStrokeColor(MID); canvas.setLineWidth(.35); canvas.line(d.leftMargin,h-.77*cm,w-d.rightMargin,h-.77*cm); canvas.line(d.leftMargin,.70*cm,w-d.rightMargin,.70*cm); canvas.setFont('Helvetica',7); canvas.setFillColor(SLATE); canvas.drawString(d.leftMargin,h-.59*cm,'ChemBot - Psi4 analysis'); canvas.drawRightString(w-d.rightMargin,h-.59*cm,f'Psi4 {version}'[:50]); canvas.drawString(d.leftMargin,.43*cm,filename[:70]); canvas.drawRightString(w-d.rightMargin,.43*cm,f'Page {d.page}'); canvas.restoreState()
+    e=a.get('energies',{}) or {}; t=a.get('thermochemistry',{}) or {}; o=a.get('orbitals',{}) or {}; d=a.get('dipole',{}) or {}; sysi=a.get('system',{}) or {}; det=a.get('psi4_details',{}) or {}
+    story=[Paragraph('Psi4 Computational Chemistry Analysis Report',title),Paragraph(f'<b>File:</b> {esc(filename)} &nbsp;&nbsp; | &nbsp;&nbsp; <b>Report engine:</b> ChemBot {REPORT_GENERATOR_VERSION}',sub)]
+    st='NORMAL TERMINATION' if normal else 'TERMINATION NOT CONFIRMED'; scol=GREEN if normal else RED
+    bar=Table([[Paragraph(f'<b>{st}</b>',ParagraphStyle('P9Status',parent=body,fontName='Helvetica-Bold',fontSize=9,textColor=colors.white,alignment=TA_CENTER))]],colWidths=[17*cm],rowHeights=[.68*cm]); bar.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),scol),('VALIGN',(0,0),(-1,-1),'MIDDLE')])); story += [bar,Spacer(1,8)]
+    meta=[['Engine','Psi4','Version',version],['Method',a.get('method') or 'N/A','Basis',a.get('basis') or 'N/A'],['Reference',det.get('reference') or 'N/A','Charge',sysi.get('charge','N/A')],['Multiplicity',sysi.get('multiplicity','N/A'),'Atoms',len(a.get('final_geometry',[]) or []) or 'N/A']]
+    story += [table(meta,[2.5*cm,6*cm,2.5*cm,6*cm],header=False)]
+    story += sec('Key results')
+    rows=[['Quantity','Value']]
+    for label,val in [('Final electronic energy',_report_fmt(e.get('final_energy_hartree'),10,' Eh')),('Gibbs free energy',_report_fmt(t.get('gibbs_hartree'),10,' Eh')),('Enthalpy',_report_fmt(t.get('enthalpy_hartree'),10,' Eh')),('HOMO',_report_fmt(o.get('homo_ev'),5,' eV')),('LUMO',_report_fmt(o.get('lumo_ev'),5,' eV')),('HOMO-LUMO gap',_report_fmt(o.get('gap_ev'),5,' eV')),('Dipole magnitude',_report_fmt(d.get('magnitude_debye'),5,' D')),('Runtime',_format_runtime((a.get('timings',{}) or {}).get('wall_seconds')) )]:
+        if not str(val).startswith('N/A'): rows.append([label,val])
+    story += [table(rows,[9*cm,8*cm])]
+    story += sec('Electronic structure and energy decomposition')
+    er=[['Quantity','Value','Unit']]
+    for k,lbl in [('final_energy_hartree','Final electronic energy'),('reference_energy_hartree','Reference / SCF energy'),('correlation_energy_hartree','Correlation energy'),('nuclear_repulsion_hartree','Nuclear repulsion energy')]:
+        if e.get(k) is not None: er.append([lbl,_report_fmt(e[k],10),'Eh'])
+    if len(er)>1: story += [table(er,[9.2*cm,4.6*cm,3.2*cm])]
+    fig(story,'optimization','Figure: optimization electronic-energy profile.','Values are displayed relative to the lowest parsed optimization energy.')
+    if t:
+        story += sec('Thermochemistry')
+        tr=[['Quantity','Value','Unit']]
+        for k,lbl,unit,dig in [('temperature_K','Temperature','K',3),('pressure_atm','Pressure','atm',5),('zpe_hartree','Zero-point vibrational energy','Eh',8),('energy_0K_hartree','Electronic + ZPE energy (0 K)','Eh',10),('internal_energy_hartree','Internal energy, U','Eh',10),('enthalpy_hartree','Enthalpy, H','Eh',10),('gibbs_hartree','Gibbs free energy, G','Eh',10),('entropy_J_mol_K','Entropy, S','J mol-1 K-1',5)]:
+            if t.get(k) is not None: tr.append([lbl,_report_fmt(t[k],dig),unit])
+        for k,lbl in [('thermal_energy_correction_hartree','Thermal energy correction'),('enthalpy_correction_hartree','Enthalpy correction'),('gibbs_correction_hartree','Gibbs correction')]:
+            if t.get(k) is not None: tr.append([lbl,_report_fmt(t[k],8),'Eh'])
+        story += [table(tr,[9.2*cm,4.6*cm,3.2*cm]),Paragraph('Thermodynamic totals are reported only when present in the Psi4 output or reconstructable from an explicitly printed electronic energy plus the corresponding Psi4 correction.',small)]
+    freqs=[float(x) for x in (a.get('frequencies_cm1',[]) or []) if x is not None]; imag=[x for x in freqs if x < -5.0]; nz=[x for x in freqs if abs(x)<5.0]; pos=[x for x in freqs if x>=5.0]
+    if freqs or a.get('ir_spectrum'):
+        story += sec('Vibrational analysis and IR spectroscopy')
+        vr=[['Diagnostic','Value'],['Stationary-point classification',a.get('stationary_point_status') or 'N/A'],['Thermochemistry reliability',a.get('thermochemistry_reliability') or 'N/A'],['Frequency entries parsed',len(freqs)],['Near-zero modes (|nu| < 5 cm-1)',len(nz)],['Imaginary modes (nu < -5 cm-1)',len(imag)],['Positive modes (nu >= 5 cm-1)',len(pos)]]
+        story += [table(vr,[11.3*cm,5.7*cm])]
+        if imag: story += [Paragraph('<b>Imaginary frequencies:</b> '+', '.join(f'{x:.2f} cm-1' for x in imag[:20]),small)]
+        clean=[]
+        for q in (a.get('ir_spectrum',[]) or []):
+            try:
+                f=float(q[0]); inten=abs(float(q[1] or 0))
+                if f>0: clean.append((f,inten))
+            except Exception: pass
+        if clean:
+            mx=max([v for _,v in clean] or [1]); pr=[['Frequency (cm-1)','IR intensity (km mol-1)','Relative (%)']]
+            for f,inten in sorted(clean,key=lambda z:z[1],reverse=True)[:15]: pr.append([f'{f:.2f}',f'{inten:.3f}',f'{100*inten/mx:.1f}' if mx else '0.0'])
+            story += [Spacer(1,5),Paragraph('Strongest calculated IR bands',h2),table(pr,[5.3*cm,6.0*cm,5.7*cm])]
+        fig(story,'ir','Figure: simulated FT-IR-like profile.','The curve is derived from Psi4 harmonic IR intensities; the transmittance-like scale is a visualization, not experimental percent transmittance.')
+    td=a.get('tddft_states',[]) or []
+    if td:
+        story += sec('Electronic excitations / TD-SCF')
+        rr=[['State','Energy (eV)','Wavelength (nm)','Oscillator strength']]
+        for s in td[:40]: rr.append([s.get('state',''),_report_fmt(s.get('ev'),5),_report_fmt(s.get('nm'),2),_report_fmt(s.get('f'),7)])
+        story += [table(rr,[2.2*cm,4.3*cm,4.7*cm,5.8*cm])]; fig(story,'uvvis','Figure: simulated UV-Vis profile from parsed Psi4 excited-state transitions.')
+    if o.get('homo_ev') is not None or (o.get('orbitals') or []):
+        story += sec('Frontier molecular orbitals')
+        fr=[['Quantity','Value']]
+        for lbl,k in [('HOMO','homo_ev'),('LUMO','lumo_ev'),('HOMO-LUMO orbital-energy gap','gap_ev'),('Alpha HOMO','alpha_homo_ev'),('Alpha LUMO','alpha_lumo_ev'),('Beta HOMO','beta_homo_ev'),('Beta LUMO','beta_lumo_ev')]:
+            if o.get(k) is not None: fr.append([lbl,_report_fmt(o[k],6,' eV')])
+        story += [table(fr,[10.8*cm,6.2*cm])]
+        desc=a.get('conceptual_dft',{}) or {}
+        if desc:
+            cr=[['Conceptual-DFT descriptor','Value']]
+            for k,lbl,unit in [('ionization_potential_ev','Ionization potential, I','eV'),('electron_affinity_ev','Electron affinity, A','eV'),('chemical_hardness_ev','Chemical hardness, eta','eV'),('chemical_potential_ev','Chemical potential, mu','eV'),('electronegativity_ev','Electronegativity, chi','eV'),('chemical_softness_ev','Chemical softness, S','eV^-1'),('electrophilicity_index_ev','Electrophilicity index, omega','eV'),('electrodonating_power_ev','Electrodonating power, omega-','eV'),('electroaccepting_power_ev','Electroaccepting power, omega+','eV'),('net_electrophilicity_ev','Net electrophilicity, Delta omega','eV')]:
+                if desc.get(k) is not None: cr.append([lbl,_report_fmt(desc[k],6,' '+unit)])
+            story += [Spacer(1,5),Paragraph('Conceptual DFT descriptors',h2),table(cr,[11*cm,6*cm]),Paragraph('These are frontier-orbital approximations. For unrestricted wavefunctions, inspect the alpha/beta frontier levels before interpreting a single combined gap.',small)]
+        fig(story,'orbitals','Figure: frontier orbital energy levels.','The plotted gap is an orbital-energy difference and is not an electronic excitation energy.')
+    charges=a.get('atomic_charges',[]) or []; geom=a.get('final_geometry',[]) or []
+    if d or charges or geom:
+        story += sec('Molecular properties')
+        pr=[['Property','Value']]
+        if d.get('magnitude_debye') is not None: pr.append(['Dipole magnitude',_report_fmt(d['magnitude_debye'],6,' D')])
+        if d.get('vector') and len(d['vector'])>=3: pr.append(['Dipole vector (X, Y, Z)','; '.join(_report_fmt(v,6) for v in d['vector'][:3])+' D'])
+        if charges: pr.append(['Mulliken atomic charges parsed',len(charges)])
+        if geom: pr.append(['Atoms in final geometry',len(geom)])
+        story += [table(pr,[10.6*cm,6.4*cm])]
+    story += sec('Calculation diagnostics')
+    errs=a.get('errors',[]) or []
+    dr=[['Check','Result'],['Psi4 normal termination','Yes' if normal else 'No'],['Stationary point',a.get('stationary_point_status') or 'N/A'],['Thermochemistry reliability',a.get('thermochemistry_reliability') or 'N/A'],['Process return code',a.get('process_returncode','N/A')],['Detected fatal/error lines',len(errs)],['Report generator',REPORT_GENERATOR_VERSION]]
+    story += [table(dr,[11.4*cm,5.6*cm])]
+    if errs:
+        story += [Spacer(1,4),Paragraph('Last diagnostic lines',h2)]
+        for line in errs[-12:]: story.append(Paragraph(esc(line),mono))
+    orbarr=o.get('orbitals',[]) or []
+    if charges or geom or orbarr: story += [PageBreak()]+sec('Appendix - detailed numerical data')
+    if charges:
+        rr=[['Index','Atom','Mulliken charge']]+[[x.get('index',''),x.get('element',''),_report_fmt(x.get('charge'),8)] for x in charges]
+        story += [Paragraph('Mulliken atomic charges',h2),table(rr,[3*cm,4*cm,10*cm])]
+    if geom:
+        rr=[['Atom','X','Y','Z']]+[[x.get('element',''),_report_fmt(x.get('x'),7),_report_fmt(x.get('y'),7),_report_fmt(x.get('z'),7)] for x in geom]
+        story += [Spacer(1,6),Paragraph('Final Cartesian geometry (Angstrom)',h2),table(rr,[3*cm,4.65*cm,4.65*cm,4.65*cm])]
+    if orbarr:
+        occ=[z for z in orbarr if (z.get('occ') or 0)>1e-8]; vir=[z for z in orbarr if (z.get('occ') or 0)<=1e-8]; sel=(occ[-20:] if occ else [])+(vir[:20] if vir else [])
+        rr=[['Index','Spin','Occ.','Energy (Eh)','Energy (eV)']]+[[z.get('index',''),z.get('spin','restricted'),_report_fmt(z.get('occ'),3),_report_fmt(z.get('eh'),8),_report_fmt(z.get('ev'),6)] for z in sel]
+        story += [Spacer(1,6),Paragraph('Frontier-centered orbital energies',h2),table(rr,[2*cm,3.4*cm,2*cm,4.8*cm,4.8*cm])]
+    doc.build(story,onFirstPage=frame,onLaterPages=frame)
+    return pdf_path
+
+def build_pdf(a, plots, pdf_path):
+    if str((a or {}).get('engine') or '').lower()=='psi4':
+        return _build_psi4_pdf_v59(a,plots,pdf_path)
+    return _build_pdf_v58(a,plots,pdf_path)
+'''
+
+ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE + "\n" + ANALYZER_V58_PATCH_CODE + "\n" + ANALYZER_V59_PATCH_CODE
 
 exec(ANALYZER_MODULE_CODE, globals())
 
@@ -3230,7 +3585,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v5.7 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v5.9 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -3511,7 +3866,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v5.8\n"
+        "🧪 Computational Chemistry Bot v5.9\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
@@ -3528,7 +3883,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v5.8-ORCAENGINE-BATCH-THERMO-20260926\n'
+        'ChemBot build: v5.9-PSI4-REPORTS-20260926\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -3839,7 +4194,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v5.7 webhook mode active on port {port}.")
+    print(f"CHEMBOT v5.9 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -3880,7 +4235,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v5.7 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v5.9 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
