@@ -2339,10 +2339,14 @@ def _redact_kaggle_error(text):
 
 
 def _kaggle_cli_command(args, env):
-    """Return a Kaggle CLI argv that works on Render even if no console script is on PATH."""
-    executable = shutil.which('kaggle', path=env.get('PATH'))
-    if executable:
-        return [executable] + list(args)
+    """Run the Kaggle CLI from THIS Python interpreter/package.
+
+    Render images can contain an older ``kaggle`` console-script on PATH even
+    after pip upgrades the package used by this process. Calling that stale
+    executable silently drops modern KAGGLE_API_TOKEN authentication. Always
+    importing ``kaggle.cli`` through sys.executable keeps the CLI and installed
+    package version identical.
+    """
     return [
         sys.executable, '-c',
         "import sys; from kaggle.cli import main; sys.argv=['kaggle']+sys.argv[1:]; sys.exit(main())"
@@ -2366,15 +2370,27 @@ def _build_kaggle_auth_env():
     env['PYTHONUTF8'] = '1'
 
     if KAGGLE_API_TOKEN:
-        # Official modern Kaggle CLI authentication source.
-        env['KAGGLE_API_TOKEN'] = KAGGLE_API_TOKEN
-        env.pop('KAGGLE_KEY', None)
+        # Official modern Kaggle CLI authentication source. The full token is
+        # passed through KAGGLE_API_TOKEN and access_token. For compatibility
+        # with Kaggle CLI/API builds that still inspect legacy key fields, also
+        # expose the token body as KAGGLE_KEY and write kaggle.json, mirroring
+        # the proven chemistry-web-lab integration.
+        token = KAGGLE_API_TOKEN.strip()
+        legacy_compat_key = token[5:] if token.startswith('KGAT_') else token
+        env['KAGGLE_API_TOKEN'] = token
+        env['KAGGLE_KEY'] = legacy_compat_key
         token_path = os.path.join(cfg, 'access_token')
-        Path(token_path).write_text(KAGGLE_API_TOKEN, encoding='utf-8')
-        try:
-            os.chmod(token_path, 0o600)
-        except OSError:
-            pass
+        Path(token_path).write_text(token, encoding='utf-8')
+        legacy_path = os.path.join(cfg, 'kaggle.json')
+        Path(legacy_path).write_text(
+            json.dumps({'username': KAGGLE_USERNAME, 'key': legacy_compat_key}),
+            encoding='utf-8'
+        )
+        for credential_path in (token_path, legacy_path):
+            try:
+                os.chmod(credential_path, 0o600)
+            except OSError:
+                pass
     else:
         # Legacy username + 32-hex API key.
         env.pop('KAGGLE_API_TOKEN', None)
@@ -2400,6 +2416,35 @@ def _looks_transient_kaggle_error(text):
         'remote end closed', 'read timed out', 'temporary failure in name resolution'
     )
     return any(m in low for m in markers)
+
+
+def _kaggle_auth_preflight(env):
+    """Verify non-interactive Kaggle authentication using the exact runtime CLI."""
+    # `config view` is not a useful auth probe; use a lightweight authenticated
+    # kernels listing call. We only care that credentials are accepted.
+    cmd = _kaggle_cli_command(['kernels', 'list', '--page-size', '1'], env)
+    try:
+        proc = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=60
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('Kaggle authentication preflight timed out: ' + str(exc)) from exc
+    combined = (proc.stdout or '') + '\n' + (proc.stderr or '')
+    if proc.returncode == 0:
+        return
+    low = combined.lower()
+    if ('authentication required' in low or 'unauthorized' in low or '401' in low
+            or 'forbidden' in low or '403' in low):
+        mode = 'KAGGLE_API_TOKEN' if KAGGLE_API_TOKEN else 'legacy KAGGLE_USERNAME/KAGGLE_KEY'
+        raise RuntimeError(
+            'Kaggle authentication preflight failed while using ' + mode + '. '
+            'The credential reaching Render was not accepted by Kaggle. '
+            'Check that the Render variable contains only the token value (no quotes/spaces), '
+            'then regenerate it in Kaggle Settings > API if necessary.\n' +
+            _redact_kaggle_error(combined)[-1400:]
+        )
+    raise RuntimeError('Kaggle authentication preflight failed: ' + _redact_kaggle_error(combined)[-1600:])
 
 
 def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, drive_link, api_factory=None):
@@ -2439,6 +2484,7 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
         Path(job_dir, 'script.py').write_text(script, encoding='utf-8', newline='\n')
 
         auth_root, env = _build_kaggle_auth_env()
+        _kaggle_auth_preflight(env)
         last_text = ''
         url = None
         for attempt in range(1, 4):
