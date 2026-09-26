@@ -1,4 +1,4 @@
-# BUILD: v5.2-KAGGLE-AUTH-ORDER-FIX-20260926
+# BUILD: v5.3-KAGGLE-AUTH-AUTODETECT-20260926
 import os
 
 # ============================================================
@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v5.2
+# Chemistry Telegram/Kaggle Bot v5.3
 # ============================================================
 
 
@@ -2352,50 +2352,79 @@ def _kaggle_cli_command(args, env):
     ] + list(args)
 
 
+def _classify_kaggle_credential():
+    """Return (mode, credential).
+
+    Kaggle legacy API keys are exactly 32 lowercase/uppercase hex characters.
+    Anything else supplied through KAGGLE_API_TOKEN is treated as a modern
+    access token, matching the detection logic used by chemistry-web-lab.
+    """
+    token = (KAGGLE_API_TOKEN or '').strip()
+    key = (KAGGLE_KEY or '').strip()
+
+    if token:
+        if re.fullmatch(r'[0-9a-fA-F]{32}', token):
+            return 'legacy', token
+        return 'modern', token
+
+    if key:
+        # KAGGLE_KEY is explicitly the legacy path.
+        return 'legacy', key
+
+    return 'none', ''
+
+
 def _build_kaggle_auth_env():
-    """Create an isolated Kaggle auth directory supporting modern and legacy credentials."""
+    """Create an isolated Kaggle auth directory with automatic legacy/modern detection."""
     if not KAGGLE_USERNAME:
         raise RuntimeError('KAGGLE_USERNAME is empty. Set your exact Kaggle username in Render.')
-    if not KAGGLE_API_TOKEN and not KAGGLE_KEY:
-        raise RuntimeError('No Kaggle credential is configured. Set KAGGLE_API_TOKEN (recommended) or KAGGLE_KEY.')
+
+    mode, credential = _classify_kaggle_credential()
+    if mode == 'none':
+        raise RuntimeError(
+            'No Kaggle credential is configured. Set either KAGGLE_API_TOKEN '
+            'or the legacy KAGGLE_KEY together with KAGGLE_USERNAME.'
+        )
 
     tmp_root = tempfile.mkdtemp(prefix='chembot-kaggle-auth-')
     cfg = os.path.join(tmp_root, '.kaggle')
     os.makedirs(cfg, exist_ok=True)
+
     env = os.environ.copy()
     env['KAGGLE_CONFIG_DIR'] = cfg
     env['KAGGLE_USERNAME'] = KAGGLE_USERNAME
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUTF8'] = '1'
 
-    if KAGGLE_API_TOKEN:
-        # Modern Kaggle authentication. Keep it completely separate from the
-        # legacy username/key path. Both variables are already exported before
-        # any Kaggle library code is invoked.
-        token = KAGGLE_API_TOKEN.strip()
-        env['KAGGLE_USERNAME'] = KAGGLE_USERNAME
-        env['KAGGLE_API_TOKEN'] = token
+    if mode == 'modern':
+        # Modern non-interactive Kaggle auth.
+        env['KAGGLE_API_TOKEN'] = credential
         env.pop('KAGGLE_KEY', None)
+
         token_path = os.path.join(cfg, 'access_token')
-        Path(token_path).write_text(token, encoding='utf-8')
+        Path(token_path).write_text(credential, encoding='utf-8')
         try:
             os.chmod(token_path, 0o600)
         except OSError:
             pass
     else:
-        # Legacy username + 32-hex API key.
+        # Legacy 32-hex key. This path is required even when the user happened
+        # to paste that old key into KAGGLE_API_TOKEN in Render.
         env.pop('KAGGLE_API_TOKEN', None)
-        env['KAGGLE_KEY'] = KAGGLE_KEY
+        env['KAGGLE_USERNAME'] = KAGGLE_USERNAME
+        env['KAGGLE_KEY'] = credential
+
         legacy_path = os.path.join(cfg, 'kaggle.json')
         Path(legacy_path).write_text(
-            json.dumps({'username': KAGGLE_USERNAME, 'key': KAGGLE_KEY}),
+            json.dumps({'username': KAGGLE_USERNAME, 'key': credential}),
             encoding='utf-8'
         )
         try:
             os.chmod(legacy_path, 0o600)
         except OSError:
             pass
-    return tmp_root, env
+
+    return tmp_root, env, mode
 
 
 def _looks_transient_kaggle_error(text):
@@ -2409,7 +2438,7 @@ def _looks_transient_kaggle_error(text):
     return any(m in low for m in markers)
 
 
-def _kaggle_auth_preflight(env):
+def _kaggle_auth_preflight(env, auth_mode):
     """Verify non-interactive Kaggle authentication using the exact runtime CLI."""
     # `config view` is not a useful auth probe; use a lightweight authenticated
     # kernels listing call. We only care that credentials are accepted.
@@ -2427,7 +2456,7 @@ def _kaggle_auth_preflight(env):
     low = combined.lower()
     if ('authentication required' in low or 'unauthorized' in low or '401' in low
             or 'forbidden' in low or '403' in low):
-        mode = 'KAGGLE_API_TOKEN' if KAGGLE_API_TOKEN else 'legacy KAGGLE_USERNAME/KAGGLE_KEY'
+        mode = ('modern KAGGLE_API_TOKEN' if auth_mode == 'modern' else 'legacy KAGGLE_USERNAME/KAGGLE_KEY')
         raise RuntimeError(
             'Kaggle authentication preflight failed while using ' + mode + '. '
             'The credential reaching Render was not accepted by Kaggle. '
@@ -2474,8 +2503,8 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
         script = header + '\n' + ANALYZER_MODULE_CODE + '\n' + KAGGLE_RUNNER_CODE
         Path(job_dir, 'script.py').write_text(script, encoding='utf-8', newline='\n')
 
-        auth_root, env = _build_kaggle_auth_env()
-        _kaggle_auth_preflight(env)
+        auth_root, env, auth_mode = _build_kaggle_auth_env()
+        _kaggle_auth_preflight(env, auth_mode)
         last_text = ''
         url = None
         for attempt in range(1, 4):
@@ -2509,7 +2538,7 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
             # 401/403 and validation errors are permanent; retries cannot fix them.
             low = combined.lower()
             if '401' in low or 'unauthorized' in low or '403' in low or 'forbidden' in low:
-                mode = 'KAGGLE_API_TOKEN' if KAGGLE_API_TOKEN else 'legacy KAGGLE_USERNAME/KAGGLE_KEY'
+                mode = ('modern KAGGLE_API_TOKEN' if auth_mode == 'modern' else 'legacy KAGGLE_USERNAME/KAGGLE_KEY')
                 raise RuntimeError(
                     'Kaggle authentication was rejected (401/403) while using ' + mode + '. '
                     'Regenerate the corresponding credential in Kaggle Settings > API, update the Render environment variable, and redeploy. '
@@ -2538,7 +2567,7 @@ if _stale_removed:
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_WORKER_THREADS)
 # Authentication is deliberately deferred to each isolated submission.
 # This avoids a stale legacy credential preventing the Render service from starting.
-print(f"CHEMBOT v4.9 is initialized with {BOT_WORKER_THREADS} Telegram workers...")
+print(f"CHEMBOT v5.3 is initialized with {BOT_WORKER_THREADS} Telegram workers...")
 
 
 def authorized(message):
@@ -2695,7 +2724,8 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v4.8\n\n"
+        "🧪 Computational Chemistry Bot v5.3\n"
+        f"• Kaggle authentication mode: {_classify_kaggle_credential()[0]}\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
         "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
@@ -2703,6 +2733,23 @@ def start(message):
         "• Psi4 D3/D4/gCP/geomeTRIC dependencies are detected and installed automatically.\n"
         "• Use /clearaux after a batch to clear stored auxiliary files/restart URL.\n"
         "• Kaggle sends calculation results directly, so this launcher can be closed after all submissions are confirmed."
+    )
+
+
+@bot.message_handler(commands=['version'])
+def version_command(message):
+    if not authorized(message): return
+    mode, credential = _classify_kaggle_credential()
+    masked = 'not configured'
+    if credential:
+        masked = f'{credential[:4]}…{credential[-4:]} ({len(credential)} chars)'
+    bot.reply_to(
+        message,
+        'ChemBot build: v5.3-KAGGLE-AUTH-AUTODETECT-20260926\n'
+        f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
+        f'Credential mode: {mode}\n'
+        f'Credential fingerprint: {masked}\n'
+        f'ORCA dataset: {ORCA_DATASET_SLUG}'
     )
 
 
@@ -2958,7 +3005,7 @@ def run_render_webhook():
                 payload = json.dumps({
                     "ok": True,
                     "service": "ChemBot",
-                    "version": "4.7",
+                    "version": "5.3",
                     "transport": "webhook",
                 }).encode("utf-8")
                 return self._reply(200, payload, "application/json; charset=utf-8")
@@ -3006,7 +3053,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v4.8 webhook mode active on port {port}.")
+    print(f"CHEMBOT v5.3 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -3047,7 +3094,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v4.9 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v5.3 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
@@ -3055,7 +3102,7 @@ def run_polling():
             raise RuntimeError(
                 "Telegram 409 conflict: another process is already polling this bot token. "
                 "Stop the other local/Render bot instance, or deploy ChemBot as a Render Web Service "
-                "so v4.8 uses webhook mode."
+                "so v5.3 uses webhook mode."
             ) from exc
         raise
 
