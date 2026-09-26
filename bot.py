@@ -1,4 +1,4 @@
-# BUILD: v4.8-Q1-FTIR-MO-FIXED-20260926
+# BUILD: v4.9-KAGGLE-JOB-FIX-20260926
 import os
 import re
 import sys
@@ -64,7 +64,7 @@ if not BOT_TOKEN:
 ALLOWED_IDS = {7495822836, -1003907097817, 839801823, -1003925918657, -1003875125323}
 ADMIN_ID = 839801823
 ORCA_DATASET_SLUG = os.environ.get(
-    "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0-linux-x86-64"
+    "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0"
 )
 MAX_TELEGRAM_DOWNLOAD = 20 * 1024 * 1024
 MAX_AUX_STORAGE = 20 * 1024 * 1024
@@ -1945,7 +1945,7 @@ def detect_psi4_extras(inp_text):
 
 # ------------------------- Kaggle runner code -------------------------
 KAGGLE_RUNNER_CODE = r'''
-import os, sys, json, time, base64, shutil, zipfile, subprocess, traceback, urllib.request, urllib.parse, hashlib
+import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib
 from pathlib import Path
 START_TIME=time.time()
 HARD_LIMIT=11.5*3600
@@ -2150,27 +2150,99 @@ try:
     output_file=basename+'.out'
     if is_psi4:
         send_msg('[Kaggle] Preparing Psi4 environment...')
-        safe_install(['conda','install','-y','-q','-c','conda-forge','psi4'])
+        psi4_exe=shutil.which('psi4')
+        if not psi4_exe:
+            mgr=shutil.which('mamba') or shutil.which('conda')
+            if not mgr:
+                raise RuntimeError('Neither mamba nor conda is available in this Kaggle image, so Psi4 cannot be installed.')
+            safe_install([mgr,'install','-y','-q','-c','conda-forge','psi4'])
+            psi4_exe=shutil.which('psi4')
         if PSI4_EXTRAS:
-            safe_install(['conda','install','-y','-q','-c','conda-forge']+PSI4_EXTRAS)
-        cmd=['psi4','-i',INPUT_FILE,'-o',output_file]
+            mgr=shutil.which('mamba') or shutil.which('conda')
+            if not mgr:
+                raise RuntimeError('Psi4 extras were requested but no conda-compatible package manager is available.')
+            safe_install([mgr,'install','-y','-q','-c','conda-forge']+PSI4_EXTRAS)
+        psi4_exe=psi4_exe or shutil.which('psi4')
+        if not psi4_exe:
+            raise RuntimeError('Psi4 installation completed but the psi4 executable was not found on PATH.')
+        cmd=[psi4_exe,'-i',INPUT_FILE,'-o',output_file]
     else:
-        send_msg('[Kaggle] Preparing ORCA 6 environment...')
-        root='/tmp/orca_env'; os.makedirs(root,exist_ok=True)
-        # Copy dataset contents without shell interpolation
-        for parent,dirs,files in os.walk('/kaggle/input'):
-            for fn in files:
-                src=os.path.join(parent,fn); rel=os.path.relpath(src,'/kaggle/input'); dst=os.path.join(root,rel); os.makedirs(os.path.dirname(dst),exist_ok=True)
-                try: shutil.copy2(src,dst)
-                except Exception: pass
-        candidates=[]
-        for parent,dirs,files in os.walk(root):
-            if 'orca' in files: candidates.append(os.path.join(parent,'orca'))
-        if not candidates: raise RuntimeError('ORCA executable not found in attached Kaggle dataset.')
-        orca_exe=min(candidates,key=len); orca_dir=os.path.dirname(os.path.realpath(orca_exe)); os.chmod(orca_exe,0o755)
+        send_msg('[Kaggle] Preparing ORCA 6 environment from attached Dataset...')
+        ORCA_SCRATCH='/tmp/orca_pkg'
+        os.makedirs(ORCA_SCRATCH,exist_ok=True)
+
+        def _find_orca_under(root_dir):
+            if not os.path.isdir(root_dir):
+                return None
+            matches=[]
+            for parent,dirs,files in os.walk(root_dir):
+                if 'orca' in files:
+                    matches.append(os.path.join(parent,'orca'))
+            if not matches:
+                return None
+            # Prefer a shallow path; it is normally the package root.
+            matches.sort(key=lambda x:(x.count(os.sep),len(x)))
+            return matches[0]
+
+        def _extract_orca_archive(archive_path,dest):
+            os.makedirs(dest,exist_ok=True)
+            try:
+                if zipfile.is_zipfile(archive_path):
+                    with zipfile.ZipFile(archive_path) as z:
+                        for info in z.infolist():
+                            name=info.filename.replace('\\','/')
+                            norm=os.path.normpath(name)
+                            if name.startswith('/') or norm.startswith('..'+os.sep) or norm=='..':
+                                raise RuntimeError('Unsafe path in ORCA ZIP archive: '+name)
+                        z.extractall(dest)
+                    return True
+                if tarfile.is_tarfile(archive_path):
+                    with tarfile.open(archive_path,'r:*') as t:
+                        members=t.getmembers()
+                        root=os.path.realpath(dest)
+                        for m in members:
+                            target=os.path.realpath(os.path.join(dest,m.name))
+                            if not (target==root or target.startswith(root+os.sep)):
+                                raise RuntimeError('Unsafe path in ORCA tar archive: '+m.name)
+                        t.extractall(dest)
+                    return True
+            except Exception as exc:
+                send_msg('[Kaggle] ORCA archive extraction failed: '+str(exc))
+            return False
+
+        # Same strategy as chemistry-web-lab: search the read-only Kaggle Dataset
+        # first; only extract archives to writable scratch if no executable exists.
+        orca_exe=_find_orca_under('/kaggle/input')
+        if not orca_exe:
+            archives=[]
+            for parent,dirs,files in os.walk('/kaggle/input'):
+                for fn in files:
+                    low=fn.lower()
+                    if low.endswith(('.tar.xz','.txz','.tar.gz','.tgz','.tar.bz2','.tbz2','.tar','.zip')):
+                        path=os.path.join(parent,fn)
+                        archives.append((0 if 'orca' in low else 1,path))
+            archives.sort()
+            for idx,(_,arc) in enumerate(archives):
+                dest=os.path.join(ORCA_SCRATCH,'extracted_%d'%idx)
+                if _extract_orca_archive(arc,dest):
+                    orca_exe=_find_orca_under(dest)
+                    if orca_exe:
+                        break
+                shutil.rmtree(dest,ignore_errors=True)
+        if not orca_exe:
+            raise RuntimeError("Could not locate the ORCA executable in attached Dataset 'abdulsalsmsalih/orca-6-1-0'. Ensure it contains the Linux ORCA package or archive.")
+        try: os.chmod(orca_exe,0o755)
+        except Exception: pass
+        orca_dir=os.path.dirname(os.path.realpath(orca_exe))
         os.environ['PATH']=orca_dir+os.pathsep+os.environ.get('PATH','')
         os.environ['LD_LIBRARY_PATH']=orca_dir+os.pathsep+os.environ.get('LD_LIBRARY_PATH','')
-        os.environ['OMPI_ALLOW_RUN_AS_ROOT']='1'; os.environ['OMPI_ALLOW_RUN_AS_ROOT_CONFIRM']='1'
+        os.environ['OMPI_ALLOW_RUN_AS_ROOT']='1'
+        os.environ['OMPI_ALLOW_RUN_AS_ROOT_CONFIRM']='1'
+        os.environ['OMPI_MCA_btl_vader_single_copy_mechanism']='none'
+        os.environ['OMPI_MCA_rmaps_base_oversubscribe']='1'
+        os.environ['OMP_NUM_THREADS']='1'
+        os.environ['MKL_NUM_THREADS']='1'
+        send_msg('[Kaggle] ORCA executable: '+orca_exe)
         cmd=[orca_exe,INPUT_FILE]
 
     send_msg(f"[Kaggle] Starting {'Psi4' if is_psi4 else 'ORCA'} calculation: {INPUT_FILE}")
@@ -2228,18 +2300,16 @@ except Exception as e:
 '''
 
 def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, drive_link, api_factory=None):
-    """Create, push, and always remove one private local Kaggle staging dir.
-
-    This function is deliberately self-contained per job: unique UUID slug,
-    unique tempfile directory, and a fresh KaggleApi client. It is therefore
-    safe to call from several Telegram worker threads at the same time.
-    """
+    """Create and push one isolated Kaggle script job, validating Kaggle's response."""
     job_id = 'chem-job-' + uuid.uuid4().hex[:16]
     job_dir = None
     try:
+        if not KAGGLE_USERNAME:
+            raise RuntimeError('KAGGLE_USERNAME is empty. Set it in Render even when using a new Kaggle API token.')
         job_dir = tempfile.mkdtemp(prefix=job_id + '_')
+        dataset_sources = [] if is_psi4 else [ORCA_DATASET_SLUG]
         metadata = {
-            'id': f'{KAGGLE_USERNAME}/{job_id}',
+            'id': f'{KAGGLE_USERNAME.lower()}/{job_id}',
             'title': job_id,
             'code_file': 'script.py',
             'language': 'python',
@@ -2247,10 +2317,10 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
             'is_private': True,
             'enable_gpu': False,
             'enable_internet': True,
-            'dataset_sources': [ORCA_DATASET_SLUG] if not is_psi4 else [],
+            'dataset_sources': dataset_sources,
         }
         Path(job_dir, 'kernel-metadata.json').write_text(
-            json.dumps(metadata), encoding='utf-8'
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8'
         )
         header = (
             'BOT_TOKEN=' + repr(BOT_TOKEN) + '\n'
@@ -2266,11 +2336,37 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
         factory = api_factory or KaggleApi
         job_api = factory()
         job_api.authenticate()
-        job_api.kernels_push(job_dir)
-        return job_id, f'https://www.kaggle.com/code/{KAGGLE_USERNAME}/{job_id}'
+        resp = job_api.kernels_push(job_dir)
+
+        errors=[]
+        if getattr(resp,'error',None):
+            errors.append(str(resp.error))
+        bad_ds=getattr(resp,'invalid_dataset_sources',None)
+        if bad_ds:
+            errors.append('Invalid dataset source(s): '+', '.join(map(str,bad_ds)))
+        bad_ks=getattr(resp,'invalid_kernel_sources',None)
+        if bad_ks:
+            errors.append('Invalid kernel source(s): '+', '.join(map(str,bad_ks)))
+        bad_cs=getattr(resp,'invalid_competition_sources',None)
+        if bad_cs:
+            errors.append('Invalid competition source(s): '+', '.join(map(str,bad_cs)))
+        if errors:
+            raise RuntimeError('Kaggle rejected the job: '+' ; '.join(errors))
+
+        ref=getattr(resp,'ref',None)
+        url=getattr(resp,'url',None)
+        if ref:
+            ref=str(ref).strip().strip('/')
+            if '/' in ref:
+                owner,slug=ref.split('/',1)
+                job_id=slug
+                url=url or f'https://www.kaggle.com/code/{owner}/{slug}'
+        if not url:
+            url=f'https://www.kaggle.com/code/{KAGGLE_USERNAME.lower()}/{job_id}'
+        return job_id, str(url)
+    except Exception as exc:
+        raise RuntimeError(f'Kaggle submission failed for {os.path.basename(input_name)}: {exc}') from exc
     finally:
-        # Local staging bytes are never needed after push, and a failed push
-        # must not leave orca-job/psi4-job/chem-job debris either.
         _safe_rmtree(job_dir)
 
 
@@ -2287,7 +2383,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_WORKER_THREADS)
 _startup_api = KaggleApi()
 _startup_api.authenticate()
 del _startup_api
-print(f"CHEMBOT v4.7 is initialized with {BOT_WORKER_THREADS} Telegram workers...")
+print(f"CHEMBOT v4.9 is initialized with {BOT_WORKER_THREADS} Telegram workers...")
 
 
 def authorized(message):
@@ -2796,7 +2892,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v4.7 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v4.9 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
