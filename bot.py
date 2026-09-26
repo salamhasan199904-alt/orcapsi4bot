@@ -1,5 +1,30 @@
-# BUILD: v4.9-KAGGLE-JOB-FIX-20260926
+# BUILD: v5.2-KAGGLE-AUTH-ORDER-FIX-20260926
 import os
+
+# ============================================================
+# CRITICAL: Kaggle credentials must be present in os.environ
+# BEFORE importing or invoking any Kaggle library/CLI code.
+# ============================================================
+
+def _clean_env(name):
+    return str(os.environ.get(name, '') or '').strip().strip('"').strip("'")
+
+BOT_TOKEN = _clean_env('CHEMBOT_BOT_TOKEN')
+KAGGLE_USERNAME = _clean_env('KAGGLE_USERNAME').lower()
+KAGGLE_API_TOKEN = _clean_env('KAGGLE_API_TOKEN')
+KAGGLE_KEY = _clean_env('KAGGLE_KEY')
+
+# Modern API-token auth is preferred. Do NOT mirror it into KAGGLE_KEY;
+# keeping both auth schemes active can make a CLI/runtime fall back to legacy.
+if KAGGLE_USERNAME:
+    os.environ['KAGGLE_USERNAME'] = KAGGLE_USERNAME
+if KAGGLE_API_TOKEN:
+    os.environ['KAGGLE_API_TOKEN'] = KAGGLE_API_TOKEN
+    os.environ.pop('KAGGLE_KEY', None)
+elif KAGGLE_KEY:
+    os.environ['KAGGLE_KEY'] = KAGGLE_KEY
+    os.environ.pop('KAGGLE_API_TOKEN', None)
+
 import re
 import sys
 import json
@@ -16,36 +41,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v5.0
-# - ORCA 6.x + Psi4 jobs on Kaggle
-# - Kaggle keeps sending results even if local launcher is closed
-# - Direct .out analysis with interactive Telegram menus
-# - Automatic plots + PDF scientific report
-# - Psi4 external dependency detection (D3/D4/gCP/geomeTRIC...)
+# Chemistry Telegram/Kaggle Bot v5.2
 # ============================================================
 
 
 def ensure_dependencies():
-    """Ensure runtime dependencies, including a Kaggle CLI new enough for API-token auth."""
     packages = {
-        "telebot": "pyTelegramBotAPI>=4.16",
-        "matplotlib": "matplotlib>=3.7",
-        "reportlab": "reportlab>=4.0",
-        "numpy": "numpy>=1.24",
-        "requests": "requests>=2.31",
+        'telebot': 'pyTelegramBotAPI>=4.16',
+        'matplotlib': 'matplotlib>=3.7',
+        'reportlab': 'reportlab>=4.0',
+        'numpy': 'numpy>=1.24',
+        'requests': 'requests>=2.31',
     }
     for mod, pkg in packages.items():
         try:
             __import__(mod)
         except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
 
-    # Kaggle 1.6.x predates the modern KAGGLE_API_TOKEN authentication path.
-    # Render deployments using a new token therefore need the current CLI.
     try:
         from importlib.metadata import version as _pkg_version
-        raw = _pkg_version("kaggle")
-        nums = [int(x) for x in re.findall(r"\d+", raw)[:3]]
+        raw = _pkg_version('kaggle')
+        nums = [int(x) for x in re.findall(r'\d+', raw)[:3]]
         while len(nums) < 3:
             nums.append(0)
         kaggle_ok = tuple(nums) >= (2, 2, 4)
@@ -53,41 +70,23 @@ def ensure_dependencies():
         kaggle_ok = False
     if not kaggle_ok:
         subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q", "--upgrade", "kaggle>=2.2.4"
+            sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'kaggle>=2.2.4'
         ])
 
 
 ensure_dependencies()
+
+# Re-assert after pip/import activity. No Kaggle module is invoked before here.
+if KAGGLE_USERNAME:
+    os.environ['KAGGLE_USERNAME'] = KAGGLE_USERNAME
+if KAGGLE_API_TOKEN:
+    os.environ['KAGGLE_API_TOKEN'] = KAGGLE_API_TOKEN
+    os.environ.pop('KAGGLE_KEY', None)
+elif KAGGLE_KEY:
+    os.environ['KAGGLE_KEY'] = KAGGLE_KEY
+
 import telebot
 from telebot import types
-
-# ------------------------- Configuration -------------------------
-# Prefer environment variables. This avoids embedding live credentials in code.
-BOT_TOKEN = os.environ.get("CHEMBOT_BOT_TOKEN", "").strip()
-KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "").strip().lower()
-KAGGLE_KEY = os.environ.get("KAGGLE_KEY", "").strip()
-KAGGLE_API_TOKEN = os.environ.get("KAGGLE_API_TOKEN", "").strip()
-
-# Normalize common Render configurations. A modern token takes precedence over
-# stale legacy credentials. If a KGAT-style token was accidentally put in
-# KAGGLE_KEY, promote it automatically. A 32-hex value is a legacy key.
-_LEGACY_KAGGLE_KEY_RE = re.compile(r"^[0-9a-fA-F]{32}$")
-if not KAGGLE_API_TOKEN and KAGGLE_KEY and not _LEGACY_KAGGLE_KEY_RE.fullmatch(KAGGLE_KEY):
-    KAGGLE_API_TOKEN = KAGGLE_KEY
-    KAGGLE_KEY = ""
-if KAGGLE_API_TOKEN and _LEGACY_KAGGLE_KEY_RE.fullmatch(KAGGLE_API_TOKEN) and not KAGGLE_KEY:
-    KAGGLE_KEY = KAGGLE_API_TOKEN
-    KAGGLE_API_TOKEN = ""
-
-if KAGGLE_USERNAME:
-    os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-if KAGGLE_API_TOKEN:
-    os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
-    # Do not let an old Render KAGGLE_KEY override/fallback in an older auth path.
-    os.environ.pop("KAGGLE_KEY", None)
-elif KAGGLE_KEY:
-    os.environ["KAGGLE_KEY"] = KAGGLE_KEY
-    os.environ.pop("KAGGLE_API_TOKEN", None)
 
 if not BOT_TOKEN:
     raise RuntimeError("Set CHEMBOT_BOT_TOKEN before running the bot.")
@@ -2370,27 +2369,19 @@ def _build_kaggle_auth_env():
     env['PYTHONUTF8'] = '1'
 
     if KAGGLE_API_TOKEN:
-        # Official modern Kaggle CLI authentication source. The full token is
-        # passed through KAGGLE_API_TOKEN and access_token. For compatibility
-        # with Kaggle CLI/API builds that still inspect legacy key fields, also
-        # expose the token body as KAGGLE_KEY and write kaggle.json, mirroring
-        # the proven chemistry-web-lab integration.
+        # Modern Kaggle authentication. Keep it completely separate from the
+        # legacy username/key path. Both variables are already exported before
+        # any Kaggle library code is invoked.
         token = KAGGLE_API_TOKEN.strip()
-        legacy_compat_key = token[5:] if token.startswith('KGAT_') else token
+        env['KAGGLE_USERNAME'] = KAGGLE_USERNAME
         env['KAGGLE_API_TOKEN'] = token
-        env['KAGGLE_KEY'] = legacy_compat_key
+        env.pop('KAGGLE_KEY', None)
         token_path = os.path.join(cfg, 'access_token')
         Path(token_path).write_text(token, encoding='utf-8')
-        legacy_path = os.path.join(cfg, 'kaggle.json')
-        Path(legacy_path).write_text(
-            json.dumps({'username': KAGGLE_USERNAME, 'key': legacy_compat_key}),
-            encoding='utf-8'
-        )
-        for credential_path in (token_path, legacy_path):
-            try:
-                os.chmod(credential_path, 0o600)
-            except OSError:
-                pass
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
     else:
         # Legacy username + 32-hex API key.
         env.pop('KAGGLE_API_TOKEN', None)
