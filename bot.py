@@ -1,4 +1,4 @@
-# BUILD: v6.2.4-STRICT-20260927
+# BUILD: v6.2.6-STRICT-20260927
 import os
 
 # ============================================================
@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v6.2.4
+# Chemistry Telegram/Kaggle Bot v6.2.6
 # ============================================================
 
 
@@ -339,7 +339,7 @@ ANALYZER_MODULE_CODE = r'''
 import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = '6.2.4'
+REPORT_GENERATOR_VERSION = '6.2.6'
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 KB_J_MOL_K = 8.314462618
@@ -3546,11 +3546,14 @@ def detect_psi4_extras(inp_text):
 
 # ------------------------- Kaggle runner code -------------------------
 KAGGLE_RUNNER_CODE = r'''
-import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib, re
+import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib, re, signal, threading
 from pathlib import Path
 START_TIME=time.time()
 HARD_LIMIT=11.5*3600
 SAFETY_MARGIN=20*60
+WORK_DIR='/kaggle/working'
+MAX_DISK_MB=20000
+MAX_DISK_BYTES=MAX_DISK_MB*1000*1000
 
 def tg(method, fields=None, file_field=None, file_path=None, timeout=90):
     """Call Telegram Bot API and fail loudly on HTTP/API-level errors."""
@@ -3610,6 +3613,131 @@ def _windows_safe_basename(value):
     if stem in {'CON','PRN','AUX','NUL'} or re.fullmatch(r'(COM|LPT)[1-9]',stem):
         name='_'+name
     return name
+
+
+def _find_gaussian_archive(input_root='/kaggle/input'):
+    """Find the Gaussian dataset file, including the common tbz/tzb typo.
+
+    Kaggle mounts the dataset under its slug; the archive's basename is
+    retained. A .tzb upload may still be a valid bzip2-compressed tarball.
+    """
+    matches=[]; visible=[]
+    if not os.path.isdir(input_root):
+        raise RuntimeError('Kaggle input directory is unavailable: '+input_root)
+    accepted={'g16.tbz','g16.tzb','g16.tbz2','g16.tar.bz2'}
+    for parent, dirs, files in os.walk(input_root):
+        dirs.sort()
+        for name in sorted(files):
+            path=os.path.join(parent,name)
+            relative=os.path.relpath(path,input_root)
+            if len(visible)<25: visible.append(relative)
+            if name.lower() in accepted:
+                in_dataset='gauusian16' in Path(relative).parts[0].lower()
+                matches.append((not in_dataset,relative.lower(),path))
+    if not matches:
+        found=', '.join(visible) if visible else '(no files visible)'
+        raise RuntimeError('No Gaussian g16 archive found under '+input_root+
+                           '. Expected g16.tzb or g16.tbz in the gauusian16 dataset. '+
+                           'Files visible: '+found)
+    matches.sort()
+    return matches[0][2]
+
+
+def _cap_gaussian_maxdisk(inp):
+    """Apply Gaussian's route keyword to every Link1 job, including GaussView inputs."""
+    lines=inp.splitlines(keepends=True)
+    starts=[i for i,line in enumerate(lines) if re.match(r'^\s*#',line)]
+    if not starts:
+        raise RuntimeError('Gaussian input has no route line beginning with #.')
+    disk_option=re.compile(r'(?i)\bMaxDisk\s*=\s*(?P<number>[-+]?\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?B|[KMG]W)?\b')
+    # Use conservative binary conversions for larger units. For example,
+    # 20 GB may mean 20,480 MB and must therefore be capped at 20,000 MB.
+    unit_mb={'KB':1/1024,'MB':1.0,'GB':1024.0,'TB':1048576.0,
+             'KW':8/1024,'MW':8.0,'GW':8192.0,'':8/(1024*1024)}
+    for start in reversed(starts):
+        end=start+1
+        while end<len(lines) and lines[end].strip():
+            end+=1
+        segment=lines[start:end]
+        choices=[]
+        for line in segment:
+            for match in disk_option.finditer(line):
+                amount=float(match.group('number'))*unit_mb[(match.group('unit') or '').upper()]
+                if amount>0: choices.append((amount,match.group(0).strip()))
+        # Preserve a smaller user-provided limit, but replace unlimited or
+        # larger values. Exactly one option remains in each Link1 route.
+        chosen=min(choices,key=lambda item:item[0]) if choices else None
+        option=chosen[1] if chosen and chosen[0]<=MAX_DISK_MB else 'MaxDisk=20000MB'
+        segment=[disk_option.sub('',line) for line in segment]
+        segment=[line for line in segment if line.strip()]
+        if not segment:
+            raise RuntimeError('Gaussian route section is empty.')
+        if not segment[-1].endswith('\n'):
+            segment[-1]+='\n'
+        segment.append(' '+option+'\n')
+        lines[start:end]=segment
+    return ''.join(lines)
+
+
+def _cap_orca_maxdisk(inp):
+    """Limit ORCA conventional SCF integral files to 20,000 MB per job."""
+    jobs=re.split(r'(?im)(^\s*\$new_job\s*$)',inp)
+    for index in range(0,len(jobs),2):
+        job=jobs[index]
+        # Respect existing %scf blocks; cap an existing directive instead of
+        # inserting a duplicate keyword (which ORCA can reject).
+        maxdisk_pattern=(r'(?im)^(\s*(?:%scf\b[^\n]*?\b)?MaxDisk\s*(?:=\s*)?)'
+                         r'([-+]?\d+(?:\.\d+)?)\b')
+        maxdisk=re.search(maxdisk_pattern,job)
+        if maxdisk:
+            job=re.sub(maxdisk_pattern,
+                       lambda m:m.group(1)+str(int(float(m.group(2))))
+                       if 0<float(m.group(2))<=20000 else m.group(1)+'20000',job)
+        else:
+            scf=re.search(r'(?im)^\s*%scf\b[^\n]*',job)
+            if scf:
+                line=scf.group(0)
+                if re.search(r'(?i)\bend\b',line):
+                    replacement=re.sub(r'(?i)\bend\b','MaxDisk 20000 end',line,count=1)
+                else:
+                    replacement=line+'\n  MaxDisk 20000'
+                job=job[:scf.start()]+replacement+job[scf.end():]
+            else:
+                job='%scf\n  MaxDisk 20000\nend\n'+job
+        jobs[index]=job
+    return ''.join(jobs)
+
+
+def _working_disk_bytes(root):
+    """Measure allocated file blocks in the active job directory."""
+    total=0
+    for parent,dirs,files in os.walk(root,followlinks=False):
+        for name in files:
+            try:
+                st=os.stat(os.path.join(parent,name),follow_symlinks=False)
+                total+=st.st_blocks*512 if hasattr(st,'st_blocks') else st.st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _stop_process_group(proc):
+    try: os.killpg(proc.pid,signal.SIGKILL)
+    except (OSError,ProcessLookupError):
+        if proc.poll() is None: proc.kill()
+
+
+def _start_disk_guard(proc, root):
+    stop=threading.Event(); exceeded=threading.Event()
+    def watch():
+        while proc.poll() is None and not stop.wait(2):
+            if _working_disk_bytes(root)>MAX_DISK_BYTES:
+                exceeded.set()
+                _stop_process_group(proc)
+                break
+    guard=threading.Thread(target=watch,daemon=True)
+    guard.start()
+    return stop,exceeded,guard
 
 
 # Official Telegram Bot API accepts documents up to 50 MB. 47 MiB is kept
@@ -3742,8 +3870,15 @@ def send_results_with_fallback(archive, results_dir):
 
 GAUSSIAN_SCRATCH_DIR=None
 try:
-    safe_install([sys.executable,'-m','pip','install','-q','requests','matplotlib>=3.7','reportlab>=4.0','numpy'])
+    PY_DEPS='/tmp/chembot_python_packages'
+    os.makedirs(PY_DEPS,exist_ok=True)
+    os.environ['PIP_CACHE_DIR']='/tmp/chembot_pip_cache'
+    safe_install([sys.executable,'-m','pip','install','-q','--target',PY_DEPS,
+                  'requests','matplotlib>=3.7','reportlab>=4.0','numpy'])
+    sys.path.insert(0,PY_DEPS)
     send_msg('[Kaggle] Session connected. Preparing calculation...')
+    os.makedirs(WORK_DIR,exist_ok=True)
+    os.chdir(WORK_DIR)
 
     files_dict=json.loads(base64.b64decode(ENCODED_FILES_JSON).decode('utf-8'))
     staged_names=set()
@@ -3813,6 +3948,7 @@ try:
             # executed input is retained in the returned result bundle.
             checkpoint_stem=re.sub(r'[^A-Za-z0-9_.-]+','_',basename).strip('._') or 'gaussian_job'
             gaussian_input='%chk='+checkpoint_stem+'.chk\n'+gaussian_input
+        gaussian_input=_cap_gaussian_maxdisk(gaussian_input)
         # GaussianView on Windows commonly writes absolute Link 0 paths (and
         # CRLF files). Persist the normalized portable input even when the user
         # already supplied %chk/%oldchk, so Gaussian never receives a Windows
@@ -3821,7 +3957,9 @@ try:
     if is_psi4:
         send_msg('[Kaggle] Preparing Psi4 environment...')
 
-        PSI4_PREFIX='/kaggle/working/psi4_env'
+        PSI4_PREFIX='/tmp/chembot_psi4_env'
+        os.environ['CONDA_PKGS_DIRS']='/tmp/chembot_conda_pkgs'
+        os.makedirs(os.environ['CONDA_PKGS_DIRS'],exist_ok=True)
 
         def _valid_conda(path):
             if not path or not os.path.isfile(path):
@@ -3869,7 +4007,7 @@ try:
             # Official Psi4 standalone installer fallback for Linux x86_64.
             # It bundles its own Conda/Python, avoiding Kaggle base-env conflicts.
             url='https://vergil.chemistry.gatech.edu/psicode-download/Psi4conda-1.11-py312-Linux-x86_64.sh'
-            installer='/kaggle/working/Psi4conda-1.11-py312-Linux-x86_64.sh'
+            installer='/tmp/Psi4conda-1.11-py312-Linux-x86_64.sh'
             send_msg('[Kaggle] Conda was not available; using the official Psi4 1.11 standalone installer...')
             req=urllib.request.Request(url,headers={'User-Agent':'ChemBot/5.6'})
             with urllib.request.urlopen(req,timeout=1800) as r, open(installer,'wb') as f:
@@ -3886,10 +4024,8 @@ try:
                 safe_install([conda2,'install','-y','-p',PSI4_PREFIX,'-c','conda-forge']+list(PSI4_EXTRAS))
             return os.path.join(PSI4_PREFIX,'bin','psi4')
 
-        psi4_exe=shutil.which('psi4')
-        if psi4_exe:
-            send_msg('[Kaggle] Existing Psi4 executable found: '+psi4_exe)
-        else:
+        psi4_exe=os.path.join(PSI4_PREFIX,'bin','psi4')
+        if not os.path.isfile(psi4_exe):
             conda_exe=_find_real_conda()
             if conda_exe:
                 send_msg('[Kaggle] Installing Psi4 1.11 with '+conda_exe+' ...')
@@ -3909,64 +4045,80 @@ try:
         if probe.returncode!=0:
             raise RuntimeError('Psi4 executable failed its version check:\n'+(probe.stdout or '')[-1500:])
         send_msg('[Kaggle] '+(probe.stdout or 'Psi4 ready').strip().splitlines()[0][:300])
+        psi4_scratch=os.path.join(WORK_DIR,'psi4_scratch')
+        os.makedirs(psi4_scratch,exist_ok=True)
+        psi4_env=os.environ.copy()
+        psi4_env['PSI_SCRATCH']=psi4_scratch
         cmd=[psi4_exe,'-i',INPUT_FILE,'-o',output_file]
     elif is_gaussian:
         send_msg('[Kaggle] Preparing Gaussian 16 from attached Dataset...')
-        gaussian_archives=[]
-        for parent,dirs,files in os.walk('/kaggle/input'):
-            for fn in files:
-                if fn.lower()=='g16.tbz':
-                    gaussian_archives.append(os.path.join(parent,fn))
-        if not gaussian_archives:
-            raise RuntimeError("Dataset 'gauusian16' is attached, but no g16.tbz archive was found under /kaggle/input.")
-        gaussian_archives.sort(key=lambda p:(0 if 'gauusian16' in os.path.normpath(p).lower().split(os.sep) else 1,p))
-        GAUSSIAN_RUNTIME_ROOT='/kaggle/working/gaussian16_runtime'
+        gaussian_archive=_find_gaussian_archive()
+        # Keep the large Gaussian installation in temporary storage, as with
+        # the ORCA package. Calculation inputs and deliverables stay in the
+        # notebook working directory and are returned to the user.
+        GAUSSIAN_RUNTIME_ROOT='/tmp/gaussian16_runtime'
         shutil.rmtree(GAUSSIAN_RUNTIME_ROOT,ignore_errors=True)
         os.makedirs(GAUSSIAN_RUNTIME_ROOT,exist_ok=True)
 
         def _extract_gaussian_tbz(archive_path,destination):
-            with tarfile.open(archive_path,'r:bz2') as archive:
+            # tarfile checks the compression header; the Kaggle dataset names
+            # its bzip2 tarball g16.tzb rather than g16.tbz.
+            with tarfile.open(archive_path,'r:*') as archive:
                 members=archive.getmembers()
                 if not members:
-                    raise RuntimeError('The g16.tbz archive is empty.')
+                    raise RuntimeError('The Gaussian archive is empty: '+os.path.basename(archive_path))
                 unpacked=sum(max(0,int(m.size)) for m in members if m.isfile())
                 if unpacked>20*1024*1024*1024:
                     raise RuntimeError('The expanded Gaussian archive exceeds the 20 GiB safety limit.')
+                free_bytes=shutil.disk_usage(destination).free
+                if unpacked+512*1024*1024>free_bytes:
+                    raise RuntimeError('Not enough free space in /tmp for the Gaussian archive: '+
+                                       'need approximately %.1f GiB, available %.1f GiB.' %
+                                       ((unpacked+512*1024*1024)/1024**3,free_bytes/1024**3))
                 root=os.path.realpath(destination)
                 for member in members:
                     name=member.name.replace('\\','/')
                     normalized=os.path.normpath(name)
                     if not name or name.startswith('/') or normalized in ('.','..') or normalized.startswith('..'+os.sep):
-                        raise RuntimeError('Unsafe path in g16.tbz: '+member.name)
+                        raise RuntimeError('Unsafe path in Gaussian archive: '+member.name)
                     target=os.path.realpath(os.path.join(destination,name))
                     if target!=root and not target.startswith(root+os.sep):
-                        raise RuntimeError('Unsafe path in g16.tbz: '+member.name)
+                        raise RuntimeError('Unsafe path in Gaussian archive: '+member.name)
                     if member.issym() or member.islnk():
                         link=member.linkname.replace('\\','/')
                         link_base=os.path.dirname(name) if member.issym() else ''
                         link_target=os.path.realpath(os.path.join(root,link_base,link))
                         if os.path.isabs(link) or (link_target!=root and not link_target.startswith(root+os.sep)):
-                            raise RuntimeError('Unsafe link in g16.tbz: '+member.name)
+                            raise RuntimeError('Unsafe link in Gaussian archive: '+member.name)
                     if not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
-                        raise RuntimeError('Unsupported special file in g16.tbz: '+member.name)
+                        raise RuntimeError('Unsupported special file in Gaussian archive: '+member.name)
                 if hasattr(tarfile,'data_filter'):
                     archive.extractall(destination,filter='data')
                 else:
                     archive.extractall(destination)
 
-        _extract_gaussian_tbz(gaussian_archives[0],GAUSSIAN_RUNTIME_ROOT)
+        send_msg('[Kaggle] Found '+os.path.basename(gaussian_archive)+
+                 '; extracting Gaussian 16 under /tmp before starting the calculation...')
+        try:
+            _extract_gaussian_tbz(gaussian_archive,GAUSSIAN_RUNTIME_ROOT)
+        except tarfile.TarError as exc:
+            raise RuntimeError('Could not unpack '+os.path.basename(gaussian_archive)+
+                               ' as a tar archive. Check that the Dataset file is a complete Linux Gaussian 16 archive.') from exc
         profile_candidates=[]
         for parent,dirs,files in os.walk(GAUSSIAN_RUNTIME_ROOT):
             if os.path.basename(parent)=='bsd' and 'g16.profile' in files:
                 profile_candidates.append(os.path.join(parent,'g16.profile'))
         if not profile_candidates:
-            raise RuntimeError('g16.tbz was extracted, but g16/bsd/g16.profile is missing. Check that the Dataset contains the Linux binary archive.')
+            raise RuntimeError(os.path.basename(gaussian_archive)+' was extracted, but g16/bsd/g16.profile is missing. Check that the Dataset contains the Linux binary archive.')
         profile_candidates.sort(key=lambda p:(p.count(os.sep),p))
         GAUSSIAN_PROFILE=profile_candidates[0]
         gaussian_bsd=os.path.dirname(GAUSSIAN_PROFILE)
         gaussian_home=os.path.dirname(gaussian_bsd)
         gaussian_root=os.path.dirname(gaussian_home)
-        GAUSSIAN_SCRATCH_DIR='/kaggle/working/gaussian_scratch'
+        if not os.path.isfile(os.path.join(gaussian_home,'g16')):
+            raise RuntimeError('Gaussian archive extracted, but the g16 executable is missing next to bsd/g16.profile.')
+        send_msg('[Kaggle] Gaussian 16 archive extracted and executable found. Preparing the runtime...')
+        GAUSSIAN_SCRATCH_DIR=os.path.join(WORK_DIR,'gaussian_scratch')
         os.makedirs(GAUSSIAN_SCRATCH_DIR,exist_ok=True)
         gaussian_env=os.environ.copy()
         gaussian_env['g16root']=gaussian_root
@@ -3995,7 +4147,7 @@ try:
         # The official profile initializes Gaussian paths and runtime variables.
         GAUSSIAN_LAUNCH_SCRIPT='source "$CHEMBOT_G16_PROFILE" >/dev/null 2>&1 || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v g16 >/dev/null 2>&1; then exec g16; fi; [ -x "$CHEMBOT_G16_EXE" ] || exit 127; exec "$CHEMBOT_G16_EXE"'
         cmd=['bash','-c',GAUSSIAN_LAUNCH_SCRIPT]
-        send_msg('[Kaggle] Gaussian 16 runtime prepared from '+os.path.basename(gaussian_archives[0]))
+        send_msg('[Kaggle] Gaussian 16 runtime prepared from '+os.path.basename(gaussian_archive))
     else:
         send_msg('[Kaggle] Preparing ORCA 6 environment from attached Dataset...')
         ORCA_SCRATCH='/tmp/orca_pkg'
@@ -4062,9 +4214,15 @@ try:
                 send_msg('[Kaggle] ORCA archive extraction failed: '+str(exc))
             return False
 
-        # Same strategy as chemistry-web-lab: search the read-only Kaggle Dataset
-        # first; only extract archives to writable scratch if no executable exists.
-        orca_exe=_find_orca_under('/kaggle/input')
+        # Keep the ORCA program and its adjacent shared libraries together in
+        # /tmp, even when Kaggle mounts an already unpacked dataset directory.
+        orca_source=_find_orca_under('/kaggle/input')
+        orca_exe=None
+        if orca_source:
+            orca_package=os.path.join(ORCA_SCRATCH,'package')
+            shutil.rmtree(orca_package,ignore_errors=True)
+            shutil.copytree(os.path.dirname(orca_source),orca_package)
+            orca_exe=os.path.join(orca_package,'orca')
         if not orca_exe:
             archives=[]
             for parent,dirs,files in os.walk('/kaggle/input'):
@@ -4095,44 +4253,62 @@ try:
         os.environ['OMP_NUM_THREADS']='1'
         os.environ['MKL_NUM_THREADS']='1'
         send_msg('[Kaggle] ORCA executable: '+orca_exe)
+        orca_input=Path(INPUT_FILE).read_text(encoding='utf-8',errors='replace')
+        Path(INPUT_FILE).write_text(_cap_orca_maxdisk(orca_input),encoding='utf-8',newline='\n')
         cmd=[orca_exe,INPUT_FILE]
 
     engine_label='Gaussian 16' if is_gaussian else ('Psi4' if is_psi4 else 'ORCA')
-    send_msg(f"[Kaggle] Launching {engine_label} calculation: {INPUT_FILE}")
+    if _working_disk_bytes(WORK_DIR)>MAX_DISK_BYTES:
+        raise RuntimeError('The working directory already exceeds the 20,000 MB calculation disk limit.')
+    send_msg(f"[Kaggle] Launching {engine_label} calculation in {WORK_DIR}: {INPUT_FILE}; MaxDisk limit {MAX_DISK_MB} MB")
     timeout_triggered=False
+    disk_guard_stop=None; disk_guard_exceeded=None; disk_guard_thread=None
     try:
         if is_psi4:
-            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
+                                  cwd=WORK_DIR,env=psi4_env,start_new_session=True)
+            disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
             send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
             try:
                 proc_stdout,_=proc.communicate(timeout=remaining_time())
             except subprocess.TimeoutExpired:
-                proc.kill(); proc_stdout,_=proc.communicate(); timeout_triggered=True
+                _stop_process_group(proc); proc_stdout,_=proc.communicate(); timeout_triggered=True
                 send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
             rc=proc.returncode
             if not os.path.exists(output_file) and proc_stdout:
                 Path(output_file).write_text(proc_stdout,encoding='utf-8',errors='replace')
         elif is_gaussian:
             with open(INPUT_FILE,'rb') as fin, open(output_file,'wb') as fout:
-                proc=subprocess.Popen(cmd,stdin=fin,stdout=fout,stderr=subprocess.STDOUT,cwd=os.getcwd(),env=gaussian_env)
+                proc=subprocess.Popen(cmd,stdin=fin,stdout=fout,stderr=subprocess.STDOUT,
+                                      cwd=WORK_DIR,env=gaussian_env,start_new_session=True)
+                disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
                 send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
                 try:
                     rc=proc.wait(timeout=remaining_time())
                 except subprocess.TimeoutExpired:
-                    proc.kill(); proc.wait(); rc=124; timeout_triggered=True
+                    _stop_process_group(proc); proc.wait(); rc=124; timeout_triggered=True
                     send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
         else:
             with open(output_file,'w',encoding='utf-8',errors='replace') as fout:
-                proc=subprocess.Popen(cmd,stdout=fout,stderr=subprocess.STDOUT)
+                proc=subprocess.Popen(cmd,stdout=fout,stderr=subprocess.STDOUT,
+                                      cwd=WORK_DIR,start_new_session=True)
+                disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
                 send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
                 try:
                     rc=proc.wait(timeout=remaining_time())
                 except subprocess.TimeoutExpired:
-                    proc.kill(); proc.wait(); rc=124; timeout_triggered=True
+                    _stop_process_group(proc); proc.wait(); rc=124; timeout_triggered=True
                     send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
     except Exception as exc:
         send_msg('[Kaggle] Could not start or wait for '+engine_label+' process: '+str(exc))
         raise
+    finally:
+        if disk_guard_stop is not None:
+            disk_guard_stop.set()
+            disk_guard_thread.join(timeout=3)
+    disk_limit_exceeded=(disk_guard_exceeded is not None and disk_guard_exceeded.is_set()) or _working_disk_bytes(WORK_DIR)>MAX_DISK_BYTES
+    if disk_limit_exceeded:
+        send_msg('[Kaggle] The calculation reached the 20,000 MB working-disk limit. Available output files will still be returned.')
 
     bundle=None
     if is_gaussian:
@@ -4218,9 +4394,9 @@ try:
                 try: shutil.copy2(rp, os.path.join(report_out, os.path.basename(rp)))
                 except Exception: pass
     result_prefix='Gaussian16_Results_' if is_gaussian else ('Psi4_Results_' if is_psi4 else 'ORCA_Results_')
-    archive=shutil.make_archive(result_prefix+basename,'zip',results_dir)
+    archive='' if disk_limit_exceeded else shutil.make_archive(result_prefix+basename,'zip',results_dir)
     transfer=send_results_with_fallback(archive,results_dir)
-    status=('SUCCESS' if rc==0 else ('TIMEOUT' if timeout_triggered else 'FAILED')) if is_gaussian else ('SUCCESS' if (rc==0 and analysis.get('normal_termination')) else ('TIMEOUT' if timeout_triggered else 'FINISHED WITH WARNINGS/ERROR'))
+    status=('DISK_LIMIT' if disk_limit_exceeded else ('SUCCESS' if rc==0 else ('TIMEOUT' if timeout_triggered else 'FAILED'))) if is_gaussian else ('DISK_LIMIT' if disk_limit_exceeded else ('SUCCESS' if (rc==0 and analysis.get('normal_termination')) else ('TIMEOUT' if timeout_triggered else 'FINISHED WITH WARNINGS/ERROR')))
     if transfer.get('failed'):
         status += ' | PARTIAL_TRANSFER'
     send_msg('[Kaggle] Final status: '+status)
@@ -4384,7 +4560,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v6.2.4 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v6.2.6 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -4703,10 +4879,11 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v6.2.4\n"
+        "🧪 Computational Chemistry Bot v6.2.6\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp, Psi4 .dat, or a GaussianView .gjf/.com/.gau file to run on private Kaggle jobs.\n"
         "• The private Kaggle run link arrives when the calculation process starts.\n"
+        "• Jobs run in /kaggle/working; engine packages stay under /tmp. Working disk is monitored at 20,000 MB.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF. Gaussian returns .log/.chk/.fchk for GaussianView 6.\n"
         "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
         "• Send .xyz/.allxyz/.gbw/.chk/.fchk before jobs when needed; the same snapshot is available to the whole batch.\n"
@@ -4721,7 +4898,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v6.2.4-STRICT-20260927\n'
+        'ChemBot build: v6.2.6-STRICT-20260927\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -4739,6 +4916,7 @@ def help_command(message):
         "Supported inputs: ORCA .inp; Psi4 .dat; Gaussian .gjf/.com/.gau or a Gaussian route-card .inp.\n"
         "Auxiliary/restart inputs: .xyz, .allxyz, .gbw, .chk, .fchk.\n"
         "Analysis input: ORCA/Psi4 .out. Gaussian .log is returned without an analyzer.\n"
+        "Kaggle layout: engine packages in /tmp; calculations/results in /kaggle/working; disk guard 20,000 MB.\n"
         "Use /clearaux to discard stored auxiliary/restart context after a batch.\n\n"
         "For .out files the bot extracts every recognized section and exposes interactive menus for energies, thermochemistry, frequencies/IR, TD-DFT/UV-Vis, orbital energies, optimization profile and diagnostics. Upload two or more compatible outputs to overlay TD-DFT/UV-Vis or FT-IR spectra. A PDF with generated figures is also produced."
     )
@@ -5043,7 +5221,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v6.2.4 webhook mode active on port {port}.")
+    print(f"CHEMBOT v6.2.6 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -5084,7 +5262,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v6.2.4 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v6.2.6 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
