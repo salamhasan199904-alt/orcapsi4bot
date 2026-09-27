@@ -1,4 +1,4 @@
-# BUILD: v6.2.3-GAUSSIAN-GV-20260927
+# BUILD: v6.2.4-STRICT-20260927
 import os
 
 # ============================================================
@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v6.2.3
+# Chemistry Telegram/Kaggle Bot v6.2.4
 # ============================================================
 
 
@@ -230,9 +230,15 @@ def detect_job_engine(filename, text=""):
     if suffix in {".gjf", ".com", ".gau"}:
         return "gaussian"
     if suffix == ".inp":
-        # Gaussian route cards begin with '#'; ORCA inputs conventionally use
-        # '!' and remain the default for .inp files without a Gaussian route.
-        if re.search(r"(?im)^\s*#(?:\s|[a-z])", str(text or "")):
+        contents = str(text or "")
+        # ORCA comments also begin with '#'. An ORCA command/geometry wins
+        # over a comment that happens to mention Gaussian-like keywords.
+        if (re.search(r'(?im)^\s*!\s*\S', contents) or
+            re.search(r'(?im)^\s*%\s*(?:pal|maxcore|scf|geom|tddft|cpcm|basis|freq)\b', contents) or
+            re.search(r'(?im)^\s*\*\s*(?:xyz|xyzfile|int)\b', contents)):
+            return "orca"
+        # Only route-like cards identify a Gaussian input with .inp suffix.
+        if re.search(r'(?im)^\s*#\s*(?:[PNT](?:\s|$)|[A-Za-z][\w()+.\-]*/[\w()+.*\-]+|(?:opt|freq|td|sp)\b)', contents):
             return "gaussian"
         return "orca"
     return None
@@ -333,7 +339,7 @@ ANALYZER_MODULE_CODE = r'''
 import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = '6.2.1'
+REPORT_GENERATOR_VERSION = '6.2.4'
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 KB_J_MOL_K = 8.314462618
@@ -1719,6 +1725,7 @@ def _orca_parse_one_job(text, filename):
     freqs = []
     imag = []
     ir = []
+    ir_has_epsilon = None
     charge_type = None
     atomic_charge_sets = {}
     expecting_basis = False
@@ -1775,7 +1782,7 @@ def _orca_parse_one_job(text, filename):
     rx_freqsec = re.compile(r'\b(?:VIBRATIONAL\s+FREQUENCIES|3N-6\s+VIBRATIONAL\s+FREQUENCIES|3N-5\s+VIBRATIONAL\s+FREQUENCIES)\b', re.I)
     rx_freqrow = re.compile(rf'^\s*\d+:\s*(?P<cm>{F})(?:\s*cm\*\*-1|\s*cm\^-1|\s*cm-1)?(?P<imag>\s*(?:\*\*\*imaginary\s+mode\*\*\*|\(imaginary\s+mode\)|imaginary))?', re.I)
     rx_irsec = re.compile(r'\bIR\s+SPECTRUM\b', re.I)
-    rx_irrow = re.compile(rf'^\s*(?P<mode>\d+):\s*(?P<freq>{F})\s+(?P<t2>{F})', re.I)
+    rx_irrow = re.compile(rf'^\s*(?P<mode>\d+):\s*(?P<freq>{F})\s+(?P<first>{F})(?:\s+(?P<second>{F}))?(?:\s+(?P<third>{F}))?(?=\s|$)', re.I)
 
     rx_hirsh = re.compile(r'\bHIRSHFELD\s+(?:ANALYSIS|CHARGES|POPULATION\s+ANALYSIS)\b', re.I)
     rx_mull = re.compile(r'\bMULLIKEN\s+(?:ATOMIC\s+)?(?:CHARGES|POPULATION\s+ANALYSIS)\b', re.I)
@@ -1962,11 +1969,17 @@ def _orca_parse_one_job(text, filename):
                 continue
             u = stripped.upper()
             if 'MODE' in u and 'FREQ' in u:
+                ir_has_epsilon = bool(re.search(r'\bEPS\b', u))
                 continue
             m = rx_irrow.search(stripped)
             if m:
                 freq = _float(m.group('freq'))
-                inten = _float(m.group('t2'))
+                # ORCA 6.1 prints: mode, frequency, eps, Int (km/mol), T**2.
+                # A short legacy row can instead print intensity directly
+                # after frequency. Never plot eps as a km/mol intensity.
+                column = 'second' if (ir_has_epsilon is True or
+                                      (ir_has_epsilon is None and m.group('third') is not None)) else 'first'
+                inten = _float(m.group(column))
                 if freq is not None and inten is not None:
                     ir.append((freq, inten))
                     if freq < 0 and freq not in imag:
@@ -2111,6 +2124,7 @@ def _orca_parse_one_job(text, filename):
 
         if rx_irsec.search(stripped):
             ir = []
+            ir_has_epsilon = None
             state = 'IR'
             continue
 
@@ -2152,6 +2166,13 @@ def _orca_parse_one_job(text, filename):
     if sent:
         thermo['entropy_cal_mol_K'] = sum(sent)
         thermo['entropy_J_mol_K'] = sum(sent) * 4.184
+    elif (thermo.get('temperature_K') is not None and thermo['temperature_K'] > 0
+          and thermo.get('enthalpy_hartree') is not None and thermo.get('gibbs_hartree') is not None):
+        # ORCA's "Final entropy term" is T*S in Eh, not S in Eh/K.
+        thermo['entropy_J_mol_K'] = (
+            (thermo['enthalpy_hartree'] - thermo['gibbs_hartree'])
+            * HARTREE_TO_KJMOL * 1000.0 / thermo['temperature_K']
+        )
 
     energies = {}
     if final_energy is not None:
@@ -2188,8 +2209,10 @@ def _orca_parse_one_job(text, filename):
     # ORCA_ENGINE classifies completeness against total 3N frequency records.
     real_atoms = [a for a in final_geometry if not str(a.get('element','')).endswith(':') and str(a.get('element','')).upper() != 'DA']
     expected = 3 * len(real_atoms) if len(real_atoms) >= 2 else (0 if real_atoms else None)
-    if normal is False or (errors and normal is not True):
+    if normal is False:
         sp_status='FAILED_CALCULATION'; thermo_rel='FAILED_CALCULATION'
+    elif normal is not True:
+        sp_status='UNCONFIRMED_CALCULATION'; thermo_rel='UNCONFIRMED_CALCULATION'
     elif not freqs:
         sp_status='NO_FREQUENCY_CALCULATION'; thermo_rel='ELECTRONIC_ONLY'
     elif expected is not None and expected > 0 and len(freqs) < expected:
@@ -2298,15 +2321,31 @@ def _parse_psi4_tddft(text):
     states=[]; active=False
     for line in text.splitlines():
         u=line.upper()
-        if 'EXCITATION ENERGY' in u and 'OSCILLATOR STRENGTH' in u: active=True; continue
+        if 'EXCITATION ENERGY' in u and 'OSCILLATOR STRENGTH' in u:
+            states=[]; active=True; continue
         if active:
             m=re.match(r'^\s*(\d+)\s+',line)
             if not m:
                 if states and line.strip() and '----' not in line: active=False
                 continue
-            vals=_nums(line[m.end():])
+            tail=line[m.end():]
+            # The symmetry label contains a number, e.g. "A->A (1 A)".
+            # Numeric columns start only after that label: excitation Eh,
+            # excitation eV, total Eh, f(length), f(velocity), ...
+            if ')' in tail:
+                tail=tail.rsplit(')',1)[1]
+            else:
+                columns=re.split(r'\s{2,}',tail.strip())
+                if len(columns)>1: tail=' '.join(columns[1:])
+            vals=_nums(tail)
             if len(vals)>=4:
-                ev=vals[1]; states.append({'state':int(m.group(1)),'ev':ev,'nm':1239.841984/ev if ev and ev>0 else None,'f':vals[3],'f_velocity':vals[4] if len(vals)>4 else None,'excitation_au':vals[0]})
+                au,ev,total_au,fosc=vals[:4]
+                if (all(v is not None and math.isfinite(v) for v in (au,ev,total_au,fosc))
+                    and au>0 and ev>0 and fosc>=0
+                    and abs(ev-au*HARTREE_TO_EV)<max(0.05,0.02*ev)):
+                    states.append({'state':int(m.group(1)),'ev':ev,'nm':1239.841984/ev,
+                                   'f':fosc,'f_velocity':vals[4] if len(vals)>4 else None,
+                                   'excitation_au':au,'total_energy_au':total_au})
     return states
 
 def _parse_psi4_precise(text, filename):
@@ -2315,8 +2354,11 @@ def _parse_psi4_precise(text, filename):
     for rx in [r'Psi4\s+([0-9][\w.\-]+)',r'Psi4\s+Version\s*[:=]?\s*([0-9][\w.\-]+)']:
         m=re.search(rx,text,re.I)
         if m: version=m.group(1); break
-    normal=bool(re.search(r'Psi4\s+exiting successfully',text,re.I))
-    fatal=[ln.strip() for ln in text.splitlines() if re.search(r'(PSIEXCEPTION|TRACEBACK|FATAL ERROR|SEGMENTATION FAULT|OUT OF MEMORY|CONVERGENCE FAILURE)',ln,re.I)]
+    success_marks=list(re.finditer(r'Psi4\s+exiting successfully',text,re.I))
+    fatal_pattern=r'(PSIEXCEPTION|TRACEBACK|FATAL ERROR|SEGMENTATION FAULT|OUT OF MEMORY|CONVERGENCE FAILURE)'
+    fatal_marks=list(re.finditer(fatal_pattern,text,re.I))
+    normal=bool(success_marks and (not fatal_marks or success_marks[-1].start()>fatal_marks[-1].start()))
+    fatal=[ln.strip() for ln in text.splitlines() if re.search(fatal_pattern,ln,re.I)]
     fm=list(re.finditer(r'@(?P<method>(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF|MP2|CCSD(?:\(T\))?))\s+Final Energy:\s*(?P<e>'+F+r')',text,re.I))
     method=fm[-1].group('method') if fm else None
     basis=None
@@ -2356,6 +2398,7 @@ def _parse_psi4_precise(text, filename):
     geometry=blocks[-1] if blocks else []
     imag=[x for x in freqs if x<0]
     if not normal and fatal: sp='FAILED_CALCULATION'; rel='FAILED_CALCULATION'
+    elif not normal: sp='UNCONFIRMED_CALCULATION'; rel='UNCONFIRMED_CALCULATION'
     elif not freqs: sp='NO_FREQUENCY_CALCULATION'; rel='ELECTRONIC_ONLY'
     elif len(imag)==0: sp='LIKELY_MINIMUM'; rel='HIGH'
     elif len(imag)==1: sp='TRANSITION_STATE'; rel='TRANSITION_STATE'
@@ -2602,6 +2645,8 @@ ANALYZER_V58_PATCH_CODE = r'''def conceptual_dft_descriptors(a):
         h=float(h); l=float(l)
     except Exception:
         return {}
+    if not (math.isfinite(h) and math.isfinite(l)) or l<=h:
+        return {}
     gap=l-h; ip=-h; ea=-l; eta=gap/2.0; mu=(h+l)/2.0
     out={
         'ionization_potential_ev': ip,
@@ -2636,6 +2681,7 @@ def section_summary(a):
             extra.append(f'{label}: {float(v):.6f}{unit}')
     dip=(a.get('dipole') or {}).get('magnitude_debye') if isinstance(a.get('dipole'),dict) else None
     if dip is not None: extra.append(f'Dipole moment: {float(dip):.6f} D')
+    if d: extra.append('I, A and related descriptors are frontier-orbital estimates, not Delta-SCF ionization/attachment energies.')
     return base + ('\n'+'\n'.join(extra) if extra else '')
 
 _section_orbitals_v57=section_orbitals
@@ -2769,7 +2815,9 @@ def _psi4_orbitals_v59(text):
     for raw in text.splitlines():
         line=raw.rstrip(); u=line.upper()
         if 'ORBITAL ENERGIES' in u:
-            active=True; current_occ=None; continue
+            # Geometry iterations can print several tables. Frontiers must
+            # come from the final table, never a mixture of earlier steps.
+            groups=[]; active=True; current_occ=None; current_spin='restricted'; continue
         if not active:
             continue
         if groups and current_occ == 0.0 and not line.strip():
@@ -2914,23 +2962,54 @@ def _psi4_thermo_v59(text, electronic_energy=None):
         if k.endswith('_hartree'): t[k.replace('_hartree','_kj_mol')]=t[k]*HARTREE_TO_KJMOL
     return t
 
+def _psi4_final_energy_v64(text):
+    """Select the last method-specific electronic energy in output order.
+
+    An SCF ``Final Energy`` line is also printed before correlated methods.
+    Taking the last *regex pattern* rather than the last calculation silently
+    replaces MP2/CCSD(T) results with the SCF reference energy.
+    """
+    f=FLOAT_RE
+    candidates=[]
+    for label,rx in (
+        ('CCSD(T)',r'(?m)^\s*CCSD\(T\)\s+(?:total\s+)?energy\s*[:=]\s*('+f+r')'),
+        ('CCSD',r'(?m)^\s*CCSD\s+(?:total\s+)?energy\s*[:=]\s*('+f+r')'),
+        ('MP3',r'(?m)^\s*MP3\s+(?:total\s+)?energy\s*[:=]\s*('+f+r')'),
+        ('MP2',r'(?m)^\s*MP2\s+(?:total\s+)?energy\s*[:=]\s*('+f+r')'),
+        ('SCF',r'(?m)^\s*@(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF)\s+Final Energy\s*[:=]\s*('+f+r')'),
+    ):
+        for match in re.finditer(rx,text,re.I):
+            energy=_float(match.group(1))
+            if energy is not None and math.isfinite(energy):
+                candidates.append((match.start(),energy,label))
+    if candidates:
+        _,energy,label=max(candidates,key=lambda item:item[0])
+        return energy,label
+    for rx in (r'(?m)^\s*Current Energy\s*[:=]\s*('+f+r')',
+               r'(?m)^\s*Final Energy\s*[:=]\s*('+f+r')'):
+        matches=list(re.finditer(rx,text,re.I))
+        if matches:
+            energy=_float(matches[-1].group(1))
+            if energy is not None and math.isfinite(energy):
+                return energy,None
+    return None,None
+
 def _parse_psi4_precise_v59(text, filename):
     F=FLOAT_RE
     version=None
     for rx in [r'Psi4\s+([0-9][\w.\-]+)',r'Psi4\s+Version\s*[:=]?\s*([0-9][\w.\-]+)']:
         m=re.search(rx,text,re.I)
         if m: version=m.group(1); break
-    normal=bool(re.search(r'Psi4\s+exiting successfully',text,re.I))
-    fatal=[ln.strip() for ln in text.splitlines() if re.search(r'(PSIEXCEPTION|TRACEBACK|FATAL ERROR|SEGMENTATION FAULT|OUT OF MEMORY|CONVERGENCE FAILURE)',ln,re.I)]
+    success_marks=list(re.finditer(r'Psi4\s+exiting successfully',text,re.I))
+    fatal_pattern=r'(PSIEXCEPTION|TRACEBACK|FATAL ERROR|SEGMENTATION FAULT|OUT OF MEMORY|CONVERGENCE FAILURE)'
+    fatal_marks=list(re.finditer(fatal_pattern,text,re.I))
+    normal=bool(success_marks and (not fatal_marks or success_marks[-1].start()>fatal_marks[-1].start()))
+    fatal=[ln.strip() for ln in text.splitlines() if re.search(fatal_pattern,ln,re.I)]
     method,basis,reference=_psi4_method_basis_v59(text)
     energies={}
-    fm=list(re.finditer(r'@(?P<method>(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF|MP2|MP3|CCSD(?:\(T\))?))\s+Final Energy:\s*(?P<e>'+F+r')',text,re.I))
-    final=_float(fm[-1].group('e')) if fm else None
-    correlated=[]
-    for rx in [r'CCSD\(T\)\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'CCSD\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'MP3\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'MP2\s+(?:total\s+)?energy\s*[:=]\s*('+F+r')',r'Current Energy\s*[:=]\s*('+F+r')',r'Final Energy\s*[:=]\s*('+F+r')']:
-        v=_last_number(text,[rx])
-        if v is not None: correlated.append(v)
-    if correlated: final=correlated[-1]
+    final,energy_method=_psi4_final_energy_v64(text)
+    if energy_method in ('CCSD(T)','CCSD','MP3','MP2'):
+        method=energy_method
     if final is not None:
         energies.update(final_energy_hartree=final,final_energy_kj_mol=final*HARTREE_TO_KJMOL,final_energy_ev=final*HARTREE_TO_EV)
     for key,arr in {
@@ -2943,7 +3022,10 @@ def _parse_psi4_precise_v59(text, filename):
     for m in re.finditer(r'@(?:DF-)?(?:RHF|ROHF|UHF|RKS|UKS|SCF)\s+Final Energy:\s*('+F+r')',text,re.I):
         v=_float(m.group(1))
         if v is not None and (not opt or abs(v-opt[-1])>1e-12): opt.append(v)
-    freqs,ir=_parse_psi4_vibrations(text); td=_parse_psi4_tddft(text); tr=_psi4_thermo_v59(text,final)
+    freqs,ir=_parse_psi4_vibrations(text); td=_parse_psi4_tddft(text)
+    # A correlated final energy and an earlier SCF frequency correction need
+    # an explicit composite protocol. Do not combine them silently.
+    tr=_psi4_thermo_v59(text,final if energy_method=='SCF' else None)
     blocks=[]; cur=[]; active=False
     for line in text.splitlines():
         if re.search(r'(?:Final optimized geometry|Geometry \(in Angstrom\)|Cartesian Geometry \(in Angstrom\))',line,re.I):
@@ -2957,6 +3039,7 @@ def _parse_psi4_precise_v59(text, filename):
     geometry=blocks[-1] if blocks else []
     imag=[x for x in freqs if x < -5.0]
     if not normal and fatal: sp='FAILED_CALCULATION'; rel='FAILED_CALCULATION'
+    elif not normal: sp='UNCONFIRMED_CALCULATION'; rel='UNCONFIRMED_CALCULATION'
     elif not freqs: sp='NO_FREQUENCY_CALCULATION'; rel='ELECTRONIC_ONLY'
     elif len(imag)==0: sp='LIKELY_MINIMUM'; rel='HIGH'
     elif len(imag)==1: sp='TRANSITION_STATE'; rel='TRANSITION_STATE'
@@ -3434,7 +3517,7 @@ def section_orbitals(a):
     ]
     extra = [f'{label}: {float(descriptors[key]):.8f} {unit}' for key,label,unit in mapping if descriptors.get(key) is not None]
     if extra:
-        lines.extend(['','Conceptual DFT descriptors:'] + extra)
+        lines.extend(['','Conceptual DFT descriptors (frontier-orbital estimates):'] + extra)
     return '\n'.join(lines) if lines else 'No valid orbital-energy table was recognized.'
 '''
 
@@ -3497,8 +3580,15 @@ def tg(method, fields=None, file_field=None, file_path=None, timeout=90):
         return raw
 
 def send_msg(msg):
-    try: tg('sendMessage',{'chat_id':CHAT_ID,'text':str(msg)[:3900]})
-    except Exception: pass
+    for attempt in range(3):
+        try:
+            tg('sendMessage',{'chat_id':CHAT_ID,'text':str(msg)[:3900]})
+            return True
+        except Exception:
+            if attempt<2:
+                time.sleep(2**attempt)
+    print('[Kaggle] Telegram message delivery failed after three attempts.',file=sys.stderr)
+    return False
 
 def safe_install(cmd):
     send_msg('[Kaggle] Installing: '+' '.join(cmd))
@@ -3667,15 +3757,28 @@ try:
 
     if DRIVE_LINK:
         send_msg('[Kaggle] Downloading restart archive...')
+        if urllib.parse.urlsplit(DRIVE_LINK).scheme.lower()!='https':
+            raise RuntimeError('Restart archive URL must use HTTPS.')
         req=urllib.request.Request(DRIVE_LINK,headers={'User-Agent':'ChemBot/4.0'})
         with urllib.request.urlopen(req,timeout=120) as r, open('restart_files.zip','wb') as f:
-            shutil.copyfileobj(r,f)
-        if os.path.getsize('restart_files.zip')>1024*1024*1024:
-            raise RuntimeError('Restart archive exceeds 1 GB safety limit.')
+            if urllib.parse.urlsplit(r.geturl()).scheme.lower()!='https':
+                raise RuntimeError('Restart archive redirected to a non-HTTPS URL.')
+            downloaded=0
+            while True:
+                chunk=r.read(4*1024*1024)
+                if not chunk: break
+                downloaded+=len(chunk)
+                if downloaded>1024*1024*1024:
+                    raise RuntimeError('Restart archive exceeds 1 GiB safety limit.')
+                f.write(chunk)
         with zipfile.ZipFile('restart_files.zip') as z:
-            for info in z.infolist():
+            infos=z.infolist()
+            if sum(max(0,info.file_size) for info in infos)>20*1024*1024*1024:
+                raise RuntimeError('Restart archive expands beyond 20 GiB.')
+            restart_root=os.path.abspath('.')
+            for info in infos:
                 target=os.path.abspath(os.path.join('.',info.filename))
-                if not target.startswith(os.path.abspath('.')+os.sep):
+                if not (target.startswith(restart_root+os.sep) or (target==restart_root and info.is_dir())):
                     raise RuntimeError('Unsafe ZIP path detected.')
             z.extractall('.')
         os.remove('restart_files.zip')
@@ -3914,24 +4017,46 @@ try:
         def _extract_orca_archive(archive_path,dest):
             os.makedirs(dest,exist_ok=True)
             try:
+                root=os.path.realpath(dest)
+                max_expanded=20*1024*1024*1024
                 if zipfile.is_zipfile(archive_path):
                     with zipfile.ZipFile(archive_path) as z:
-                        for info in z.infolist():
+                        infos=z.infolist()
+                        if sum(max(0,info.file_size) for info in infos)>max_expanded:
+                            raise RuntimeError('ORCA ZIP expands beyond 20 GiB.')
+                        for info in infos:
                             name=info.filename.replace('\\','/')
                             norm=os.path.normpath(name)
-                            if name.startswith('/') or norm.startswith('..'+os.sep) or norm=='..':
+                            target=os.path.realpath(os.path.join(dest,norm))
+                            if (not name or name.startswith('/') or norm=='..' or norm.startswith('..'+os.sep)
+                                or not (target==root or target.startswith(root+os.sep))):
                                 raise RuntimeError('Unsafe path in ORCA ZIP archive: '+name)
                         z.extractall(dest)
                     return True
                 if tarfile.is_tarfile(archive_path):
                     with tarfile.open(archive_path,'r:*') as t:
                         members=t.getmembers()
-                        root=os.path.realpath(dest)
+                        if sum(max(0,int(m.size)) for m in members if m.isfile())>max_expanded:
+                            raise RuntimeError('ORCA tar expands beyond 20 GiB.')
                         for m in members:
-                            target=os.path.realpath(os.path.join(dest,m.name))
-                            if not (target==root or target.startswith(root+os.sep)):
+                            name=m.name.replace('\\','/')
+                            normalized=os.path.normpath(name)
+                            target=os.path.realpath(os.path.join(dest,normalized))
+                            if (not name or name.startswith('/') or normalized=='..' or normalized.startswith('..'+os.sep)
+                                or not (target==root or target.startswith(root+os.sep))):
                                 raise RuntimeError('Unsafe path in ORCA tar archive: '+m.name)
-                        t.extractall(dest)
+                            if m.issym() or m.islnk():
+                                link=m.linkname.replace('\\','/')
+                                link_base=os.path.dirname(normalized) if m.issym() else ''
+                                linked=os.path.realpath(os.path.join(root,link_base,link))
+                                if os.path.isabs(link) or not (linked==root or linked.startswith(root+os.sep)):
+                                    raise RuntimeError('Unsafe link in ORCA tar archive: '+m.name)
+                            if not (m.isdir() or m.isfile() or m.issym() or m.islnk()):
+                                raise RuntimeError('Unsupported special file in ORCA tar archive: '+m.name)
+                        if hasattr(tarfile,'data_filter'):
+                            t.extractall(dest,filter='data')
+                        else:
+                            t.extractall(dest)
                     return True
             except Exception as exc:
                 send_msg('[Kaggle] ORCA archive extraction failed: '+str(exc))
@@ -4259,7 +4384,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v6.2.3 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v6.2.4 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -4441,7 +4566,10 @@ def _parse_reaction_equation(equation):
         for raw in s.split('+'):
             raw=raw.strip(); m=re.match(r'^(?:(\d+(?:\.\d+)?)\s*\*?\s*)?(.+?)$',raw)
             if not m: raise ValueError('Could not parse reaction term: '+raw)
-            out.append((float(m.group(1) or 1.0),m.group(2).strip()))
+            coeff=float(m.group(1) or 1.0)
+            if not math.isfinite(coeff) or coeff<=0:
+                raise ValueError('Stoichiometric coefficients must be positive and finite.')
+            out.append((coeff,m.group(2).strip()))
         return out
     return side(parts[0]),side(parts[1])
 
@@ -4454,62 +4582,93 @@ def _reaction_thermo_from_sessions(chat_id,user_id,equation):
         key=Path(name).stem.lower()
         if key not in byname: raise ValueError(f'No parsed output found for {name!r}; upload its .out first.')
         return byname[key]
+    species=[resolve(name) for _,name in reactants+products]
+    if any(not a.get('normal_termination') for a in species):
+        raise ValueError('Every participating output must confirm normal termination before reaction thermodynamics is calculated.')
+    warnings=[]
+    levels={(a.get('method') or 'N/A',a.get('basis') or 'N/A') for a in species}
+    comparable=len(levels)==1
+    if not comparable:
+        warnings.append('Mixed levels of theory: '+', '.join(f'{m}/{b}' for m,b in sorted(levels)))
+    solvation={(a.get('solvation_model'),a.get('solvent')) for a in species}
+    if len(solvation)>1:
+        warnings.append('Solvation conditions differ or were not identified for every species.')
+        comparable=False
+    if any(not a.get('method') or not a.get('basis') for a in species):
+        warnings.append('Method/basis could not be verified for every species.')
+        comparable=False
+
+    def atom_counts(a):
+        counts={}
+        for row in a.get('final_geometry',[]) or []:
+            element=row.get('element') if isinstance(row,dict) else (row[0] if isinstance(row,(list,tuple)) and row else None)
+            if not element: continue
+            raw_symbol=str(element).strip()
+            if raw_symbol.endswith(':'): continue
+            symbol=raw_symbol.capitalize()
+            if symbol in ('Da','X','Gh'): continue
+            if not re.fullmatch(r'[A-Z][a-z]?',symbol): continue
+            counts[symbol]=counts.get(symbol,0.0)+1.0
+        return counts
+    balance={}; geometry_complete=True
+    for sign,terms in ((-1.0,reactants),(1.0,products)):
+        for coeff,name in terms:
+            counts=atom_counts(resolve(name))
+            if not counts:
+                geometry_complete=False
+                continue
+            for element,n in counts.items():
+                balance[element]=balance.get(element,0.0)+sign*coeff*n
+    if geometry_complete:
+        imbalance={k:v for k,v in balance.items() if abs(v)>1e-6}
+        if imbalance:
+            details=', '.join(f'{k}{v:+g}' for k,v in sorted(imbalance.items()))
+            raise ValueError('Reaction is not atom balanced (products-reactants): '+details)
+    else:
+        warnings.append('Atom balance could not be checked because at least one final geometry is missing.')
+
+    charges=[]
+    for sign,terms in ((-1.0,reactants),(1.0,products)):
+        for coeff,name in terms:
+            q=_float((resolve(name).get('system') or {}).get('charge'))
+            if q is not None and math.isfinite(q):
+                charges.append(sign*coeff*q)
+    if len(charges)!=len(species):
+        warnings.append('Charge balance could not be checked because at least one charge is missing.')
+    elif abs(sum(charges))>1e-6:
+        raise ValueError(f'Reaction is not charge balanced (products-reactants): {sum(charges):+g}.')
+
     def delta(getter):
         total=0.0
         for coeff,name in products:
-            v=getter(resolve(name));
-            if v is None: return None
+            v=_float(getter(resolve(name)))
+            if v is None or not math.isfinite(v): return None
             total+=coeff*v
         for coeff,name in reactants:
-            v=getter(resolve(name));
-            if v is None: return None
+            v=_float(getter(resolve(name)))
+            if v is None or not math.isfinite(v): return None
             total-=coeff*v
         return total
     e=delta(lambda a:(a.get('energies') or {}).get('final_energy_hartree'))
     e0=delta(lambda a: ((a.get('energies') or {}).get('final_energy_hartree')+(a.get('thermochemistry') or {}).get('zpe_hartree')) if (a.get('energies') or {}).get('final_energy_hartree') is not None and (a.get('thermochemistry') or {}).get('zpe_hartree') is not None else None)
-    h=delta(lambda a:(a.get('thermochemistry') or {}).get('enthalpy_hartree'))
-    g=delta(lambda a:(a.get('thermochemistry') or {}).get('gibbs_hartree'))
-    temps=[]
-    for _,name in reactants+products:
-        t=(resolve(name).get('thermochemistry') or {}).get('temperature_K')
-        if t is not None: temps.append(float(t))
-    temp=temps[0] if temps and max(temps)-min(temps)<1e-4 else None
+    temps=[_float((a.get('thermochemistry') or {}).get('temperature_K')) for a in species]
+    temp=temps[0] if (all(t is not None and math.isfinite(t) and t>0 for t in temps)
+                       and max(temps)-min(temps)<1e-4) else None
+    if temp is None:
+        warnings.append('Temperature is missing or inconsistent; Delta H, Delta G, Delta S and K_eq were not evaluated.')
+    h=delta(lambda a:(a.get('thermochemistry') or {}).get('enthalpy_hartree')) if temp is not None else None
+    g=delta(lambda a:(a.get('thermochemistry') or {}).get('gibbs_hartree')) if temp is not None else None
+    if not comparable:
+        e=e0=h=g=None
+        warnings.append('Reaction differences were not evaluated because theory or solvation conditions are inconsistent or incomplete.')
     conv=HARTREE_TO_KJMOL
     out={'equation':equation,'delta_e_kj_mol':e*conv if e is not None else None,'delta_e0_kj_mol':e0*conv if e0 is not None else None,'delta_h_kj_mol':h*conv if h is not None else None,'delta_g_kj_mol':g*conv if g is not None else None,'temperature_K':temp}
     out['delta_s_j_mol_k']=((h-g)*conv*1000.0/temp) if h is not None and g is not None and temp and temp>0 else None
-    if g is not None and temp and temp>0:
+    if g is not None and temp and comparable:
         try: out['keq']=math.exp(-(g*conv*1000.0)/(8.314462618*temp))
         except OverflowError: out['keq']=float('inf') if g<0 else 0.0
-    else: out['keq']=None
-    species=[resolve(name) for _,name in reactants+products]
-    warnings=[]
-    levels={(a.get('method') or 'N/A',a.get('basis') or 'N/A') for a in species}
-    if len(levels)>1: warnings.append('Mixed levels of theory detected: '+', '.join(f'{m}/{b}' for m,b in sorted(levels)))
-    if any(not a.get('normal_termination') for a in species): warnings.append('At least one participating calculation does not have confirmed normal termination.')
-    if temps and temp is None: warnings.append('Thermochemistry temperatures are not identical across all species; Delta S and K_eq were not evaluated.')
-    def atom_counts(a):
-        counts={}
-        for row in a.get('final_geometry',[]) or []:
-            try: el=str(row[0])
-            except Exception: continue
-            counts[el]=counts.get(el,0.0)+1.0
-        return counts
-    balance={}
-    known=True
-    for sign,terms in [(-1.0,reactants),(1.0,products)]:
-        for coeff,name in terms:
-            counts=atom_counts(resolve(name))
-            if not counts: known=False; continue
-            for el,n in counts.items(): balance[el]=balance.get(el,0.0)+sign*coeff*n
-    imbalance={k:v for k,v in balance.items() if abs(v)>1e-6}
-    if known and imbalance: warnings.append('Reaction is not atom balanced (products-reactants): '+', '.join(f'{k}{v:+g}' for k,v in sorted(imbalance.items())))
-    charges=[]
-    for sign,terms in [(-1.0,reactants),(1.0,products)]:
-        for coeff,name in terms:
-            q=(resolve(name).get('system') or {}).get('charge')
-            if q is None: charges=[]; break
-            charges.append(sign*coeff*float(q))
-    if charges and abs(sum(charges))>1e-6: warnings.append(f'Reaction is not charge balanced (products-reactants): {sum(charges):+g}.')
+    else:
+        out['keq']=None
     out['warnings']=warnings
     return out
 
@@ -4544,12 +4703,13 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v6.2.3\n"
+        "🧪 Computational Chemistry Bot v6.2.4\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
-        "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
-        "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
+        "• Send ORCA .inp, Psi4 .dat, or a GaussianView .gjf/.com/.gau file to run on private Kaggle jobs.\n"
+        "• The private Kaggle run link arrives when the calculation process starts.\n"
+        "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF. Gaussian returns .log/.chk/.fchk for GaussianView 6.\n"
         "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
-        "• Send .xyz/.allxyz/.gbw before one or several jobs when needed; the same snapshot is available to the whole batch.\n"
+        "• Send .xyz/.allxyz/.gbw/.chk/.fchk before jobs when needed; the same snapshot is available to the whole batch.\n"
         "• Psi4 D3/D4/gCP/geomeTRIC dependencies are detected and installed automatically.\n"
         "• Use /clearaux after a batch to clear stored auxiliary files/restart URL.\n"
         "• Kaggle sends calculation results directly, so this launcher can be closed after all submissions are confirmed."
@@ -4561,13 +4721,14 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v6.2.3-GAUSSIAN-GV-20260927\n'
+        'ChemBot build: v6.2.4-STRICT-20260927\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
         f'API access_token prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("modern_token")) else "no"}\n'
         f'Startup KaggleApi.authenticate(): {"OK" if KAGGLE_STARTUP_AUTH_OK else "FAILED"}\n'
-        f'ORCA dataset: {ORCA_DATASET_SLUG}'
+        f'ORCA dataset: {ORCA_DATASET_SLUG}\n'
+        f'Gaussian dataset: {GAUSSIAN_DATASET_SLUG}'
     )
 
 
@@ -4575,9 +4736,9 @@ def version_command(message):
 def help_command(message):
     if not authorized(message): return
     bot.reply_to(message,
-        "Supported job inputs: .inp (ORCA), .dat (Psi4).\n"
-        "Auxiliary/restart inputs: .xyz, .allxyz, .gbw (snapshotted independently into every job in a rapid batch).\n"
-        "Analysis input: .out.\n"
+        "Supported inputs: ORCA .inp; Psi4 .dat; Gaussian .gjf/.com/.gau or a Gaussian route-card .inp.\n"
+        "Auxiliary/restart inputs: .xyz, .allxyz, .gbw, .chk, .fchk.\n"
+        "Analysis input: ORCA/Psi4 .out. Gaussian .log is returned without an analyzer.\n"
         "Use /clearaux to discard stored auxiliary/restart context after a batch.\n\n"
         "For .out files the bot extracts every recognized section and exposes interactive menus for energies, thermochemistry, frequencies/IR, TD-DFT/UV-Vis, orbital energies, optimization profile and diagnostics. Upload two or more compatible outputs to overlay TD-DFT/UV-Vis or FT-IR spectra. A PDF with generated figures is also produced."
     )
@@ -4598,6 +4759,8 @@ def clear_aux(message):
 @bot.message_handler(func=lambda m: bool(m.text and m.text.startswith(('http://','https://'))))
 def handle_link(message):
     if not authorized(message): return
+    if not (message.text or '').strip().lower().startswith('https://'):
+        bot.reply_to(message,'Restart archive URLs must use HTTPS.'); return
     with state_lock:
         user_drive_links[message.from_user.id]=message.text.strip()
     bot.reply_to(message,"🔗 Restart archive URL stored. It will be snapshotted into each subsequent job until /clearaux or /start.")
@@ -4880,7 +5043,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v6.2.3 webhook mode active on port {port}.")
+    print(f"CHEMBOT v6.2.4 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -4921,7 +5084,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v6.2.3 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v6.2.4 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
