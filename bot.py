@@ -1,4 +1,4 @@
-# BUILD: v6.2.1-FRONTIER-20260926
+# BUILD: v6.2.3-GAUSSIAN-GV-20260927
 import os
 
 # ============================================================
@@ -33,11 +33,12 @@ import threading
 import hashlib
 import math
 import signal
+import codecs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v6.2.1
+# Chemistry Telegram/Kaggle Bot v6.2.3
 # ============================================================
 
 
@@ -191,6 +192,10 @@ except ValueError as exc:
 ORCA_DATASET_SLUG = os.environ.get(
     "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0"
 )
+GAUSSIAN_DATASET_SLUG = os.environ.get(
+    "GAUSSIAN_DATASET_SLUG",
+    f"{KAGGLE_USERNAME or 'abdulsalsmsalih'}/gauusian16",
+)
 MAX_TELEGRAM_DOWNLOAD = 20 * 1024 * 1024
 MAX_AUX_STORAGE = 20 * 1024 * 1024
 MAX_TEXT_OUT = 20 * 1024 * 1024
@@ -214,6 +219,43 @@ try:
 except ValueError as exc:
     raise RuntimeError('CHEMBOT_WORKER_THREADS must be an integer from 2 to 32.') from exc
 BOT_WORKER_THREADS = min(32, max(2, _requested_worker_threads))
+
+
+def detect_job_engine(filename, text=""):
+    """Identify calculation inputs from their extension and Gaussian route card."""
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    suffix = Path(name).suffix
+    if suffix == ".dat":
+        return "psi4"
+    if suffix in {".gjf", ".com", ".gau"}:
+        return "gaussian"
+    if suffix == ".inp":
+        # Gaussian route cards begin with '#'; ORCA inputs conventionally use
+        # '!' and remain the default for .inp files without a Gaussian route.
+        if re.search(r"(?im)^\s*#(?:\s|[a-z])", str(text or "")):
+            return "gaussian"
+        return "orca"
+    return None
+
+
+def decode_job_input(raw):
+    """Decode common GaussView-on-Windows text encodings and normalize newlines."""
+    data = bytes(raw)
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        text = data.decode('utf-32')
+    elif data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = data.decode('utf-16')
+    elif data.startswith(codecs.BOM_UTF8):
+        text = data.decode('utf-8-sig')
+    else:
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            text = data.decode('cp1256')
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    if '\x00' in text:
+        raise ValueError('The input contains NUL characters and is not a supported Gaussian text file.')
+    return text
 
 # Names used by older ChemBot versions.  They are safe to prune when they are
 # clearly local staging directories, because the Kaggle kernel has already
@@ -3421,7 +3463,7 @@ def detect_psi4_extras(inp_text):
 
 # ------------------------- Kaggle runner code -------------------------
 KAGGLE_RUNNER_CODE = r'''
-import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib
+import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib, re
 from pathlib import Path
 START_TIME=time.time()
 HARD_LIMIT=11.5*3600
@@ -3466,6 +3508,19 @@ def safe_install(cmd):
 
 def remaining_time():
     return max(60, HARD_LIMIT-SAFETY_MARGIN-(time.time()-START_TIME))
+
+
+def _windows_safe_basename(value):
+    """Keep returned Gaussian files portable to Windows/GaussView."""
+    name=os.path.basename(str(value).replace('\\','/'))
+    name=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',name).rstrip(' .')
+    if not name or name in ('.','..'):
+        name='gaussian_input'
+    stem=os.path.splitext(name)[0].upper()
+    if stem in {'CON','PRN','AUX','NUL'} or re.fullmatch(r'(COM|LPT)[1-9]',stem):
+        name='_'+name
+    return name
+
 
 # Official Telegram Bot API accepts documents up to 50 MB. 47 MiB is kept
 # below 50,000,000 bytes and leaves a practical safety margin.
@@ -3556,7 +3611,7 @@ def send_results_with_fallback(archive, results_dir):
     manifest_path=os.path.join(results_dir,'CHEMBOT_TRANSFER_MANIFEST.txt')
     entries=_write_transfer_manifest(results_dir,manifest_path)
     # Scientific text/checkpoint artifacts first; very large trajectories/cubes later.
-    priority={'.out':0,'.property.txt':1,'.property.json':2,'.xyz':3,'.hess':4,'.gbw':5,'.molden.input':6,'.engrad':7,'.opt':8,'.trj':9,'.allxyz':10,'.cube':11,'.dat':12}
+    priority={'.log':0,'.out':1,'.fchk':2,'.chk':3,'.gjf':4,'.com':4,'.property.txt':5,'.property.json':6,'.xyz':7,'.hess':8,'.gbw':9,'.molden.input':10,'.engrad':11,'.opt':12,'.trj':13,'.allxyz':14,'.cube':15,'.dat':16}
     def key_for(entry):
         name=entry['file'].lower()
         rank=50
@@ -3595,16 +3650,20 @@ def send_results_with_fallback(archive, results_dir):
         send_msg('[Transfer] Rescue completed successfully. All result bytes were delivered.')
     return {'mode':'fallback','sent':sent,'failed':failed}
 
+GAUSSIAN_SCRATCH_DIR=None
 try:
     safe_install([sys.executable,'-m','pip','install','-q','requests','matplotlib>=3.7','reportlab>=4.0','numpy'])
     send_msg('[Kaggle] Session connected. Preparing calculation...')
 
     files_dict=json.loads(base64.b64decode(ENCODED_FILES_JSON).decode('utf-8'))
+    staged_names=set()
     for fname,b64content in files_dict.items():
-        # strip path traversal
-        safe_name=os.path.basename(fname)
+        safe_name=_windows_safe_basename(fname)
+        if safe_name in staged_names:
+            raise RuntimeError('Two uploaded files map to the same Windows-safe filename: '+safe_name)
+        staged_names.add(safe_name)
         with open(safe_name,'wb') as f: f.write(base64.b64decode(b64content))
-    INPUT_FILE=os.path.basename(INPUT_FILE)
+    INPUT_FILE=_windows_safe_basename(INPUT_FILE)
 
     if DRIVE_LINK:
         send_msg('[Kaggle] Downloading restart archive...')
@@ -3621,9 +3680,41 @@ try:
             z.extractall('.')
         os.remove('restart_files.zip')
 
-    is_psi4=INPUT_FILE.lower().endswith('.dat')
+    JOB_ENGINE=str(JOB_ENGINE).strip().lower()
+    if JOB_ENGINE not in ('orca','psi4','gaussian'):
+        raise RuntimeError('Unsupported calculation engine: '+JOB_ENGINE)
+    is_psi4=JOB_ENGINE=='psi4'
+    is_gaussian=JOB_ENGINE=='gaussian'
     basename=os.path.splitext(INPUT_FILE)[0]
-    output_file=basename+'.out'
+    output_file=basename+('.log' if is_gaussian else '.out')
+    GAUSSIAN_SCRATCH_DIR=None
+    if is_gaussian:
+        gaussian_input=Path(INPUT_FILE).read_text(encoding='utf-8',errors='replace')
+        gaussian_lines=[]
+        has_checkpoint=False
+        for line in gaussian_input.split('\n'):
+            link0=re.match(r'^(\s*%(?:oldchk|chk)\s*=\s*)(.*?)(\s*)$',line,re.I)
+            if link0:
+                raw_path=link0.group(2).strip()
+                if len(raw_path)>=2 and raw_path[0]==raw_path[-1] and raw_path[0] in ('"',"'"):
+                    raw_path=raw_path[1:-1]
+                local_name=_windows_safe_basename(raw_path.replace('\\','/').rsplit('/',1)[-1])
+                quoted='"'+local_name+'"' if any(ch.isspace() for ch in local_name) else local_name
+                line=link0.group(1)+quoted+link0.group(3)
+                if re.match(r'^\s*%chk\s*=',line,re.I):
+                    has_checkpoint=True
+            gaussian_lines.append(line)
+        gaussian_input='\n'.join(gaussian_lines)
+        if not has_checkpoint and not re.search(r'(?im)^\s*%nosave\b',gaussian_input):
+            # A checkpoint enables GaussView orbital/geometry inspection. The
+            # executed input is retained in the returned result bundle.
+            checkpoint_stem=re.sub(r'[^A-Za-z0-9_.-]+','_',basename).strip('._') or 'gaussian_job'
+            gaussian_input='%chk='+checkpoint_stem+'.chk\n'+gaussian_input
+        # GaussianView on Windows commonly writes absolute Link 0 paths (and
+        # CRLF files). Persist the normalized portable input even when the user
+        # already supplied %chk/%oldchk, so Gaussian never receives a Windows
+        # drive path inside the Linux Kaggle runtime.
+        Path(INPUT_FILE).write_text(gaussian_input,encoding='utf-8',newline='\n')
     if is_psi4:
         send_msg('[Kaggle] Preparing Psi4 environment...')
 
@@ -3716,6 +3807,92 @@ try:
             raise RuntimeError('Psi4 executable failed its version check:\n'+(probe.stdout or '')[-1500:])
         send_msg('[Kaggle] '+(probe.stdout or 'Psi4 ready').strip().splitlines()[0][:300])
         cmd=[psi4_exe,'-i',INPUT_FILE,'-o',output_file]
+    elif is_gaussian:
+        send_msg('[Kaggle] Preparing Gaussian 16 from attached Dataset...')
+        gaussian_archives=[]
+        for parent,dirs,files in os.walk('/kaggle/input'):
+            for fn in files:
+                if fn.lower()=='g16.tbz':
+                    gaussian_archives.append(os.path.join(parent,fn))
+        if not gaussian_archives:
+            raise RuntimeError("Dataset 'gauusian16' is attached, but no g16.tbz archive was found under /kaggle/input.")
+        gaussian_archives.sort(key=lambda p:(0 if 'gauusian16' in os.path.normpath(p).lower().split(os.sep) else 1,p))
+        GAUSSIAN_RUNTIME_ROOT='/kaggle/working/gaussian16_runtime'
+        shutil.rmtree(GAUSSIAN_RUNTIME_ROOT,ignore_errors=True)
+        os.makedirs(GAUSSIAN_RUNTIME_ROOT,exist_ok=True)
+
+        def _extract_gaussian_tbz(archive_path,destination):
+            with tarfile.open(archive_path,'r:bz2') as archive:
+                members=archive.getmembers()
+                if not members:
+                    raise RuntimeError('The g16.tbz archive is empty.')
+                unpacked=sum(max(0,int(m.size)) for m in members if m.isfile())
+                if unpacked>20*1024*1024*1024:
+                    raise RuntimeError('The expanded Gaussian archive exceeds the 20 GiB safety limit.')
+                root=os.path.realpath(destination)
+                for member in members:
+                    name=member.name.replace('\\','/')
+                    normalized=os.path.normpath(name)
+                    if not name or name.startswith('/') or normalized in ('.','..') or normalized.startswith('..'+os.sep):
+                        raise RuntimeError('Unsafe path in g16.tbz: '+member.name)
+                    target=os.path.realpath(os.path.join(destination,name))
+                    if target!=root and not target.startswith(root+os.sep):
+                        raise RuntimeError('Unsafe path in g16.tbz: '+member.name)
+                    if member.issym() or member.islnk():
+                        link=member.linkname.replace('\\','/')
+                        link_base=os.path.dirname(name) if member.issym() else ''
+                        link_target=os.path.realpath(os.path.join(root,link_base,link))
+                        if os.path.isabs(link) or (link_target!=root and not link_target.startswith(root+os.sep)):
+                            raise RuntimeError('Unsafe link in g16.tbz: '+member.name)
+                    if not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
+                        raise RuntimeError('Unsupported special file in g16.tbz: '+member.name)
+                if hasattr(tarfile,'data_filter'):
+                    archive.extractall(destination,filter='data')
+                else:
+                    archive.extractall(destination)
+
+        _extract_gaussian_tbz(gaussian_archives[0],GAUSSIAN_RUNTIME_ROOT)
+        profile_candidates=[]
+        for parent,dirs,files in os.walk(GAUSSIAN_RUNTIME_ROOT):
+            if os.path.basename(parent)=='bsd' and 'g16.profile' in files:
+                profile_candidates.append(os.path.join(parent,'g16.profile'))
+        if not profile_candidates:
+            raise RuntimeError('g16.tbz was extracted, but g16/bsd/g16.profile is missing. Check that the Dataset contains the Linux binary archive.')
+        profile_candidates.sort(key=lambda p:(p.count(os.sep),p))
+        GAUSSIAN_PROFILE=profile_candidates[0]
+        gaussian_bsd=os.path.dirname(GAUSSIAN_PROFILE)
+        gaussian_home=os.path.dirname(gaussian_bsd)
+        gaussian_root=os.path.dirname(gaussian_home)
+        GAUSSIAN_SCRATCH_DIR='/kaggle/working/gaussian_scratch'
+        os.makedirs(GAUSSIAN_SCRATCH_DIR,exist_ok=True)
+        gaussian_env=os.environ.copy()
+        gaussian_env['g16root']=gaussian_root
+        gaussian_env['GAUSS_SCRDIR']=GAUSSIAN_SCRATCH_DIR
+        gaussian_env['CHEMBOT_G16_PROFILE']=GAUSSIAN_PROFILE
+        gaussian_env['CHEMBOT_GAUSS_SCRDIR']=GAUSSIAN_SCRATCH_DIR
+
+        install_script=os.path.join(gaussian_bsd,'install')
+        if os.path.isfile(install_script):
+            try: os.chmod(install_script,0o755)
+            except OSError: pass
+            install=subprocess.run([install_script],cwd=gaussian_home,env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=300)
+            if install.returncode!=0:
+                raise RuntimeError('Gaussian bsd/install failed:\n'+(install.stdout or '')[-2500:])
+        gaussian_exe=os.path.join(gaussian_home,'g16')
+        if not os.path.exists(gaussian_exe):
+            raise RuntimeError('Gaussian installation did not produce g16 at '+gaussian_exe)
+        try: os.chmod(gaussian_exe,0o755)
+        except OSError: pass
+        gaussian_env['CHEMBOT_G16_EXE']=gaussian_exe
+        gaussian_formchk=os.path.join(gaussian_home,'formchk')
+        gaussian_env['CHEMBOT_FORMCHK_EXE']=gaussian_formchk if os.path.isfile(gaussian_formchk) else ''
+        if gaussian_env['CHEMBOT_FORMCHK_EXE']:
+            try: os.chmod(gaussian_formchk,0o755)
+            except OSError: pass
+        # The official profile initializes Gaussian paths and runtime variables.
+        GAUSSIAN_LAUNCH_SCRIPT='source "$CHEMBOT_G16_PROFILE" >/dev/null 2>&1 || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v g16 >/dev/null 2>&1; then exec g16; fi; [ -x "$CHEMBOT_G16_EXE" ] || exit 127; exec "$CHEMBOT_G16_EXE"'
+        cmd=['bash','-c',GAUSSIAN_LAUNCH_SCRIPT]
+        send_msg('[Kaggle] Gaussian 16 runtime prepared from '+os.path.basename(gaussian_archives[0]))
     else:
         send_msg('[Kaggle] Preparing ORCA 6 environment from attached Dataset...')
         ORCA_SCRATCH='/tmp/orca_pkg'
@@ -3795,64 +3972,138 @@ try:
         send_msg('[Kaggle] ORCA executable: '+orca_exe)
         cmd=[orca_exe,INPUT_FILE]
 
-    send_msg(f"[Kaggle] Starting {'Psi4' if is_psi4 else 'ORCA'} calculation: {INPUT_FILE}")
+    engine_label='Gaussian 16' if is_gaussian else ('Psi4' if is_psi4 else 'ORCA')
+    send_msg(f"[Kaggle] Launching {engine_label} calculation: {INPUT_FILE}")
     timeout_triggered=False
     try:
         if is_psi4:
-            proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=remaining_time())
+            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+            send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
+            try:
+                proc_stdout,_=proc.communicate(timeout=remaining_time())
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc_stdout,_=proc.communicate(); timeout_triggered=True
+                send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
             rc=proc.returncode
-            if not os.path.exists(output_file) and proc.stdout:
-                Path(output_file).write_text(proc.stdout,encoding='utf-8',errors='replace')
+            if not os.path.exists(output_file) and proc_stdout:
+                Path(output_file).write_text(proc_stdout,encoding='utf-8',errors='replace')
+        elif is_gaussian:
+            with open(INPUT_FILE,'rb') as fin, open(output_file,'wb') as fout:
+                proc=subprocess.Popen(cmd,stdin=fin,stdout=fout,stderr=subprocess.STDOUT,cwd=os.getcwd(),env=gaussian_env)
+                send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
+                try:
+                    rc=proc.wait(timeout=remaining_time())
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait(); rc=124; timeout_triggered=True
+                    send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
         else:
             with open(output_file,'w',encoding='utf-8',errors='replace') as fout:
-                proc=subprocess.run(cmd,stdout=fout,stderr=subprocess.STDOUT,timeout=remaining_time())
-                rc=proc.returncode
-    except subprocess.TimeoutExpired:
-        timeout_triggered=True; rc=124
-        send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
+                proc=subprocess.Popen(cmd,stdout=fout,stderr=subprocess.STDOUT)
+                send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
+                try:
+                    rc=proc.wait(timeout=remaining_time())
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait(); rc=124; timeout_triggered=True
+                    send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
+    except Exception as exc:
+        send_msg('[Kaggle] Could not start or wait for '+engine_label+' process: '+str(exc))
+        raise
 
-    out_text=Path(output_file).read_text(encoding='utf-8',errors='replace') if os.path.exists(output_file) else ''
-    analysis=parse_output_text(out_text,output_file)
-    analysis['process_returncode']=rc
-    if rc!=0 and not timeout_triggered: send_msg(f'[Kaggle] Program exited with code {rc}. Results will still be analyzed and returned.')
+    bundle=None
+    if is_gaussian:
+        checkpoints=[]
+        runtime_real=os.path.realpath(GAUSSIAN_RUNTIME_ROOT)
+        for parent,dirs,files in os.walk(os.getcwd()):
+            parent_real=os.path.realpath(parent)
+            if parent_real==runtime_real or parent_real.startswith(runtime_real+os.sep):
+                dirs[:]=[]
+                continue
+            dirs[:]=[d for d in dirs if not (os.path.realpath(os.path.join(parent,d))==runtime_real or os.path.realpath(os.path.join(parent,d)).startswith(runtime_real+os.sep))]
+            for fn in files:
+                if fn.lower().endswith('.chk'):
+                    checkpoints.append(os.path.join(parent,fn))
+        converted=0
+        formchk_script='source "$CHEMBOT_G16_PROFILE" >/dev/null 2>&1 || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v formchk >/dev/null 2>&1; then exec formchk "$1" "$2"; fi; [ -x "$CHEMBOT_FORMCHK_EXE" ] || exit 127; exec "$CHEMBOT_FORMCHK_EXE" "$1" "$2"'
+        for chk_path in sorted(set(checkpoints)):
+            fchk_path=os.path.splitext(chk_path)[0]+'.fchk'
+            try:
+                conversion=subprocess.run(['bash','-c',formchk_script,'formchk',chk_path,fchk_path],env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=max(60,min(remaining_time(),1800)))
+                if conversion.returncode==0 and os.path.isfile(fchk_path) and os.path.getsize(fchk_path)>0:
+                    converted+=1
+                else:
+                    send_msg('[GaussView] Could not convert '+os.path.basename(chk_path)+' to .fchk: '+(conversion.stdout or '')[-800:])
+            except Exception as exc:
+                send_msg('[GaussView] Could not convert '+os.path.basename(chk_path)+' to .fchk: '+str(exc))
+        if converted:
+            send_msg('[GaussView] Converted %d checkpoint file(s) to Windows-friendly .fchk format.' % converted)
+        else:
+            send_msg('[GaussView] No usable checkpoint was found. The .log and executed input will still be returned; include a %chk= line to save orbitals.')
+        if rc!=0 and not timeout_triggered:
+            send_msg('[Kaggle] Gaussian exited with code %d. Available files will still be returned.' % rc)
+    else:
+        out_text=Path(output_file).read_text(encoding='utf-8',errors='replace') if os.path.exists(output_file) else ''
+        analysis=parse_output_text(out_text,output_file)
+        analysis['process_returncode']=rc
+        if rc!=0 and not timeout_triggered: send_msg(f'[Kaggle] Program exited with code {rc}. Results will still be analyzed and returned.')
 
-    work='analysis_report'; os.makedirs(work,exist_ok=True)
-    bundle=generate_report_bundle(analysis,work,basename)
-    plots=bundle['plots']; pdf_path=bundle['pdf']
+        work='analysis_report'; os.makedirs(work,exist_ok=True)
+        bundle=generate_report_bundle(analysis,work,basename)
+        plots=bundle['plots']; pdf_path=bundle['pdf']
 
-    send_msg('[Analysis]\n'+section_summary(analysis))
-    for name,path in plots.items():
-        try: tg('sendPhoto',{'chat_id':CHAT_ID,'caption':name.replace('_',' ').title()},'photo',path)
-        except Exception as e: send_msg('Could not send plot '+name+': '+str(e))
-    try: tg('sendDocument',{'chat_id':CHAT_ID,'caption':'Complete scientific analysis PDF'},'document',pdf_path)
-    except Exception as e: send_msg('Could not send PDF: '+str(e))
+        send_msg('[Analysis]\n'+section_summary(analysis))
+        for name,path in plots.items():
+            try: tg('sendPhoto',{'chat_id':CHAT_ID,'caption':name.replace('_',' ').title()},'photo',path)
+            except Exception as e: send_msg('Could not send plot '+name+': '+str(e))
+        try: tg('sendDocument',{'chat_id':CHAT_ID,'caption':'Complete scientific analysis PDF'},'document',pdf_path)
+        except Exception as e: send_msg('Could not send PDF: '+str(e))
 
     results_dir='outputs'; os.makedirs(results_dir,exist_ok=True)
-    allowed_ext=('.out','.gbw','.xyz','.molden.input','.property.txt','.property.json','.prop','.hess','.interp','.allxyz','.opt','.dat','.cube','.engrad','.trj')
-    for parent,dirs,files in os.walk('.'):
-        if parent.startswith('./outputs') or parent.startswith('./analysis_report'): continue
+    allowed_ext=('.log','.out','.chk','.fchk','.gjf','.com','.gau','.gbw','.xyz','.molden.input','.property.txt','.property.json','.prop','.hess','.interp','.allxyz','.opt','.dat','.cube','.cub','.engrad','.trj') if is_gaussian else ('.out','.gbw','.xyz','.molden.input','.property.txt','.property.json','.prop','.hess','.interp','.allxyz','.opt','.dat','.cube','.engrad','.trj')
+    excluded_roots=[os.path.realpath(results_dir)]
+    if os.path.isdir('analysis_report'):
+        excluded_roots.append(os.path.realpath('analysis_report'))
+    if is_gaussian:
+        excluded_roots.append(os.path.realpath(GAUSSIAN_RUNTIME_ROOT))
+    for parent,dirs,files in os.walk(os.getcwd()):
+        parent_real=os.path.realpath(parent)
+        if any(parent_real==root or parent_real.startswith(root+os.sep) for root in excluded_roots):
+            dirs[:]=[]
+            continue
+        dirs[:]=[d for d in dirs if not any(os.path.realpath(os.path.join(parent,d))==root or os.path.realpath(os.path.join(parent,d)).startswith(root+os.sep) for root in excluded_roots)]
         for fn in files:
-            if fn==INPUT_FILE or fn.endswith(allowed_ext):
+            if fn==INPUT_FILE or fn.lower().endswith(allowed_ext):
                 src=os.path.join(parent,fn)
                 if os.path.isfile(src):
-                    try: shutil.copy2(src,os.path.join(results_dir,os.path.basename(fn)))
+                    try:
+                        result_name=_windows_safe_basename(fn) if is_gaussian else os.path.basename(fn)
+                        result_path=os.path.join(results_dir,result_name)
+                        if os.path.exists(result_path) and os.path.realpath(src)!=os.path.realpath(result_path):
+                            stem,ext=os.path.splitext(result_name)
+                            parent_tag=_windows_safe_basename(os.path.basename(parent))
+                            result_path=os.path.join(results_dir,stem+'_'+parent_tag+ext)
+                        shutil.copy2(src,result_path)
                     except Exception: pass
 
     # Include the exact same canonical report bundle that was sent to Telegram.
-    report_out=os.path.join(results_dir,'analysis_report')
-    os.makedirs(report_out,exist_ok=True)
-    for rp in [bundle.get('pdf'), bundle.get('analysis_json'), bundle.get('manifest')] + list(bundle.get('plots',{}).values()):
-        if rp and os.path.isfile(rp):
-            try: shutil.copy2(rp, os.path.join(report_out, os.path.basename(rp)))
-            except Exception: pass
-    archive=shutil.make_archive(('Psi4_Results_' if is_psi4 else 'ORCA_Results_')+basename,'zip',results_dir)
+    if bundle:
+        report_out=os.path.join(results_dir,'analysis_report')
+        os.makedirs(report_out,exist_ok=True)
+        for rp in [bundle.get('pdf'), bundle.get('analysis_json'), bundle.get('manifest')] + list(bundle.get('plots',{}).values()):
+            if rp and os.path.isfile(rp):
+                try: shutil.copy2(rp, os.path.join(report_out, os.path.basename(rp)))
+                except Exception: pass
+    result_prefix='Gaussian16_Results_' if is_gaussian else ('Psi4_Results_' if is_psi4 else 'ORCA_Results_')
+    archive=shutil.make_archive(result_prefix+basename,'zip',results_dir)
     transfer=send_results_with_fallback(archive,results_dir)
-    status='SUCCESS' if (rc==0 and analysis.get('normal_termination')) else ('TIMEOUT' if timeout_triggered else 'FINISHED WITH WARNINGS/ERROR')
+    status=('SUCCESS' if rc==0 else ('TIMEOUT' if timeout_triggered else 'FAILED')) if is_gaussian else ('SUCCESS' if (rc==0 and analysis.get('normal_termination')) else ('TIMEOUT' if timeout_triggered else 'FINISHED WITH WARNINGS/ERROR'))
     if transfer.get('failed'):
         status += ' | PARTIAL_TRANSFER'
     send_msg('[Kaggle] Final status: '+status)
 except Exception as e:
     send_msg('Fatal Kaggle error:\n'+str(e)+'\n'+traceback.format_exc()[-2500:])
+finally:
+    if GAUSSIAN_SCRATCH_DIR:
+        shutil.rmtree(GAUSSIAN_SCRATCH_DIR,ignore_errors=True)
 '''
 
 def _redact_kaggle_error(text):
@@ -3889,23 +4140,26 @@ def _new_authenticated_kaggle_api(api_factory=None):
     return client
 
 
-def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, drive_link, api_factory=None):
+def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, drive_link, api_factory=None, is_gaussian=False):
     """Package and push a Kaggle kernel using the original bot's KaggleApi flow."""
     job_id = 'chem-job-' + uuid.uuid4().hex[:16]
     job_dir = None
     try:
         job_dir = tempfile.mkdtemp(prefix=job_id + '_')
+        engine = 'gaussian' if is_gaussian else ('psi4' if is_psi4 else 'orca')
+        dataset_sources = ([GAUSSIAN_DATASET_SLUG] if is_gaussian else ([] if is_psi4 else [ORCA_DATASET_SLUG]))
+        code_file = 'notebook.ipynb' if is_gaussian else 'script.py'
         metadata = {
             'id': f'{KAGGLE_USERNAME}/{job_id}',
             'title': job_id,
-            'code_file': 'script.py',
+            'code_file': code_file,
             'language': 'python',
-            'kernel_type': 'script',
+            'kernel_type': 'notebook' if is_gaussian else 'script',
             'is_private': True,
             'enable_gpu': False,
             'enable_internet': True,
-            # ORCA only: mount the requested ORCA 6.1.0 dataset.
-            'dataset_sources': [] if is_psi4 else [ORCA_DATASET_SLUG],
+            # Attach only the selected engine's private runtime Dataset.
+            'dataset_sources': dataset_sources,
         }
         Path(job_dir, 'kernel-metadata.json').write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -3919,9 +4173,33 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
             'ENCODED_FILES_JSON=' + repr(encoded_files_json) + '\n'
             'DRIVE_LINK=' + repr(drive_link) + '\n'
             'PSI4_EXTRAS=' + repr(extras) + '\n'
+            'JOB_ENGINE=' + repr(engine) + '\n'
+            'KAGGLE_NOTEBOOK_URL=' + repr(f'https://www.kaggle.com/code/{KAGGLE_USERNAME}/{job_id}') + '\n'
         )
-        script = header + '\n' + ANALYZER_MODULE_CODE + '\n' + KAGGLE_RUNNER_CODE
-        Path(job_dir, 'script.py').write_text(script, encoding='utf-8', newline='\n')
+        analyzer_code = '' if is_gaussian else ANALYZER_MODULE_CODE
+        script = header + '\n' + analyzer_code + '\n' + KAGGLE_RUNNER_CODE
+        if is_gaussian:
+            notebook = {
+                'cells': [{
+                    'cell_type': 'code',
+                    'execution_count': None,
+                    'metadata': {},
+                    'outputs': [],
+                    'source': script,
+                }],
+                'metadata': {
+                    'kernelspec': {'display_name': 'Python 3', 'language': 'python', 'name': 'python3'},
+                    'language_info': {'name': 'python'},
+                },
+                'nbformat': 4,
+                'nbformat_minor': 5,
+            }
+            Path(job_dir, code_file).write_text(
+                json.dumps(notebook, ensure_ascii=False, indent=1),
+                encoding='utf-8', newline='\n'
+            )
+        else:
+            Path(job_dir, code_file).write_text(script, encoding='utf-8', newline='\n')
 
         # Original bot pattern:
         #   api = KaggleApi()
@@ -3981,7 +4259,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v6.2.1 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v6.2.3 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -4266,7 +4544,7 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v6.2.1\n"
+        "🧪 Computational Chemistry Bot v6.2.3\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp or Psi4 .dat to run on Kaggle.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF.\n"
@@ -4283,7 +4561,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v6.2.1-FRONTIER-20260926\n'
+        'ChemBot build: v6.2.3-GAUSSIAN-GV-20260927\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -4413,7 +4691,7 @@ def handle_document(message):
         return
 
     # Auxiliary job files
-    if filename.endswith(('.xyz','.allxyz','.gbw')):
+    if filename.endswith(('.xyz','.allxyz','.gbw','.chk','.fchk')):
         if size>MAX_TELEGRAM_DOWNLOAD:
             bot.reply_to(message,'This auxiliary file exceeds Telegram Bot API 20 MB download limit. Use a restart ZIP URL instead.'); return
         try:
@@ -4435,13 +4713,17 @@ def handle_document(message):
         return
 
     # Calculation jobs
-    if filename.endswith(('.inp','.dat')):
+    if filename.endswith(('.inp','.dat','.gjf','.com','.gau')):
         if size>MAX_TELEGRAM_DOWNLOAD:
             bot.reply_to(message,'Input exceeds Telegram Bot API download limit.'); return
         try:
-            info=bot.get_file(message.document.file_id); raw=bot.download_file(info.file_path); inp=raw.decode('utf-8',errors='replace')
-            is_psi4=filename.endswith('.dat'); extras=detect_psi4_extras(inp) if is_psi4 else []
-            prog='Psi4' if is_psi4 else 'ORCA'
+            info=bot.get_file(message.document.file_id); raw=bot.download_file(info.file_path); inp=decode_job_input(raw)
+            engine=detect_job_engine(original_name,inp)
+            if engine is None:
+                bot.reply_to(message,'Unsupported calculation input. Send ORCA .inp, Psi4 .dat, or Gaussian .gjf/.com/.gau input.'); return
+            is_psi4=engine=='psi4'; is_gaussian=engine=='gaussian'
+            extras=detect_psi4_extras(inp) if is_psi4 else []
+            prog='Gaussian 16' if is_gaussian else ('Psi4' if is_psi4 else 'ORCA')
             extra_note=("\nDetected external Psi4 packages: "+', '.join(extras)) if extras else ''
             bot.reply_to(message,f"☁️ {prog} input received. Preparing Kaggle job...{extra_note}")
 
@@ -4451,7 +4733,7 @@ def handle_document(message):
             aux_snapshot, drive = snapshot_user_job_context(uid)
 
             # Helpful NEB end-point convenience, retaining original behavior.
-            if not is_psi4 and 'neb-ts' in inp.lower() and '%neb' not in inp.lower():
+            if engine=='orca' and 'neb-ts' in inp.lower() and '%neb' not in inp.lower():
                 xyzs=[n for n in aux_snapshot if n.lower().endswith(('.xyz','.allxyz'))]
                 if len(xyzs)==1:
                     inp += f'\n\n%neb\n  NEB_End_XYZ "{xyzs[0]}"\nend\n'
@@ -4462,15 +4744,16 @@ def handle_document(message):
             encoded=base64.b64encode(json.dumps(payload).encode()).decode('ascii')
             # submit_kaggle_job uses a UUID slug, a private tempfile directory,
             # a fresh KaggleApi client, and a finally-cleanup for this job only.
-            job_id,url=submit_kaggle_job(
-                original_name, encoded, chat_id, is_psi4, extras, drive
+            job_id,_url=submit_kaggle_job(
+                original_name, encoded, chat_id, is_psi4, extras, drive,
+                is_gaussian=is_gaussian
             )
-            bot.send_message(chat_id,f"✅ Kaggle job submitted: {original_name}\nYou may close this launcher after all files in the batch show this confirmation.\n{url}")
+            bot.send_message(chat_id,f"✅ Private Kaggle {'notebook' if is_gaussian else 'job'} submitted for {prog}: {original_name}\nYou may close this launcher after all files in the batch show this confirmation. The notebook link will be sent when the calculation process starts.")
         except Exception as e:
             bot.reply_to(message,'Submission error: '+str(e))
         return
 
-    bot.reply_to(message,'Supported files: .inp, .dat, .out, .xyz, .allxyz, .gbw')
+    bot.reply_to(message,'Supported files: ORCA .inp, Psi4 .dat, Gaussian .gjf/.com/.gau (or Gaussian route-card .inp), .out, .xyz, .allxyz, .gbw, .chk, .fchk')
 
 
 # ------------------------- Runtime transport -------------------------
@@ -4597,7 +4880,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v6.2.1 webhook mode active on port {port}.")
+    print(f"CHEMBOT v6.2.3 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -4638,7 +4921,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v6.2.1 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v6.2.3 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
