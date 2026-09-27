@@ -1,4 +1,4 @@
-# BUILD: v6.2.6-STRICT-20260927
+# BUILD: v6.2.7-STRICT-20260927
 import os
 
 # ============================================================
@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v6.2.6
+# Chemistry Telegram/Kaggle Bot v6.2.7
 # ============================================================
 
 
@@ -202,6 +202,7 @@ MAX_TEXT_OUT = 20 * 1024 * 1024
 
 user_aux_storage = {}
 user_drive_links = {}
+recent_kaggle_jobs = {}
 analysis_sessions = {}
 analysis_group_batches = {}
 analysis_group_lock = threading.RLock()
@@ -339,7 +340,7 @@ ANALYZER_MODULE_CODE = r'''
 import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = '6.2.6'
+REPORT_GENERATOR_VERSION = '6.2.7'
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 KB_J_MOL_K = 8.314462618
@@ -4268,7 +4269,7 @@ try:
             proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
                                   cwd=WORK_DIR,env=psi4_env,start_new_session=True)
             disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
-            send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
+            send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
             try:
                 proc_stdout,_=proc.communicate(timeout=remaining_time())
             except subprocess.TimeoutExpired:
@@ -4282,7 +4283,7 @@ try:
                 proc=subprocess.Popen(cmd,stdin=fin,stdout=fout,stderr=subprocess.STDOUT,
                                       cwd=WORK_DIR,env=gaussian_env,start_new_session=True)
                 disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
-                send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
+                send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
                 try:
                     rc=proc.wait(timeout=remaining_time())
                 except subprocess.TimeoutExpired:
@@ -4293,7 +4294,7 @@ try:
                 proc=subprocess.Popen(cmd,stdout=fout,stderr=subprocess.STDOUT,
                                       cwd=WORK_DIR,start_new_session=True)
                 disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
-                send_msg('✅ '+engine_label+' calculation process started on Kaggle.\nRun link: '+str(KAGGLE_NOTEBOOK_URL))
+                send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
                 try:
                     rc=proc.wait(timeout=remaining_time())
                 except subprocess.TimeoutExpired:
@@ -4483,6 +4484,7 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
             notebook = {
                 'cells': [{
                     'cell_type': 'code',
+                    'id': 'chemrun-' + uuid.uuid4().hex[:16],
                     'execution_count': None,
                     'metadata': {},
                     'outputs': [],
@@ -4560,7 +4562,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v6.2.6 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v6.2.7 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -4569,6 +4571,53 @@ def authorized(message):
     chat_id = getattr(chat, 'id', None)
     user_id = getattr(sender, 'id', None)
     return chat_id in ALLOWED_IDS or user_id in ALLOWED_IDS
+
+
+def _send_submission_link(chat_id, message_text):
+    """Send the accepted Kaggle URL from Render, before notebook setup runs."""
+    for attempt in range(3):
+        try:
+            bot.send_message(chat_id,message_text,disable_web_page_preview=True)
+            return True
+        except Exception:
+            if attempt<2: time.sleep(2**attempt)
+    print('Telegram delivery failed for a Kaggle submission link; /jobs can retrieve it.')
+    return False
+
+
+def _own_kaggle_job_links():
+    """Recover recent private ChemBot jobs from the authenticated Kaggle account."""
+    api=_new_authenticated_kaggle_api()
+    try:
+        listed=api.kernels_list(mine=True,search='chem-job-',page=1,sort_by='dateRun')
+    except TypeError:
+        try: listed=api.kernels_list(mine=True,search='chem-job-',page=1)
+        except TypeError: listed=api.kernels_list(mine=True,page=1)
+    items=(listed.get('kernels',[]) if isinstance(listed,dict)
+           else getattr(listed,'kernels',listed)) or []
+    links=[]
+    for item in items:
+        ref=item.get('ref') if isinstance(item,dict) else getattr(item,'ref',None)
+        if not isinstance(ref,str): continue
+        owner,sep,slug=ref.partition('/')
+        if sep and owner.lower()==KAGGLE_USERNAME.lower() and slug.lower().startswith('chem-job-'):
+            links.append('https://www.kaggle.com/code/'+owner+'/'+slug)
+    return links[:10]
+
+
+@bot.message_handler(commands=['jobs'])
+def jobs_command(message):
+    if not authorized(message): return
+    uid=message.from_user.id; chat_id=message.chat.id
+    with state_lock:
+        links=list(recent_kaggle_jobs.get((chat_id,uid),[]))
+    if uid==ADMIN_ID:
+        try:
+            for url in _own_kaggle_job_links():
+                if url not in links: links.append(url)
+        except Exception as exc:
+            print('Could not list Kaggle jobs:',type(exc).__name__)
+    bot.reply_to(message,'Recent private Kaggle jobs:\n'+'\n'.join(links[:10]) if links else 'No recent ChemBot job links were found.')
 
 
 def split_send(chat_id, text, title=None):
@@ -4879,10 +4928,10 @@ def start(message):
         user_aux_storage.pop(uid,None)
         user_drive_links.pop(uid,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v6.2.6\n"
+        "🧪 Computational Chemistry Bot v6.2.7\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp, Psi4 .dat, or a GaussianView .gjf/.com/.gau file to run on private Kaggle jobs.\n"
-        "• The private Kaggle run link arrives when the calculation process starts.\n"
+        "• The private Kaggle run link arrives as soon as Kaggle accepts the job; use /jobs to retrieve recent links.\n"
         "• Jobs run in /kaggle/working; engine packages stay under /tmp. Working disk is monitored at 20,000 MB.\n"
         "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF. Gaussian returns .log/.chk/.fchk for GaussianView 6.\n"
         "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
@@ -4898,7 +4947,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v6.2.6-STRICT-20260927\n'
+        'ChemBot build: v6.2.7-STRICT-20260927\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -4916,6 +4965,7 @@ def help_command(message):
         "Supported inputs: ORCA .inp; Psi4 .dat; Gaussian .gjf/.com/.gau or a Gaussian route-card .inp.\n"
         "Auxiliary/restart inputs: .xyz, .allxyz, .gbw, .chk, .fchk.\n"
         "Analysis input: ORCA/Psi4 .out. Gaussian .log is returned without an analyzer.\n"
+        "The private Kaggle link is sent immediately after submission; /jobs retrieves recent links.\n"
         "Kaggle layout: engine packages in /tmp; calculations/results in /kaggle/working; disk guard 20,000 MB.\n"
         "Use /clearaux to discard stored auxiliary/restart context after a batch.\n\n"
         "For .out files the bot extracts every recognized section and exposes interactive menus for energies, thermochemistry, frequencies/IR, TD-DFT/UV-Vis, orbital energies, optimization profile and diagnostics. Upload two or more compatible outputs to overlay TD-DFT/UV-Vis or FT-IR spectra. A PDF with generated figures is also produced."
@@ -5085,11 +5135,19 @@ def handle_document(message):
             encoded=base64.b64encode(json.dumps(payload).encode()).decode('ascii')
             # submit_kaggle_job uses a UUID slug, a private tempfile directory,
             # a fresh KaggleApi client, and a finally-cleanup for this job only.
-            job_id,_url=submit_kaggle_job(
+            job_id,job_url=submit_kaggle_job(
                 original_name, encoded, chat_id, is_psi4, extras, drive,
                 is_gaussian=is_gaussian
             )
-            bot.send_message(chat_id,f"✅ Private Kaggle {'notebook' if is_gaussian else 'job'} submitted for {prog}: {original_name}\nYou may close this launcher after all files in the batch show this confirmation. The notebook link will be sent when the calculation process starts.")
+            with state_lock:
+                links=recent_kaggle_jobs.setdefault((chat_id,uid),[])
+                links.insert(0,job_url)
+                del links[10:]
+            notice=(f"✅ Private Kaggle {'notebook' if is_gaussian else 'job'} accepted for {prog}: {original_name}\n"
+                    f"🔗 {job_url}\n"
+                    "The notebook may still be installing packages or extracting the program before the calculation starts. "
+                    "Send /jobs to retrieve recent job links.")
+            _send_submission_link(chat_id,notice)
         except Exception as e:
             bot.reply_to(message,'Submission error: '+str(e))
         return
@@ -5221,7 +5279,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v6.2.6 webhook mode active on port {port}.")
+    print(f"CHEMBOT v6.2.7 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -5262,7 +5320,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v6.2.6 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v6.2.7 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
