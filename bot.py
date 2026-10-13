@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""ChemBot 7.1.0 — final scientific/Telegram/Kaggle script (2026-10-13).
+"""ChemBot 7.1.1 — final scientific/Telegram/Kaggle script (2026-10-13).
 
 Python 3.10+ (3.11/3.12 recommended). Start: python chembot.py
 Render: Web Service, start command python chembot.py, health route /health.
 Environment: CHEMBOT_BOT_TOKEN; KAGGLE_USERNAME; KAGGLE_API_TOKEN or KAGGLE_KEY;
-CHEMBOT_ALLOWED_IDS=your Telegram numeric user ID; CHEMBOT_ADMIN_ID=your ID.
+Optional owner overrides: CHEMBOT_ALLOWED_IDS=your Telegram numeric user ID;
+CHEMBOT_ADMIN_ID=your ID. If omitted, the original bot's trusted IDs are used.
 Runtime datasets: ORCA_DATASET_SLUG and GAUSSIAN_DATASET_SLUG (owner/slug).
 Engine binaries must already be available to your Kaggle account in those datasets.
 Set CHEMBOT_AUTO_INSTALL=0 when dependencies were installed during the build.
@@ -57,7 +58,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v7.1.0
+# Chemistry Telegram/Kaggle Bot v7.1.1
 # ============================================================
 
 
@@ -2221,8 +2222,8 @@ def section_orbitals(a):
 # thermochemistry_blocks and job_blocks retain independent provenance.
 BOHR_TO_ANGSTROM = 0.529177210903
 FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
-PARSER_VERSION = '7.1.0'
-REPORT_GENERATOR_VERSION = '7.1.0'
+PARSER_VERSION = '7.1.1'
+REPORT_GENERATOR_VERSION = '7.1.1'
 _LEGACY_ANALYZER_PARSE = parse_output_text
 
 
@@ -3446,7 +3447,7 @@ import re
 from pathlib import Path
 
 ANALYSIS_SCHEMA_VERSION = "2.0"
-PARSER_VERSION = "7.1.0"
+PARSER_VERSION = "7.1.1"
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 GAS_CONSTANT_J_MOL_K = 8.314462618
@@ -3961,7 +3962,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = "7.1.0"
+REPORT_GENERATOR_VERSION = "7.1.1"
 _RF_HARTREE_TO_KJMOL = 2625.499638
 _RF_HC_EV_NM = 1239.841984
 _RF_EV_TO_CM1 = 8065.544005
@@ -6193,9 +6194,9 @@ def _run_self_tests():
 def _offline_cli():
     import argparse
     parser = argparse.ArgumentParser(
-        description='ChemBot 7.1.0: Telegram/Kaggle chemistry bot and conservative output analyzer.',
+        description='ChemBot 7.1.1: Telegram/Kaggle chemistry bot and conservative output analyzer.',
         epilog='Bot configuration: CHEMBOT_BOT_TOKEN, KAGGLE_USERNAME, KAGGLE_API_TOKEN (or KAGGLE_KEY), '
-               'CHEMBOT_ALLOWED_IDS=your Telegram user ID; CHEMBOT_ADMIN_ID=your ID. '
+               'Optional owner overrides: CHEMBOT_ALLOWED_IDS=your Telegram user ID; CHEMBOT_ADMIN_ID=your ID. Original trusted IDs are used when omitted. '
                'Render Web Services automatically use HTTPS webhooks. Run without arguments to start the bot.')
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--self-test', action='store_true', help='run synthetic scientific and worker regression checks without credentials')
@@ -6297,7 +6298,11 @@ from telebot import types
 if not BOT_TOKEN:
     raise RuntimeError("Set CHEMBOT_BOT_TOKEN before running the bot.")
 
-_DEFAULT_ALLOWED_IDS = set()
+# Preserve the explicitly trusted users/chats from the supplied original bot.
+# Environment settings can replace the owner list; permitted groups still do
+# not authorize their other members to run jobs on the personal Kaggle account.
+_DEFAULT_ALLOWED_IDS = {7495822836, -1003907097817, 839801823, -1003925918657, -1003875125323}
+_DEFAULT_ADMIN_ID = 839801823
 
 def _parse_id_set(raw_value, fallback, variable_name):
     raw_value = str(raw_value or '').strip()
@@ -6312,17 +6317,46 @@ def _parse_id_set(raw_value, fallback, variable_name):
     return ids
 
 
-ALLOWED_IDS = _parse_id_set(os.environ.get('CHEMBOT_ALLOWED_IDS'), _DEFAULT_ALLOWED_IDS, 'CHEMBOT_ALLOWED_IDS')
-try:
-    ADMIN_ID = int(os.environ.get('CHEMBOT_ADMIN_ID', '0') or '0')
-except ValueError as exc:
-    raise RuntimeError('CHEMBOT_ADMIN_ID must be a Telegram numeric ID.') from exc
-if ADMIN_ID < 0:
-    raise RuntimeError('CHEMBOT_ADMIN_ID must be a positive user ID, not a group ID.')
-if ADMIN_ID > 0:
-    ALLOWED_IDS.add(ADMIN_ID)
-if not any(user_id > 0 for user_id in ALLOWED_IDS):
-    raise RuntimeError('Set CHEMBOT_ALLOWED_IDS to your Telegram user ID or set CHEMBOT_ADMIN_ID. Group IDs alone cannot authorize users.')
+def _resolve_authorization(environ=None):
+    """Retain original defaults while respecting explicit owner overrides."""
+    environ = os.environ if environ is None else environ
+    def value(name):
+        return str(environ.get(name, '') or '').strip().strip('"').strip("'")
+    raw_ids = value('CHEMBOT_ALLOWED_IDS')
+    raw_admin = value('CHEMBOT_ADMIN_ID')
+    if raw_ids:
+        ids = _parse_id_set(raw_ids, set(), 'CHEMBOT_ALLOWED_IDS')
+    elif raw_admin and raw_admin != '0':
+        # An explicit administrator replaces the original trusted users.
+        ids = {identifier for identifier in _DEFAULT_ALLOWED_IDS if identifier < 0}
+    else:
+        ids = set(_DEFAULT_ALLOWED_IDS)
+    if 0 in ids:
+        raise RuntimeError('CHEMBOT_ALLOWED_IDS must contain non-zero numeric user/chat IDs.')
+    if raw_admin:
+        try:
+            admin = int(raw_admin)
+        except ValueError as exc:
+            raise RuntimeError('CHEMBOT_ADMIN_ID must be a Telegram numeric ID.') from exc
+        if admin < 0:
+            raise RuntimeError('CHEMBOT_ADMIN_ID must be a positive user ID, not a group ID.')
+    elif raw_ids and any(identifier > 0 for identifier in ids):
+        # A custom user list must not silently retain an unrelated default admin.
+        admin = 0
+    else:
+        admin = _DEFAULT_ADMIN_ID
+        # Existing Render installations sometimes configured only chat IDs.
+        # Reuse the original trusted users, rather than granting access to every
+        # member of those groups or making new variables mandatory at startup.
+        ids.update(identifier for identifier in _DEFAULT_ALLOWED_IDS if identifier > 0)
+    if admin > 0:
+        ids.add(admin)
+    if not any(identifier > 0 for identifier in ids):
+        raise RuntimeError('Authorization has no permitted user. Add a positive user ID to CHEMBOT_ALLOWED_IDS or CHEMBOT_ADMIN_ID.')
+    return ids, admin
+
+
+ALLOWED_IDS, ADMIN_ID = _resolve_authorization()
 ORCA_DATASET_SLUG = os.environ.get(
     "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0"
 )
@@ -6898,7 +6932,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v7.1.0 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle credentials={'configured' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v7.1.1 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle credentials={'configured' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -7241,7 +7275,7 @@ def start(message):
         user_aux_storage.pop(context_key,None)
         user_drive_links.pop(context_key,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v7.1.0\n"
+        "🧪 Computational Chemistry Bot v7.1.1\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp, Psi4 .dat, or a GaussianView .gjf/.com/.gau file to run on private Kaggle jobs.\n"
         "• The private Kaggle run link arrives as soon as Kaggle accepts the job; use /jobs to retrieve recent links.\n"
@@ -7260,7 +7294,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v7.1.0-FINAL-20261013\n'
+        'ChemBot build: v7.1.1-FINAL-20261013\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -7572,7 +7606,7 @@ def run_render_webhook():
     max_update_bytes = int(os.environ.get("CHEMBOT_MAX_WEBHOOK_BYTES", str(2 * 1024 * 1024)))
 
     class TelegramWebhookHandler(BaseHTTPRequestHandler):
-        server_version = "ChemBotWebhook/7.1.0"
+        server_version = "ChemBotWebhook/7.1.1"
 
         def log_message(self, fmt, *args):
             # BaseHTTPRequestHandler includes the secret route in request logs.
@@ -7590,7 +7624,7 @@ def run_render_webhook():
                 payload = json.dumps({
                     "ok": True,
                     "service": "ChemBot",
-                    "version": "7.1.0",
+                    "version": "7.1.1",
                     "transport": "webhook",
                 }).encode("utf-8")
                 return self._reply(200, payload, "application/json; charset=utf-8")
@@ -7643,7 +7677,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v7.1.0 webhook mode active on port {port}.")
+    print(f"CHEMBOT v7.1.1 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -7684,7 +7718,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v7.1.0 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v7.1.1 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
