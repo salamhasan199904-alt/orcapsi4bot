@@ -1,4 +1,20 @@
-# BUILD: v6.2.7-STRICT-20260927
+#!/usr/bin/env python3
+"""ChemBot 7.1.0 — final scientific/Telegram/Kaggle script (2026-10-13).
+
+Python 3.10+ (3.11/3.12 recommended). Start: python chembot.py
+Render: Web Service, start command python chembot.py, health route /health.
+Environment: CHEMBOT_BOT_TOKEN; KAGGLE_USERNAME; KAGGLE_API_TOKEN or KAGGLE_KEY;
+CHEMBOT_ALLOWED_IDS=your Telegram numeric user ID; CHEMBOT_ADMIN_ID=your ID.
+Runtime datasets: ORCA_DATASET_SLUG and GAUSSIAN_DATASET_SLUG (owner/slug).
+Engine binaries must already be available to your Kaggle account in those datasets.
+Set CHEMBOT_AUTO_INSTALL=0 when dependencies were installed during the build.
+Private notebooks contain the delivery token and input; keep them private.
+Commands: --help, --self-test, --print-requirements, --analyze file.out --outdir report.
+Self-tests use synthetic fixtures and never contact Telegram, Kaggle or engines.
+The parser supports common printed output sections, not every engine protocol.
+Reports retain warnings for missing evidence; export formatting does not validate
+an unsuitable method, basis, molecule, stationary point or scientific hypothesis.
+"""
 import os
 
 # ============================================================
@@ -34,28 +50,39 @@ import hashlib
 import math
 import signal
 import codecs
+import hmac
+from collections import OrderedDict
+from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v6.2.7
+# Chemistry Telegram/Kaggle Bot v7.1.0
 # ============================================================
 
 
-def ensure_dependencies():
+def ensure_dependencies(report_only=False):
     packages = {
-        'telebot': 'pyTelegramBotAPI>=4.16',
-        'matplotlib': 'matplotlib>=3.7',
-        'reportlab': 'reportlab>=4.0',
-        'numpy': 'numpy>=1.24',
-        'requests': 'requests>=2.31',
+        'telebot': 'pyTelegramBotAPI>=4.16,<5',
+        'matplotlib': 'matplotlib>=3.7,<4',
+        'reportlab': 'reportlab>=4.0,<5',
+        'numpy': 'numpy>=1.24,<3',
+        'requests': 'requests>=2.31,<3',
     }
+    if report_only:
+        packages.pop('telebot')
+        packages.pop('requests')
+    allow_install = _clean_env('CHEMBOT_AUTO_INSTALL').lower() not in {'0','no','false'}
     for mod, pkg in packages.items():
         try:
             __import__(mod)
         except ImportError:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+            if not allow_install:
+                raise RuntimeError('Missing dependency; install ' + pkg + ' during the build step.')
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg], timeout=300)
 
+    if report_only:
+        return
     try:
         from importlib.metadata import version as _pkg_version
         raw = _pkg_version('kaggle')
@@ -66,183 +93,11 @@ def ensure_dependencies():
     except Exception:
         kaggle_ok = False
     if not kaggle_ok:
+        if not allow_install:
+            raise RuntimeError('Install kaggle>=2.2.4,<3 during the build step.')
         subprocess.check_call([
-            sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'kaggle>=2.2.4'
-        ])
-
-
-ensure_dependencies()
-
-# ---------------------------------------------------------------------------
-# Kaggle authentication: reproduce the working pattern of the original bot.
-# Credentials/files are created BEFORE importing KaggleApi.
-# ---------------------------------------------------------------------------
-def _prepare_original_kaggle_auth():
-    if not KAGGLE_USERNAME:
-        return {
-            'username': '', 'modern_token': '', 'legacy_key': '', 'paths': []
-        }
-
-    raw_token = (KAGGLE_API_TOKEN or '').strip()
-    raw_key = (KAGGLE_KEY or '').strip()
-
-    modern_token = ''
-    legacy_key = ''
-
-    # A KGAT token may have been placed in either Render variable.
-    for value in (raw_token, raw_key):
-        if value.startswith('KGAT_') and len(value) > 5:
-            modern_token = modern_token or value
-            suffix = value[5:]
-            if re.fullmatch(r'[0-9a-fA-F]{32}', suffix):
-                legacy_key = legacy_key or suffix
-
-    # A bare 32-hex value is the legacy Kaggle key used by the original bot.
-    for value in (raw_key, raw_token):
-        if re.fullmatch(r'[0-9a-fA-F]{32}', value or ''):
-            legacy_key = legacy_key or value
-
-    # If KAGGLE_API_TOKEN contains a non-KGAT modern token, preserve it exactly.
-    if raw_token and not modern_token and not re.fullmatch(r'[0-9a-fA-F]{32}', raw_token):
-        modern_token = raw_token
-
-    os.environ['KAGGLE_USERNAME'] = KAGGLE_USERNAME
-    if modern_token:
-        os.environ['KAGGLE_API_TOKEN'] = modern_token
-    if legacy_key:
-        os.environ['KAGGLE_KEY'] = legacy_key
-
-    written=[]
-    home = os.environ.get('HOME') or str(Path.home())
-
-    # Exact path style used by the uploaded original bot.
-    config_dir = os.path.join(home, '.config', 'kaggle')
-    os.makedirs(config_dir, exist_ok=True)
-    if legacy_key:
-        p = os.path.join(config_dir, 'kaggle.json')
-        Path(p).write_text(
-            json.dumps({'username': KAGGLE_USERNAME, 'key': legacy_key}),
-            encoding='utf-8'
-        )
-        try: os.chmod(p, 0o600)
-        except OSError: pass
-        written.append(p)
-
-    # Compatibility path used by many Kaggle API releases on Linux/Render.
-    classic_dir = os.path.join(home, '.kaggle')
-    os.makedirs(classic_dir, exist_ok=True)
-    if legacy_key:
-        p = os.path.join(classic_dir, 'kaggle.json')
-        Path(p).write_text(
-            json.dumps({'username': KAGGLE_USERNAME, 'key': legacy_key}),
-            encoding='utf-8'
-        )
-        try: os.chmod(p, 0o600)
-        except OSError: pass
-        written.append(p)
-
-    # Current Kaggle CLI/API token source. It does not replace the legacy JSON;
-    # both are intentionally available, matching the original bot's dual setup.
-    if modern_token:
-        p = os.path.join(classic_dir, 'access_token')
-        Path(p).write_text(modern_token, encoding='utf-8')
-        try: os.chmod(p, 0o600)
-        except OSError: pass
-        written.append(p)
-
-    return {
-        'username': KAGGLE_USERNAME,
-        'modern_token': modern_token,
-        'legacy_key': legacy_key,
-        'paths': written,
-    }
-
-
-KAGGLE_AUTH_INFO = _prepare_original_kaggle_auth()
-
-# IMPORTANT: KaggleApi is imported only after the username/token/key and
-# credential files above already exist, exactly as requested.
-import telebot
-from telebot import types
-from kaggle.api.kaggle_api_extended import KaggleApi
-
-if not BOT_TOKEN:
-    raise RuntimeError("Set CHEMBOT_BOT_TOKEN before running the bot.")
-
-_DEFAULT_ALLOWED_IDS = {7495822836, -1003907097817, 839801823, -1003925918657, -1003875125323}
-
-def _parse_id_set(raw_value, fallback, variable_name):
-    raw_value = str(raw_value or '').strip()
-    if not raw_value:
-        return set(fallback)
-    try:
-        ids = {int(token.strip()) for token in re.split(r'[,;\s]+', raw_value) if token.strip()}
-    except ValueError as exc:
-        raise RuntimeError(f'{variable_name} must contain comma-separated Telegram numeric IDs.') from exc
-    if not ids:
-        raise RuntimeError(f'{variable_name} was set but did not contain any Telegram numeric IDs.')
-    return ids
-
-
-ALLOWED_IDS = _parse_id_set(os.environ.get('CHEMBOT_ALLOWED_IDS'), _DEFAULT_ALLOWED_IDS, 'CHEMBOT_ALLOWED_IDS')
-try:
-    ADMIN_ID = int(os.environ.get('CHEMBOT_ADMIN_ID', '839801823'))
-except ValueError as exc:
-    raise RuntimeError('CHEMBOT_ADMIN_ID must be a Telegram numeric ID.') from exc
-ORCA_DATASET_SLUG = os.environ.get(
-    "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0"
-)
-GAUSSIAN_DATASET_SLUG = os.environ.get(
-    "GAUSSIAN_DATASET_SLUG",
-    f"{KAGGLE_USERNAME or 'abdulsalsmsalih'}/gauusian16",
-)
-MAX_TELEGRAM_DOWNLOAD = 20 * 1024 * 1024
-MAX_AUX_STORAGE = 20 * 1024 * 1024
-MAX_TEXT_OUT = 20 * 1024 * 1024
-
-user_aux_storage = {}
-user_drive_links = {}
-recent_kaggle_jobs = {}
-analysis_sessions = {}
-analysis_group_batches = {}
-analysis_group_lock = threading.RLock()
-ANALYSIS_GROUP_DEBOUNCE_SECONDS = 2.5
-# Protect short-lived shared state used by Telegram handler threads.
-session_lock = threading.RLock()
-state_lock = threading.RLock()
-render_lock = threading.RLock()  # Matplotlib/ReportLab rendering is serialized for thread safety.
-
-# Telegram can deliver several documents almost simultaneously.  Use enough
-# worker threads to accept a batch, while every Kaggle submission receives its
-# own KaggleApi instance and its own temporary directory.
-try:
-    _requested_worker_threads = int(os.environ.get('CHEMBOT_WORKER_THREADS', '8'))
-except ValueError as exc:
-    raise RuntimeError('CHEMBOT_WORKER_THREADS must be an integer from 2 to 32.') from exc
-BOT_WORKER_THREADS = min(32, max(2, _requested_worker_threads))
-
-
-def detect_job_engine(filename, text=""):
-    """Identify calculation inputs from their extension and Gaussian route card."""
-    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
-    suffix = Path(name).suffix
-    if suffix == ".dat":
-        return "psi4"
-    if suffix in {".gjf", ".com", ".gau"}:
-        return "gaussian"
-    if suffix == ".inp":
-        contents = str(text or "")
-        # ORCA comments also begin with '#'. An ORCA command/geometry wins
-        # over a comment that happens to mention Gaussian-like keywords.
-        if (re.search(r'(?im)^\s*!\s*\S', contents) or
-            re.search(r'(?im)^\s*%\s*(?:pal|maxcore|scf|geom|tddft|cpcm|basis|freq)\b', contents) or
-            re.search(r'(?im)^\s*\*\s*(?:xyz|xyzfile|int)\b', contents)):
-            return "orca"
-        # Only route-like cards identify a Gaussian input with .inp suffix.
-        if re.search(r'(?im)^\s*#\s*(?:[PNT](?:\s|$)|[A-Za-z][\w()+.\-]*/[\w()+.*\-]+|(?:opt|freq|td|sp)\b)', contents):
-            return "gaussian"
-        return "orca"
-    return None
+            sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'kaggle>=2.2.4,<3'
+        ], timeout=300)
 
 
 def decode_job_input(raw):
@@ -264,79 +119,15 @@ def decode_job_input(raw):
         raise ValueError('The input contains NUL characters and is not a supported Gaussian text file.')
     return text
 
-# Names used by older ChemBot versions.  They are safe to prune when they are
-# clearly local staging directories, because the Kaggle kernel has already
-# received a copy after kernels_push() returns.
-LEGACY_JOB_PREFIXES = ("orca-job-", "psi4-job-", "chem-job-")
 
-
-def _safe_rmtree(path):
-    if not path:
-        return
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
-
-
-def cleanup_stale_local_job_dirs():
-    """Remove staging directories left by older/interrupted launcher runs.
-
-    Current-working-directory legacy jobs are removed immediately.  Temporary
-    directory jobs are removed only when older than one hour so another live
-    launcher process is not disturbed.
-    """
-    removed = []
-    now = time.time()
-    roots = [(Path.cwd(), 0.0), (Path(tempfile.gettempdir()), 3600.0)]
-    seen = set()
-    for root, min_age in roots:
-        try:
-            root = root.resolve()
-        except Exception:
-            continue
-        if str(root) in seen:
-            continue
-        seen.add(str(root))
-        try:
-            entries = list(root.iterdir())
-        except Exception:
-            continue
-        for entry in entries:
-            try:
-                if not entry.is_dir() or not entry.name.startswith(LEGACY_JOB_PREFIXES):
-                    continue
-                # Restrict deletion to the exact naming family generated by the bot.
-                suffix = entry.name.split('-', 2)[-1]
-                if not re.fullmatch(r'[A-Za-z0-9_]+', suffix or ''):
-                    continue
-                age = max(0.0, now - entry.stat().st_mtime)
-                if age < min_age:
-                    continue
-                _safe_rmtree(str(entry))
-                if not entry.exists():
-                    removed.append(str(entry))
-            except Exception:
-                continue
-    return removed
-
-
-def snapshot_user_job_context(user_id):
-    """Return independent copies of auxiliary files and restart URL.
-
-    The snapshot is intentionally non-destructive so a burst of .inp/.dat
-    messages from the same user can all use the same endpoint/restart files.
-    /clearaux or /start explicitly clears the shared preparation context.
-    """
-    with state_lock:
-        aux = dict(user_aux_storage.get(user_id, {}))
-        drive = str(user_drive_links.get(user_id, '') or '')
-    return aux, drive
-
-# ============================================================
-# Shared analyzer source. It is executed locally and injected into Kaggle jobs.
-# ============================================================
 ANALYZER_MODULE_CODE = r'''
+
+from __future__ import annotations
+
+# Scientific analyzer extracted by AST from the five analyzer sources in
+# ChemBot v6.2.7, then hardened below. No bot, Kaggle or Telegram startup code.
+# This module can run standalone or be embedded in the bot/worker namespace.
+
 import os, re, math, json, textwrap, hashlib
 from pathlib import Path
 
@@ -733,7 +524,7 @@ def section_summary(a):
     lines=[f"Engine: {a.get('engine')} {a.get('version') or ''}".strip(),
            f"Status: {'NORMAL TERMINATION' if a.get('normal_termination') else 'NOT CONFIRMED'}",
            f"Method: {a.get('method') or 'N/A'}", f"Basis: {a.get('basis') or 'N/A'}"]
-    if 'final_energy_hartree' in e: lines.append(f"Final energy: {e['final_energy_hartree']:.12f} Eh")
+    if e.get('final_energy_hartree') is not None: lines.append(f"Final energy: {e['final_energy_hartree']:.12f} Eh")
     if o.get('homo_ev') is not None: lines.append(f"HOMO: {o['homo_ev']:.6f} eV")
     if o.get('lumo_ev') is not None: lines.append(f"LUMO: {o['lumo_ev']:.6f} eV")
     if o.get('gap_ev') is not None: lines.append(f"HOMO-LUMO gap: {o['gap_ev']:.6f} eV")
@@ -799,203 +590,6 @@ def section_diagnostics(a):
     return '\n'.join(lines)
 
 
-def make_plots(a, outdir):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import numpy as np
-    os.makedirs(outdir,exist_ok=True)
-    made={}
-
-    def _gaussian_broaden(xvals, yvals, grid, sigma):
-        yy = np.zeros_like(grid, dtype=float)
-        if sigma <= 0:
-            sigma = 1.0
-        for xv, yv in zip(xvals, yvals):
-            if xv is None or yv is None:
-                continue
-            amp = max(0.0, float(yv))
-            yy += amp * np.exp(-0.5 * ((grid - float(xv)) / sigma) ** 2)
-        return yy
-
-    opt=a.get('optimization_energies',[])
-    if len(opt)>=2:
-        p=os.path.join(outdir,'optimization_energy.png')
-        arr = np.array([float(v) for v in opt if v is not None], dtype=float)
-        if arr.size >= 2:
-            rel = (arr - np.min(arr)) * HARTREE_TO_KJMOL
-            fig=plt.figure(figsize=(8,5)); ax=fig.add_subplot(111)
-            ax.plot(range(1,len(rel)+1), rel, marker='o', ms=3)
-            ax.set_xlabel('Optimization step')
-            ax.set_ylabel('Relative energy (kJ mol$^{-1}$)')
-            ax.set_title('Optimization energy profile')
-            ax.grid(alpha=.25)
-            ymin = min(rel.min(), 0.0)
-            ymax = rel.max() if rel.size else 1.0
-            pad = max(1.0, 0.05 * (ymax - ymin if ymax > ymin else 1.0))
-            ax.set_ylim(max(-pad, ymin - pad), ymax + pad)
-            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['optimization']=p
-
-    ir=a.get('ir_spectrum',[])
-    if ir:
-        p=os.path.join(outdir,'ir_spectrum.png')
-        pairs=[]
-        for q in ir:
-            try:
-                freq=float(q[0]); inten=abs(float(q[1] or 0.0))
-            except Exception:
-                continue
-            if freq > 0 and inten >= 0:
-                pairs.append((freq, inten))
-        # Prefer conventional mid-IR presentation (4000–400 cm^-1).
-        mid_ir=[(f,i) for f,i in pairs if 400.0 <= f <= 4000.0]
-        use = mid_ir if mid_ir else pairs
-        if use:
-            x=np.array([f for f,_ in use], dtype=float)
-            y=np.array([i for _,i in use], dtype=float)
-            if np.max(y) > 0:
-                y = y / np.max(y)
-            lo = 400.0 if mid_ir else max(0.0, np.min(x) - 120.0)
-            hi = 4000.0 if mid_ir else float(np.max(x) + 120.0)
-            if hi <= lo:
-                lo, hi = float(np.min(x)), float(np.max(x))
-            grid=np.linspace(lo, hi, 3600)
-            yy=_gaussian_broaden(x, y, grid, sigma=16.0)
-            if np.max(yy) > 0:
-                yy = yy / np.max(yy)
-            trans = 100.0 - 92.0 * yy
-            sticks = 100.0 - 35.0 * y
-            fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
-            ax.plot(grid, trans, lw=1.8)
-            ax.vlines(x, 100.0, sticks, alpha=.12, linewidth=0.6)
-            ax.set_xlabel('Wavenumber (cm$^{-1}$)')
-            ax.set_ylabel('Transmittance (%)')
-            ax.set_title('Simulated FT-IR spectrum')
-            ax.set_xlim(hi, lo)
-            ax.set_ylim(0, 102)
-            ax.grid(alpha=.18)
-            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['ir']=p
-
-    states=[s for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
-    if states:
-        p=os.path.join(outdir,'uvvis_spectrum.png')
-        nms=np.array([float(s['nm']) for s in states if s.get('nm')], dtype=float)
-        fosc=np.array([max(0.0, float(s.get('f') or 0.0)) for s in states if s.get('nm')], dtype=float)
-        if nms.size:
-            lo=max(100.0, float(np.min(nms))-80.0)
-            hi=min(2000.0, float(np.max(nms))+80.0)
-            grid=np.linspace(lo,hi,2500)
-            yy=_gaussian_broaden(nms, fosc, grid, sigma=10.0)
-            if np.max(yy)>0: yy=yy/np.max(yy)
-            stick = fosc / (np.max(fosc) if np.max(fosc)>0 else 1.0)
-            fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
-            ax.plot(grid,yy,lw=1.6)
-            ax.vlines(nms,0,stick,alpha=.35,linewidth=0.8)
-            ax.set_xlabel('Wavelength (nm)')
-            ax.set_ylabel('Relative intensity')
-            ax.set_title('Simulated UV-Vis spectrum (Gaussian broadening)')
-            ax.set_ylim(0, 1.05)
-            ax.grid(alpha=.2)
-            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['uvvis']=p
-
-    raman=a.get('raman_spectrum',[])
-    if raman:
-        p=os.path.join(outdir,'raman_spectrum.png')
-        pairs=[]
-        for q in raman:
-            try:
-                shift=float(q[0]); act=abs(float(q[1] or 0.0))
-            except Exception:
-                continue
-            if shift > 0 and act >= 0:
-                pairs.append((shift, act))
-        if pairs:
-            x=np.array([f for f,_ in pairs], dtype=float)
-            y=np.array([i for _,i in pairs], dtype=float)
-            if np.max(y) > 0:
-                y = y / np.max(y)
-            lo = max(0.0, np.min(x) - 80.0)
-            hi = np.max(x) + 80.0
-            grid=np.linspace(lo, hi, 3200)
-            yy=_gaussian_broaden(x, y, grid, sigma=10.0)
-            if np.max(yy) > 0:
-                yy = yy / np.max(yy)
-            fig=plt.figure(figsize=(9,5)); ax=fig.add_subplot(111)
-            ax.plot(grid, yy, lw=1.6)
-            ax.vlines(x, 0, y, alpha=.20, linewidth=0.6)
-            ax.set_xlabel('Raman shift (cm$^{-1}$)')
-            ax.set_ylabel('Relative activity')
-            ax.set_title('Calculated Raman spectrum')
-            ax.set_xlim(hi, lo)
-            ax.set_ylim(0, 1.05)
-            ax.grid(alpha=.2)
-            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['raman']=p
-
-    o=a.get('orbitals',{}).get('orbitals',[])
-    if o:
-        p=os.path.join(outdir,'orbital_energies.png')
-        cleaned=[z for z in o if z.get('ev') is not None]
-        occ=[z for z in cleaned if (z.get('occ') or 0.0) > 1e-8]
-        vir=[z for z in cleaned if (z.get('occ') or 0.0) <= 1e-8]
-        show_occ = occ[-6:]
-        show_vir = vir[:6]
-        subset = show_occ + show_vir
-        if subset:
-            ys=[float(z.get('ev')) for z in subset]
-            fig=plt.figure(figsize=(6.8,7.2)); ax=fig.add_subplot(111)
-
-            def _spread_positions(yvals, min_sep=0.12):
-                if not yvals:
-                    return []
-                out=[float(yvals[0])]
-                for yv in yvals[1:]:
-                    yv=float(yv)
-                    if yv - out[-1] < min_sep:
-                        yv = out[-1] + min_sep
-                    out.append(yv)
-                return out
-
-            for z in show_occ:
-                yv=float(z.get('ev'))
-                lw=2.4 if z is occ[-1] else 1.4
-                ax.hlines(yv, -0.34, -0.08, lw=lw)
-            for z in show_vir:
-                yv=float(z.get('ev'))
-                lw=2.4 if z is vir[0] else 1.4
-                ax.hlines(yv, 0.08, 0.34, lw=lw)
-            homo = occ[-1] if occ else None
-            lumo = vir[0] if vir else None
-            if homo is not None:
-                yv=float(homo.get('ev'))
-                ax.text(-0.40, yv, f"HOMO\n{yv:.2f} eV", ha='right', va='center', fontsize=9)
-            if lumo is not None:
-                yv=float(lumo.get('ev'))
-                ax.text(0.40, yv, f"LUMO\n{yv:.2f} eV", ha='left', va='center', fontsize=9)
-            occ_lab = show_occ[-3:-1]
-            vir_lab = show_vir[1:3]
-            occ_text_y = _spread_positions([float(z.get('ev')) for z in occ_lab], min_sep=0.11)
-            vir_text_y = _spread_positions([float(z.get('ev')) for z in vir_lab], min_sep=0.11)
-            for z, yt in zip(occ_lab, occ_text_y):
-                yv=float(z.get('ev'))
-                ax.annotate(str(z.get('index')), xy=(-0.08, yv), xytext=(-0.02, yt), textcoords='data', ha='right', va='center', fontsize=7, arrowprops=dict(arrowstyle='-', lw=0.5, shrinkA=0, shrinkB=0))
-            for z, yt in zip(vir_lab, vir_text_y):
-                yv=float(z.get('ev'))
-                ax.annotate(str(z.get('index')), xy=(0.08, yv), xytext=(0.02, yt), textcoords='data', ha='left', va='center', fontsize=7, arrowprops=dict(arrowstyle='-', lw=0.5, shrinkA=0, shrinkB=0))
-            if homo is not None and lumo is not None:
-                yh=float(homo.get('ev')); yl=float(lumo.get('ev'))
-                gap = yl - yh
-                xgap = 0.0
-                ax.annotate('', xy=(xgap, yl), xytext=(xgap, yh), arrowprops=dict(arrowstyle='<->', lw=1.2))
-                ax.text(xgap + 0.03, (yl+yh)/2.0, f'ΔE = {gap:.2f} eV', va='center', fontsize=8)
-            ymin=min(ys); ymax=max(ys); pad=max(0.4, 0.10*(ymax-ymin if ymax>ymin else 1.0))
-            ax.set_xlim(-0.5, 0.5)
-            ax.set_ylim(ymin-pad, ymax+pad)
-            ax.set_xticks([-0.2, 0.2]); ax.set_xticklabels(['Occupied', 'Virtual'])
-            ax.set_ylabel('Orbital energy (eV)')
-            ax.set_title('Frontier molecular orbital energy levels')
-            ax.grid(axis='y',alpha=.15)
-            fig.tight_layout(); fig.savefig(p,dpi=300,bbox_inches='tight'); plt.close(fig); made['orbitals']=p
-    return made
 
 
 def _report_fmt(v, digits=6, suffix=''):
@@ -1038,491 +632,12 @@ def _pdf_sha256(path):
     return h.hexdigest()
 
 
-def build_pdf(a, plots, pdf_path):
-    """Create the canonical ChemBot scientific report.
-
-    This function is intentionally shared by Telegram-side .out analysis and
-    the Kaggle runner. Keeping one implementation prevents the two report
-    styles from drifting apart.
-    """
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT, TA_CENTER
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
-        PageBreak, KeepTogether, LongTable, HRFlowable
-    )
-
-    NAVY = colors.HexColor('#17324D')
-    SLATE = colors.HexColor('#4B5D6B')
-    LIGHT = colors.HexColor('#F3F6F8')
-    MID = colors.HexColor('#D9E1E7')
-    GREEN = colors.HexColor('#1F7A4D')
-    RED = colors.HexColor('#A33A32')
-    TEXT = colors.HexColor('#202830')
-
-    styles=getSampleStyleSheet()
-    title_style=ParagraphStyle(
-        'ReportTitle', parent=styles['Title'], fontName='Helvetica-Bold',
-        fontSize=19, leading=22, textColor=NAVY, alignment=TA_LEFT,
-        spaceAfter=4
-    )
-    subtitle_style=ParagraphStyle(
-        'ReportSubtitle', parent=styles['BodyText'], fontName='Helvetica',
-        fontSize=8.5, leading=11, textColor=SLATE, spaceAfter=8
-    )
-    h1=ParagraphStyle(
-        'SectionH1', parent=styles['Heading2'], fontName='Helvetica-Bold',
-        fontSize=12.2, leading=15, textColor=NAVY, spaceBefore=10, spaceAfter=5
-    )
-    h2=ParagraphStyle(
-        'SectionH2', parent=styles['Heading3'], fontName='Helvetica-Bold',
-        fontSize=9.8, leading=12, textColor=SLATE, spaceBefore=6, spaceAfter=4
-    )
-    body=ParagraphStyle(
-        'ReportBody', parent=styles['BodyText'], fontName='Helvetica',
-        fontSize=8.6, leading=11.3, textColor=TEXT
-    )
-    small=ParagraphStyle(
-        'ReportSmall', parent=body, fontSize=7.3, leading=9.3, textColor=SLATE
-    )
-    caption=ParagraphStyle(
-        'FigureCaption', parent=small, fontSize=7.4, leading=9.4,
-        alignment=TA_CENTER, textColor=SLATE, spaceBefore=4, spaceAfter=7
-    )
-    mono=ParagraphStyle(
-        'ReportMono', parent=body, fontName='Courier', fontSize=6.8, leading=8.4
-    )
-
-    filename=str(a.get('filename') or 'calculation.out')
-    engine=str(a.get('engine') or 'Unknown')
-    version=str(a.get('version') or 'N/A')
-    method=str(a.get('method') or 'N/A')
-    basis=str(a.get('basis') or 'N/A')
-    normal=bool(a.get('normal_termination'))
-    status='NORMAL TERMINATION' if normal else 'TERMINATION NOT CONFIRMED'
-
-    doc=SimpleDocTemplate(
-        pdf_path, pagesize=A4,
-        rightMargin=1.45*cm, leftMargin=1.45*cm,
-        topMargin=1.45*cm, bottomMargin=1.45*cm,
-        title='Computational Chemistry Analysis Report',
-        author='ChemBot'
-    )
-
-    def esc(x):
-        return str(x if x is not None else '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-
-    def cell(x, style=body):
-        return Paragraph(esc(x), style)
-
-    def section_title(label):
-        return [Spacer(1,3), Paragraph(label, h1), HRFlowable(width='100%', thickness=0.6, color=MID, spaceAfter=5)]
-
-    def styled_table(rows, widths=None, header=True, font_size=7.7):
-        converted=[]
-        for ridx,row in enumerate(rows):
-            st = small if ridx or not header else ParagraphStyle(
-                'TmpHdr', parent=small, fontName='Helvetica-Bold',
-                textColor=colors.white, fontSize=7.5, leading=9
-            )
-            converted.append([cell(v, st) for v in row])
-        t=LongTable(converted, colWidths=widths, repeatRows=1 if header else 0, hAlign='LEFT')
-        commands=[
-            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-            ('LEFTPADDING',(0,0),(-1,-1),5),
-            ('RIGHTPADDING',(0,0),(-1,-1),5),
-            ('TOPPADDING',(0,0),(-1,-1),3.5),
-            ('BOTTOMPADDING',(0,0),(-1,-1),3.5),
-            ('GRID',(0,0),(-1,-1),0.25,MID),
-            ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
-            ('FONTSIZE',(0,0),(-1,-1),font_size),
-        ]
-        if header:
-            commands += [
-                ('BACKGROUND',(0,0),(-1,0),NAVY),
-                ('TEXTCOLOR',(0,0),(-1,0),colors.white),
-                ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-            ]
-            first_data=1
-        else:
-            first_data=0
-        for r in range(first_data, len(rows)):
-            if (r-first_data) % 2:
-                commands.append(('BACKGROUND',(0,r),(-1,r),LIGHT))
-        t.setStyle(TableStyle(commands))
-        return t
-
-    def metric_rows():
-        e=a.get('energies',{}) or {}
-        t=a.get('thermochemistry',{}) or {}
-        o=a.get('orbitals',{}) or {}
-        d=a.get('dipole',{}) or {}
-        timing=a.get('timings',{}) or {}
-        vals=[
-            ('Final electronic energy', _report_fmt(e.get('final_energy_hartree'), 10, ' Eh')),
-            ('Gibbs free energy', _report_fmt(t.get('gibbs_hartree'), 10, ' Eh')),
-            ('HOMO', _report_fmt(o.get('homo_ev'), 4, ' eV')),
-            ('LUMO', _report_fmt(o.get('lumo_ev'), 4, ' eV')),
-            ('HOMO-LUMO gap', _report_fmt(o.get('gap_ev'), 4, ' eV')),
-            ('Dipole magnitude', _report_fmt(d.get('magnitude_debye'), 4, ' D')),
-            ('Runtime', _format_runtime(timing.get('wall_seconds'))),
-        ]
-        return [(k,v) for k,v in vals if not v.startswith('N/A')]
-
-    def add_figure(story, key, label, note=None, max_h=10.3*cm):
-        path=plots.get(key)
-        if not path or not os.path.exists(path):
-            return
-        im=Image(path)
-        max_w=17.0*cm
-        scale=min(max_w/float(im.imageWidth), max_h/float(im.imageHeight))
-        im.drawWidth=im.imageWidth*scale
-        im.drawHeight=im.imageHeight*scale
-        story.append(KeepTogether([
-            Spacer(1,5), im,
-            Paragraph(label + (f' {note}' if note else ''), caption)
-        ]))
-
-    def page_frame(canvas, doc_obj):
-        canvas.saveState()
-        w,h=A4
-        canvas.setStrokeColor(MID)
-        canvas.setLineWidth(0.4)
-        canvas.line(doc_obj.leftMargin, h-0.78*cm, w-doc_obj.rightMargin, h-0.78*cm)
-        canvas.setFont('Helvetica', 7)
-        canvas.setFillColor(SLATE)
-        canvas.drawString(doc_obj.leftMargin, h-0.60*cm, 'ChemBot computational chemistry analysis')
-        right=f'{engine} {version}'
-        canvas.drawRightString(w-doc_obj.rightMargin, h-0.60*cm, right[:55])
-        canvas.line(doc_obj.leftMargin, 0.72*cm, w-doc_obj.rightMargin, 0.72*cm)
-        canvas.drawString(doc_obj.leftMargin, 0.45*cm, filename[:68])
-        canvas.drawRightString(w-doc_obj.rightMargin, 0.45*cm, f'Page {doc_obj.page}')
-        canvas.restoreState()
-
-    story=[]
-    story += [
-        Paragraph('Computational Chemistry Analysis Report', title_style),
-        Paragraph(
-            f'<b>File:</b> {esc(filename)} &nbsp;&nbsp; | &nbsp;&nbsp; '
-            f'<b>Report engine:</b> ChemBot {REPORT_GENERATOR_VERSION}',
-            subtitle_style
-        ),
-    ]
-
-    status_color = GREEN if normal else RED
-    status_tab=Table(
-        [[Paragraph(f'<b>{status}</b>', ParagraphStyle(
-            'StatusText', parent=body, fontName='Helvetica-Bold',
-            fontSize=9.2, textColor=colors.white, alignment=TA_CENTER
-        ))]],
-        colWidths=[17.0*cm], rowHeights=[0.70*cm]
-    )
-    status_tab.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,-1),status_color),
-        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-        ('BOX',(0,0),(-1,-1),0,status_color),
-    ]))
-    story += [status_tab, Spacer(1,8)]
-
-    sysinfo=a.get('system',{}) or {}
-    meta_rows=[
-        ['Engine', engine, 'Version', version],
-        ['Method', method, 'Basis', basis],
-        ['Charge', sysinfo.get('charge','N/A'), 'Multiplicity', sysinfo.get('multiplicity','N/A')],
-        ['Atoms', len(a.get('final_geometry',[]) or []) or 'N/A', 'Runtime', _format_runtime((a.get('timings',{}) or {}).get('wall_seconds'))],
-    ]
-    mt=Table([[cell(x, body) for x in r] for r in meta_rows],
-             colWidths=[2.5*cm,6.0*cm,2.5*cm,6.0*cm])
-    mt.setStyle(TableStyle([
-        ('GRID',(0,0),(-1,-1),0.25,MID),
-        ('BACKGROUND',(0,0),(0,-1),LIGHT),
-        ('BACKGROUND',(2,0),(2,-1),LIGHT),
-        ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
-        ('FONTNAME',(0,0),(0,-1),'Helvetica-Bold'),
-        ('FONTNAME',(2,0),(2,-1),'Helvetica-Bold'),
-        ('FONTSIZE',(0,0),(-1,-1),8),
-        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-        ('LEFTPADDING',(0,0),(-1,-1),5),
-        ('TOPPADDING',(0,0),(-1,-1),4),
-        ('BOTTOMPADDING',(0,0),(-1,-1),4),
-    ]))
-    story += [mt]
-
-    story += section_title('Key results')
-    metrics=metric_rows()
-    if metrics:
-        rows=[['Quantity','Value']] + [[k,v] for k,v in metrics]
-        story += [styled_table(rows,[8.5*cm,8.5*cm]), Spacer(1,5)]
-
-    # Calculation quality / frequency diagnostic
-    freqs=[float(x) for x in (a.get('frequencies_cm1',[]) or []) if x is not None]
-    imag_strict=[x for x in freqs if x < -5.0]
-    near_zero=[x for x in freqs if abs(x) < 5.0]
-    positive=[x for x in freqs if x >= 5.0]
-    if freqs:
-        diag_rows=[
-            ['Frequency diagnostic','Value'],
-            ['Normal-mode entries parsed', str(len(freqs))],
-            ['Near-zero modes (|nu| < 5 cm-1)', str(len(near_zero))],
-            ['Imaginary modes (nu < -5 cm-1)', str(len(imag_strict))],
-            ['Positive modes (nu >= 5 cm-1)', str(len(positive))],
-        ]
-        story += [Paragraph(
-            'Frequency counts are reported separately so translational/rotational near-zero entries are not mislabeled as vibrational modes.',
-            small
-        ), Spacer(1,4), styled_table(diag_rows,[11.5*cm,5.5*cm])]
-
-    # Energies and thermochemistry
-    story += section_title('Energetics and thermochemistry')
-    e=a.get('energies',{}) or {}
-    t=a.get('thermochemistry',{}) or {}
-    energy_rows=[['Quantity','Value','Unit']]
-    if e.get('final_energy_hartree') is not None:
-        energy_rows.append(['Final electronic energy', _report_fmt(e['final_energy_hartree'],10), 'Eh'])
-    thermo_map=[
-        ('temperature_K','Temperature','K',4),
-        ('pressure_atm','Pressure','atm',4),
-        ('zpe_hartree','Zero-point energy','Eh',8),
-        ('thermal_energy_correction_hartree','Thermal energy correction','Eh',8),
-        ('enthalpy_correction_hartree','Enthalpy correction','Eh',8),
-        ('gibbs_correction_hartree','Gibbs correction','Eh',8),
-        ('enthalpy_hartree','Total enthalpy','Eh',10),
-        ('gibbs_hartree','Gibbs free energy','Eh',10),
-        ('entropy_J_mol_K','Entropy','J mol-1 K-1',5),
-    ]
-    for key,label,unit,dig in thermo_map:
-        if t.get(key) is not None:
-            energy_rows.append([label,_report_fmt(t[key],dig),unit])
-    if len(energy_rows)>1:
-        story += [styled_table(energy_rows,[9.0*cm,4.5*cm,3.5*cm])]
-    add_figure(story,'optimization','Figure: optimization energy profile. Energies are shown relative to the minimum parsed optimization energy.')
-
-    # Vibrational analysis
-    if freqs or a.get('ir_spectrum') or a.get('raman_spectrum'):
-        story += section_title('Vibrational spectroscopy')
-        vib_rows=[['Metric','Value']]
-        if freqs:
-            vib_rows += [
-                ['Normal-mode entries parsed', str(len(freqs))],
-                ['Near-zero modes (|nu| < 5 cm-1)', str(len(near_zero))],
-                ['Imaginary modes (nu < -5 cm-1)', str(len(imag_strict))],
-                ['Lowest non-zero mode', _report_fmt(min(positive) if positive else None,2,' cm-1')],
-                ['Highest mode', _report_fmt(max(freqs) if freqs else None,2,' cm-1')],
-            ]
-        story += [styled_table(vib_rows,[11.0*cm,6.0*cm])]
-        if imag_strict:
-            story += [Spacer(1,4), Paragraph(
-                '<b>Imaginary frequencies:</b> ' + ', '.join(f'{x:.2f} cm-1' for x in imag_strict[:20]),
-                small
-            )]
-
-        ir=a.get('ir_spectrum',[]) or []
-        ir_clean=[]
-        for pair in ir:
-            try:
-                f=float(pair[0]); inten=abs(float(pair[1] or 0.0))
-            except Exception:
-                continue
-            if f>0:
-                ir_clean.append((f,inten))
-        if ir_clean:
-            ranked=sorted(ir_clean,key=lambda q:q[1],reverse=True)[:12]
-            mx=max([x[1] for x in ir_clean] or [1.0])
-            peak_rows=[['Frequency (cm-1)','Relative intensity (%)']]
-            for f,inten in ranked:
-                peak_rows.append([f'{f:.2f}', f'{100.0*inten/mx:.1f}' if mx>0 else '0.0'])
-            story += [Spacer(1,6), Paragraph('Strongest calculated IR bands',h2),
-                      styled_table(peak_rows,[8.5*cm,8.5*cm])]
-        add_figure(
-            story,'ir',
-            'Figure: simulated FT-IR-like profile.',
-            'The y-axis is a normalized transmittance-like visualization derived from calculated intensities; it is not experimental %T.'
-        )
-        add_figure(story,'raman','Figure: calculated Raman spectrum.')
-
-    # TD-DFT
-    td=a.get('tddft_states',[]) or []
-    if td:
-        story += section_title('Electronic excitations / TD-DFT')
-        rows=[['State','Energy (eV)','Wavelength (nm)','Oscillator strength']]
-        for s in td[:30]:
-            rows.append([
-                s.get('state',''),
-                _report_fmt(s.get('ev'),4),
-                _report_fmt(s.get('nm'),2),
-                _report_fmt(s.get('f'),6),
-            ])
-        story += [styled_table(rows,[2.2*cm,4.2*cm,4.5*cm,6.1*cm])]
-        if len(td)>30:
-            story += [Paragraph(f'First 30 of {len(td)} parsed excited states are shown.', small)]
-        add_figure(story,'uvvis','Figure: simulated UV-Vis spectrum from parsed TD-DFT transitions.')
-
-    # Orbitals
-    orb=a.get('orbitals',{}) or {}
-    arr=orb.get('orbitals',[]) or []
-    if arr or orb.get('homo_ev') is not None:
-        story += section_title('Frontier orbital energies')
-        fr=[['Quantity','Energy (eV)']]
-        if orb.get('homo_ev') is not None: fr.append(['HOMO',_report_fmt(orb.get('homo_ev'),5)])
-        if orb.get('lumo_ev') is not None: fr.append(['LUMO',_report_fmt(orb.get('lumo_ev'),5)])
-        if orb.get('gap_ev') is not None: fr.append(['HOMO-LUMO orbital-energy gap',_report_fmt(orb.get('gap_ev'),5)])
-        story += [styled_table(fr,[11.0*cm,6.0*cm])]
-        desc=a.get('conceptual_dft',{}) or {}
-        if desc:
-            drows=[['Conceptual-DFT descriptor','Value']]
-            descriptor_labels=[
-                ('ionization_potential_ev','Ionization potential, I',' eV'),
-                ('electron_affinity_ev','Electron affinity, A',' eV'),
-                ('chemical_hardness_ev','Chemical hardness, eta',' eV'),
-                ('chemical_potential_ev','Chemical potential, mu',' eV'),
-                ('electronegativity_ev','Electronegativity, chi',' eV'),
-                ('chemical_softness_ev','Chemical softness, S',' eV^-1'),
-                ('electrophilicity_index_ev','Electrophilicity index, omega',' eV'),
-                ('electrodonating_power_ev','Electrodonating power, omega-',' eV'),
-                ('electroaccepting_power_ev','Electroaccepting power, omega+',' eV'),
-                ('net_electrophilicity_ev','Net electrophilicity, Delta omega',' eV'),
-            ]
-            for key,label,suffix in descriptor_labels:
-                if desc.get(key) is not None:
-                    drows.append([label,_report_fmt(desc.get(key),6,suffix)])
-            if len(drows)>1:
-                story += [Spacer(1,6),Paragraph('Conceptual DFT descriptors',h2),styled_table(drows,[11.0*cm,6.0*cm]),
-                          Paragraph('Frontier-orbital approximations using the same Koopmans/Parr-Pearson definitions implemented by ORCA_ENGINE.',small)]
-        if arr:
-            frontier=_frontier_orbital_records_v62(orb,per_side=6)
-            rows=[['Spin','Label','Index','Occ.','Energy (Eh)','Energy (eV)']]
-            for spin,label,z in frontier:
-                rows.append([spin,label,z.get('index',''),_report_fmt(z.get('occ'),2),_report_fmt(z.get('eh'),7),_report_fmt(z.get('ev'),5)])
-            story += [Spacer(1,6), Paragraph('Frontier orbital window',h2),
-                      styled_table(rows,[2.4*cm,2.6*cm,1.5*cm,1.5*cm,4.5*cm,4.5*cm])]
-        add_figure(
-            story,'orbitals',
-            'Figure: frontier orbital energy-level diagram.',
-            'This is an energy diagram from printed orbital data, not a 3D orbital isosurface; the gap is not an excitation energy.'
-        )
-
-    # Molecular properties
-    d=a.get('dipole',{}) or {}
-    charges=a.get('atomic_charges',[]) or []
-    geom=a.get('final_geometry',[]) or []
-    if d or charges or geom:
-        story += section_title('Molecular properties')
-        prop=[['Property','Value']]
-        if sysinfo.get('charge') is not None: prop.append(['Total charge',str(sysinfo.get('charge'))])
-        if sysinfo.get('multiplicity') is not None: prop.append(['Multiplicity',str(sysinfo.get('multiplicity'))])
-        if d.get('magnitude_debye') is not None: prop.append(['Dipole magnitude',_report_fmt(d.get('magnitude_debye'),5,' D')])
-        if geom: prop.append(['Atoms in final Cartesian geometry',str(len(geom))])
-        if charges: prop.append(['Atomic charges parsed',str(len(charges))])
-        story += [styled_table(prop,[10.5*cm,6.5*cm])]
-
-    # Diagnostics
-    story += section_title('Diagnostics')
-    errs=a.get('errors',[]) or []
-    diag=[
-        ['Check','Result'],
-        ['Normal termination detected','Yes' if normal else 'No'],
-        ['Process return code',str(a.get('process_returncode','N/A'))],
-        ['Parsed warning/error lines',str(len(errs))],
-        ['Report generator',REPORT_GENERATOR_VERSION],
-    ]
-    story += [styled_table(diag,[11.5*cm,5.5*cm])]
-    if errs:
-        story += [Spacer(1,5), Paragraph('Last detected diagnostic lines',h2)]
-        for line in errs[-12:]:
-            story.append(Paragraph(esc(line), mono))
-
-    # Appendices for full machine-readable details
-    if charges or geom or arr:
-        story.append(PageBreak())
-        story += section_title('Appendix - detailed numerical data')
-
-    if charges:
-        story += [Paragraph('Atomic charges',h2)]
-        rows=[['Index','Atom','Charge']]
-        for x in charges:
-            rows.append([x.get('index',''),x.get('element',''),_report_fmt(x.get('charge'),7)])
-        story += [styled_table(rows,[3.0*cm,4.0*cm,10.0*cm])]
-
-    if geom:
-        story += [Spacer(1,8), Paragraph('Final Cartesian geometry (Angstrom)',h2)]
-        rows=[['Atom','X','Y','Z']]
-        for x in geom:
-            rows.append([
-                x.get('element',''),
-                _report_fmt(x.get('x'),7),
-                _report_fmt(x.get('y'),7),
-                _report_fmt(x.get('z'),7),
-            ])
-        story += [styled_table(rows,[3.0*cm,4.65*cm,4.65*cm,4.65*cm])]
-
-    if arr:
-        story += [Spacer(1,8), Paragraph('Orbital energies - frontier-centered extract',h2)]
-        occ=[z for z in arr if (z.get('occ') or 0)>1e-8]
-        vir=[z for z in arr if (z.get('occ') or 0)<=1e-8]
-        appendix_arr=(occ[-20:] if occ else []) + (vir[:20] if vir else [])
-        rows=[['Index','Spin','Occ.','Energy (Eh)','Energy (eV)']]
-        for z in appendix_arr:
-            rows.append([
-                z.get('index',''), z.get('spin','restricted'),
-                _report_fmt(z.get('occ'),3), _report_fmt(z.get('eh'),8), _report_fmt(z.get('ev'),6)
-            ])
-        story += [styled_table(rows,[2.0*cm,3.5*cm,2.0*cm,4.8*cm,4.8*cm])]
-        if len(arr)>len(appendix_arr):
-            story += [Paragraph(
-                f'This appendix shows {len(appendix_arr)} frontier-centered orbitals out of {len(arr)} parsed orbitals. '
-                'The complete parsed dataset is preserved in analysis.json.',
-                small
-            )]
-
-    doc.build(story, onFirstPage=page_frame, onLaterPages=page_frame)
-    return pdf_path
 
 
-def generate_report_bundle(a, outdir, base_name=None):
-    """Canonical report bundle used identically by local Telegram analysis and Kaggle."""
-    os.makedirs(outdir, exist_ok=True)
-    base=(base_name or Path(str(a.get('filename') or 'calculation')).stem).strip() or 'calculation'
-    plots=make_plots(a,outdir)
-    pdf_path=os.path.join(outdir,base+'_analysis_report.pdf')
-    build_pdf(a,plots,pdf_path)
 
-    enriched=dict(a)
-    enriched['report_generator_version']=REPORT_GENERATOR_VERSION
-    analysis_path=os.path.join(outdir,'analysis.json')
-    with open(analysis_path,'w',encoding='utf-8') as fh:
-        json.dump(enriched,fh,indent=2,ensure_ascii=False)
 
-    manifest={
-        'report_generator_version': REPORT_GENERATOR_VERSION,
-        'filename': a.get('filename'),
-        'engine': a.get('engine'),
-        'pdf': os.path.basename(pdf_path),
-        'pdf_sha256': _pdf_sha256(pdf_path),
-        'plots': {k: os.path.basename(v) for k,v in plots.items() if v and os.path.exists(v)},
-    }
-    manifest_path=os.path.join(outdir,'report_manifest.json')
-    with open(manifest_path,'w',encoding='utf-8') as fh:
-        json.dump(manifest,fh,indent=2,ensure_ascii=False)
 
-    return {
-        'plots':plots,
-        'pdf':pdf_path,
-        'analysis_json':analysis_path,
-        'manifest':manifest_path,
-        'version':REPORT_GENERATOR_VERSION,
-    }
 
-'''
-
-# ============================================================
-# v4.1 scientific parser hardening
-# ORCA patterns align to chemistry-web-lab/orca_engine RegexLibrary.
-# Psi4 parsing is independent and follows native Psi4 output tables.
-# ============================================================
-ANALYZER_V41_PATCH_CODE = r'''
 FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
 
 def detect_engine(text):
@@ -2201,7 +1316,7 @@ def _orca_parse_one_job(text, filename):
     homo = occupied[-1]['ev'] if occupied else None
     lumo = virtual[0]['ev'] if virtual else None
     orb = {
-        'orbitals': orbitals_all[-500:],
+        'orbitals': orbitals_all,
         'homo_ev': homo,
         'lumo_ev': lumo,
         'gap_ev': (lumo - homo) if homo is not None and lumo is not None else None,
@@ -2253,13 +1368,13 @@ def _orca_parse_one_job(text, filename):
         'energies': energies,
         'optimization_energies': optimization_energies[-500:],
         'thermochemistry': thermo,
-        'frequencies_cm1': freqs[-5000:],
-        'imaginary_frequencies_cm1': imag[-5000:],
+        'frequencies_cm1': freqs,
+        'imaginary_frequencies_cm1': imag,
         'expected_frequency_count': expected,
         'stationary_point_status': sp_status,
         'thermochemistry_reliability': thermo_rel,
-        'ir_spectrum': ir[-5000:],
-        'tddft_states': td[:5000],
+        'ir_spectrum': ir,
+        'tddft_states': td,
         'orbitals': orb,
         'dipole': dipole,
         'atomic_charges': atomic_charges,
@@ -2552,93 +1667,10 @@ def parse_output_text(text, filename='calculation.out'):
         result = {'filename':filename,'engine':eng,'version':detect_version(text,eng),'normal_termination':normal,'errors':errors,'method':method,'basis':basis,'energies':parse_energies(text,eng),'optimization_energies':parse_optimization(text,eng),'thermochemistry':parse_thermo(text,eng),'frequencies_cm1':freqs,'imaginary_frequencies_cm1':[x for x in freqs if x<0],'ir_spectrum':ir,'tddft_states':parse_tddft(text,eng),'orbitals':parse_orbitals(text,eng),'dipole':parse_dipole(text),'atomic_charges':parse_atomic_charges(text),'final_geometry':parse_final_geometry(text),'raman_spectrum':parse_raman(text),'system':parse_charge_mult(text),'timings':parse_timings(text,eng)}
     return _normalize_analysis_schema(result)
 
-def _gaussian_curve(points, xmin=None, xmax=None, sigma=10.0, normalize=True, n=3000):
-    import numpy as np
-    if not points: return None,None
-    xs=[float(x) for x,y in points if x is not None and y is not None]
-    if not xs: return None,None
-    lo=xmin if xmin is not None else min(xs)-6*sigma; hi=xmax if xmax is not None else max(xs)+6*sigma
-    grid=np.linspace(lo,hi,n); yy=np.zeros_like(grid)
-    for x,y in points: yy += max(0.0,float(y or 0.0))*np.exp(-0.5*((grid-float(x))/sigma)**2)
-    if normalize and yy.max()>0: yy=yy/yy.max()
-    return grid,yy
 
-def make_overlay_plot(analyses, kind, outpath, normalize=True, sigma=None):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import numpy as np
 
-    fig=plt.figure(figsize=(10,6))
-    ax=fig.add_subplot(111)
-    used=0
 
-    if kind=='uv':
-        sigma=10.0 if sigma is None else float(sigma)
-        pts_all=[]
-        for a in analyses:
-            pts=[(float(s.get('nm')), max(0.0, float(s.get('f') or 0.0))) for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
-            if pts:
-                pts_all.extend(pts)
-        if not pts_all:
-            plt.close(fig)
-            return None
-        allnm=[p[0] for p in pts_all]
-        lo=max(150.0,min(allnm)-60.0)
-        hi=min(1200.0,max(allnm)+60.0)
-        for a in analyses:
-            pts=[(float(s.get('nm')), max(0.0, float(s.get('f') or 0.0))) for s in a.get('tddft_states',[]) if s.get('nm') and s.get('f') is not None]
-            if not pts:
-                continue
-            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=normalize,n=3000)
-            ax.plot(x,y,lw=1.8,label=Path(a.get('filename','spectrum')).stem)
-            used+=1
-        ax.set_xlim(lo,hi)
-        ax.set_xlabel('Wavelength (nm)')
-        ax.set_ylabel('Relative intensity' if normalize else 'Oscillator-strength weighted intensity')
-        ax.set_title('TD-DFT / UV-Vis overlay')
-        ax.set_ylim(bottom=0)
-    else:
-        sigma=16.0 if sigma is None else float(sigma)
-        pool=[]
-        for a in analyses:
-            pts=[(float(x), abs(float(y or 0.0))) for x,y in a.get('ir_spectrum',[]) if x is not None and float(x)>0]
-            if pts:
-                pool.extend(pts)
-        if not pool:
-            plt.close(fig)
-            return None
-        pool_mid=[(f,i) for f,i in pool if 400.0 <= f <= 4000.0]
-        use_pool = pool_mid if pool_mid else pool
-        lo=400.0 if any(400.0 <= f <= 4000.0 for f,_ in use_pool) else max(0.0, min(f for f,_ in use_pool)-80.0)
-        hi=4000.0 if any(400.0 <= f <= 4000.0 for f,_ in use_pool) else max(f for f,_ in use_pool)+80.0
-        for a in analyses:
-            pts=[(float(x), abs(float(y or 0.0))) for x,y in a.get('ir_spectrum',[]) if x is not None and float(x)>0]
-            pts=[(f,i) for f,i in pts if lo <= f <= hi]
-            if not pts:
-                continue
-            x,y=_gaussian_curve(pts,lo,hi,sigma=sigma,normalize=True,n=3600)
-            trans = 100.0 - 92.0 * y
-            ax.plot(x,trans,lw=1.5,label=Path(a.get('filename','spectrum')).stem)
-            used+=1
-        ax.set_xlim(hi,lo)
-        ax.set_xlabel('Wavenumber (cm$^{-1}$)')
-        ax.set_ylabel('Transmittance (%)')
-        ax.set_title('Simulated FT-IR overlay')
-        ax.set_ylim(0,102)
-    if used<2:
-        plt.close(fig)
-        return None
-    ax.legend(fontsize=8, frameon=False)
-    ax.grid(alpha=.18)
-    fig.tight_layout()
-    fig.savefig(outpath,dpi=300,bbox_inches='tight')
-    plt.close(fig)
-    return outpath
-'''
-
-# v5.8 analyzer additions
-ANALYZER_V58_PATCH_CODE = r'''def conceptual_dft_descriptors(a):
+def conceptual_dft_descriptors(a):
     # ORCA_ENGINE-compatible frontier-orbital descriptors.
     o=(a or {}).get('orbitals',{}) or {}
     h=o.get('homo_ev'); l=o.get('lumo_ev')
@@ -2696,57 +1728,10 @@ def section_orbitals(a):
         if d.get(k) is not None: rows.append(f'{label}: {float(d[k]):.8f} {unit}')
     return txt+'\n'+'\n'.join(rows)
 
-_make_plots_v57=make_plots
-def make_plots(a,outdir):
-    made=_make_plots_v57(a,outdir)
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    o=(a.get('orbitals') or {}).get('orbitals',[]) or []
-    cleaned=[z for z in o if z.get('ev') is not None]
-    occ=[z for z in cleaned if (z.get('occ') or 0.0)>1e-8]
-    vir=[z for z in cleaned if (z.get('occ') or 0.0)<=1e-8]
-    if not occ or not vir: return made
-    # Publication-style plot: emphasize only HOMO and LUMO labels to avoid overlap.
-    show_occ=occ[-3:]; show_vir=vir[:3]; homo=occ[-1]; lumo=vir[0]
-    p=os.path.join(outdir,'orbital_energies.png')
-    fig,ax=plt.subplots(figsize=(7.2,6.0))
-    for z in show_occ[:-1]:
-        ax.hlines(float(z['ev']),-0.34,-0.12,lw=1.2)
-    ax.hlines(float(homo['ev']),-0.34,-0.12,lw=2.5)
-    for z in show_vir[1:]:
-        ax.hlines(float(z['ev']),0.12,0.34,lw=1.2)
-    ax.hlines(float(lumo['ev']),0.12,0.34,lw=2.5)
 
-    yh=float(homo['ev']); yl=float(lumo['ev']); gap=yl-yh
-    ax.annotate('HOMO', xy=(-0.34,yh), xytext=(-0.50,yh), ha='right', va='center', fontsize=9.0,
-                arrowprops=dict(arrowstyle='-', lw=.55, shrinkA=0, shrinkB=0))
-    ax.text(-0.50, yh-0.03*max(1.0,abs(yh)), f'{yh:.2f} eV', ha='right', va='top', fontsize=8.0)
-    ax.annotate('LUMO', xy=(0.34,yl), xytext=(0.50,yl), ha='left', va='center', fontsize=9.0,
-                arrowprops=dict(arrowstyle='-', lw=.55, shrinkA=0, shrinkB=0))
-    ax.text(0.50, yl-0.03*max(1.0,abs(yl)), f'{yl:.2f} eV', ha='left', va='top', fontsize=8.0)
 
-    if len(show_occ) >= 2:
-        ax.text(-0.50, float(show_occ[-2]['ev']), 'HOMO-1', ha='right', va='center', fontsize=7.3, alpha=0.85)
-    if len(show_vir) >= 2:
-        ax.text(0.50, float(show_vir[1]['ev']), 'LUMO+1', ha='left', va='center', fontsize=7.3, alpha=0.85)
 
-    ax.annotate('',xy=(0.0,yl),xytext=(0.0,yh),arrowprops=dict(arrowstyle='<->',lw=1.1))
-    ax.text(0.03,(yh+yl)/2.0,f'gap = {gap:.2f} eV',va='center',ha='left',fontsize=8.5)
-    ys=[float(z['ev']) for z in show_occ+show_vir]
-    ymin,ymax=min(ys),max(ys); pad=max(.75,.18*(ymax-ymin if ymax>ymin else 1.0))
-    ax.set_xlim(-0.78,0.78); ax.set_ylim(ymin-pad,ymax+pad)
-    ax.set_xticks([-0.21,0.21]); ax.set_xticklabels(['Occupied','Virtual'])
-    ax.set_ylabel('Orbital energy (eV)'); ax.set_title('Frontier molecular orbital energy levels')
-    ax.grid(axis='y',alpha=.12)
-    fig.tight_layout(); fig.savefig(p,dpi=600,bbox_inches='tight'); plt.close(fig)
-    made['orbitals']=p
-    return made
 
-'''
-
-# v5.9 Psi4 parser/report hardening
-ANALYZER_V59_PATCH_CODE = r'''
 def _psi4_last_match(text, patterns):
     for rx in patterns:
         ms=list(re.finditer(rx,text,re.I|re.M))
@@ -2868,7 +1853,7 @@ def _psi4_orbitals_v59(text):
 
     occs=[x for x in orbitals if (x.get('occ') or 0)>1e-8]
     virs=[x for x in orbitals if (x.get('occ') or 0)<=1e-8]
-    out={'orbitals':orbitals[-1000:]}
+    out={'orbitals':orbitals}
     if occs:
         out['homo_ev']=max(occs,key=lambda z:z['ev'])['ev']
     if virs:
@@ -3054,145 +2039,10 @@ def parse_output_text(text,filename='output.out'):
         a=_parse_psi4_precise_v59(text,filename); a['conceptual_dft']=conceptual_dft_descriptors(a); return a
     return _parse_output_text_v58_for_v59(text,filename)
 
-_build_pdf_v58=build_pdf
-def _build_psi4_pdf_v59(a, plots, pdf_path):
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT, TA_CENTER
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether, LongTable, HRFlowable
-    NAVY=colors.HexColor('#17324D'); SLATE=colors.HexColor('#4B5D6B'); LIGHT=colors.HexColor('#F3F6F8'); MID=colors.HexColor('#D9E1E7'); GREEN=colors.HexColor('#1F7A4D'); RED=colors.HexColor('#A33A32'); TEXT=colors.HexColor('#202830')
-    styles=getSampleStyleSheet()
-    title=ParagraphStyle('P9Title',parent=styles['Title'],fontName='Helvetica-Bold',fontSize=18.5,leading=22,textColor=NAVY,alignment=TA_LEFT,spaceAfter=4)
-    sub=ParagraphStyle('P9Sub',parent=styles['BodyText'],fontSize=8.3,leading=10.5,textColor=SLATE,spaceAfter=8)
-    h1=ParagraphStyle('P9H1',parent=styles['Heading2'],fontName='Helvetica-Bold',fontSize=12,leading=14.5,textColor=NAVY,spaceBefore=9,spaceAfter=4)
-    h2=ParagraphStyle('P9H2',parent=styles['Heading3'],fontName='Helvetica-Bold',fontSize=9.6,leading=11.5,textColor=SLATE,spaceBefore=5,spaceAfter=3)
-    body=ParagraphStyle('P9Body',parent=styles['BodyText'],fontSize=8.4,leading=10.8,textColor=TEXT)
-    small=ParagraphStyle('P9Small',parent=body,fontSize=7.2,leading=9.1,textColor=SLATE)
-    cap=ParagraphStyle('P9Cap',parent=small,alignment=TA_CENTER,spaceBefore=3,spaceAfter=6)
-    mono=ParagraphStyle('P9Mono',parent=body,fontName='Courier',fontSize=6.7,leading=8.2)
-    filename=str(a.get('filename') or 'psi4.out'); version=str(a.get('version') or 'N/A'); normal=bool(a.get('normal_termination'))
-    doc=SimpleDocTemplate(pdf_path,pagesize=A4,rightMargin=1.4*cm,leftMargin=1.4*cm,topMargin=1.42*cm,bottomMargin=1.42*cm,title='Psi4 Computational Chemistry Analysis Report',author='ChemBot')
-    def esc(x): return str(x if x is not None else '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-    def cell(x,sty=body): return Paragraph(esc(x),sty)
-    def sec(txt): return [Spacer(1,3),Paragraph(txt,h1),HRFlowable(width='100%',thickness=.55,color=MID,spaceAfter=5)]
-    def table(rows,widths=None,header=True):
-        hh=ParagraphStyle('P9TH',parent=small,fontName='Helvetica-Bold',textColor=colors.white,fontSize=7.3,leading=8.7)
-        data=[[cell(v,hh if header and r==0 else small) for v in row] for r,row in enumerate(rows)]
-        t=LongTable(data,colWidths=widths,repeatRows=1 if header else 0,hAlign='LEFT')
-        cmds=[('VALIGN',(0,0),(-1,-1),'MIDDLE'),('GRID',(0,0),(-1,-1),.25,MID),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),3.4),('BOTTOMPADDING',(0,0),(-1,-1),3.4)]
-        if header: cmds += [('BACKGROUND',(0,0),(-1,0),NAVY),('TEXTCOLOR',(0,0),(-1,0),colors.white)]
-        first=1 if header else 0
-        for r in range(first,len(rows)):
-            if (r-first)%2: cmds.append(('BACKGROUND',(0,r),(-1,r),LIGHT))
-        t.setStyle(TableStyle(cmds)); return t
-    def fig(story,key,label,note=None,maxh=9.6*cm):
-        p=plots.get(key)
-        if not p or not os.path.exists(p): return
-        im=Image(p); scale=min(17*cm/im.imageWidth,maxh/im.imageHeight); im.drawWidth*=scale; im.drawHeight*=scale
-        story.append(KeepTogether([Spacer(1,5),im,Paragraph(label+((' '+note) if note else ''),cap)]))
-    def frame(canvas,d):
-        canvas.saveState(); w,h=A4; canvas.setStrokeColor(MID); canvas.setLineWidth(.35); canvas.line(d.leftMargin,h-.77*cm,w-d.rightMargin,h-.77*cm); canvas.line(d.leftMargin,.70*cm,w-d.rightMargin,.70*cm); canvas.setFont('Helvetica',7); canvas.setFillColor(SLATE); canvas.drawString(d.leftMargin,h-.59*cm,'ChemBot - Psi4 analysis'); canvas.drawRightString(w-d.rightMargin,h-.59*cm,f'Psi4 {version}'[:50]); canvas.drawString(d.leftMargin,.43*cm,filename[:70]); canvas.drawRightString(w-d.rightMargin,.43*cm,f'Page {d.page}'); canvas.restoreState()
-    e=a.get('energies',{}) or {}; t=a.get('thermochemistry',{}) or {}; o=a.get('orbitals',{}) or {}; d=a.get('dipole',{}) or {}; sysi=a.get('system',{}) or {}; det=a.get('psi4_details',{}) or {}
-    story=[Paragraph('Psi4 Computational Chemistry Analysis Report',title),Paragraph(f'<b>File:</b> {esc(filename)} &nbsp;&nbsp; | &nbsp;&nbsp; <b>Report engine:</b> ChemBot {REPORT_GENERATOR_VERSION}',sub)]
-    st='NORMAL TERMINATION' if normal else 'TERMINATION NOT CONFIRMED'; scol=GREEN if normal else RED
-    bar=Table([[Paragraph(f'<b>{st}</b>',ParagraphStyle('P9Status',parent=body,fontName='Helvetica-Bold',fontSize=9,textColor=colors.white,alignment=TA_CENTER))]],colWidths=[17*cm],rowHeights=[.68*cm]); bar.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),scol),('VALIGN',(0,0),(-1,-1),'MIDDLE')])); story += [bar,Spacer(1,8)]
-    meta=[['Engine','Psi4','Version',version],['Method',a.get('method') or 'N/A','Basis',a.get('basis') or 'N/A'],['Reference',det.get('reference') or 'N/A','Charge',sysi.get('charge','N/A')],['Multiplicity',sysi.get('multiplicity','N/A'),'Atoms',len(a.get('final_geometry',[]) or []) or 'N/A']]
-    story += [table(meta,[2.5*cm,6*cm,2.5*cm,6*cm],header=False)]
-    story += sec('Key results')
-    rows=[['Quantity','Value']]
-    for label,val in [('Final electronic energy',_report_fmt(e.get('final_energy_hartree'),10,' Eh')),('Gibbs free energy',_report_fmt(t.get('gibbs_hartree'),10,' Eh')),('Enthalpy',_report_fmt(t.get('enthalpy_hartree'),10,' Eh')),('HOMO',_report_fmt(o.get('homo_ev'),5,' eV')),('LUMO',_report_fmt(o.get('lumo_ev'),5,' eV')),('HOMO-LUMO gap',_report_fmt(o.get('gap_ev'),5,' eV')),('Dipole magnitude',_report_fmt(d.get('magnitude_debye'),5,' D')),('Runtime',_format_runtime((a.get('timings',{}) or {}).get('wall_seconds')) )]:
-        if not str(val).startswith('N/A'): rows.append([label,val])
-    story += [table(rows,[9*cm,8*cm])]
-    story += sec('Electronic structure and energy decomposition')
-    er=[['Quantity','Value','Unit']]
-    for k,lbl in [('final_energy_hartree','Final electronic energy'),('reference_energy_hartree','Reference / SCF energy'),('correlation_energy_hartree','Correlation energy'),('nuclear_repulsion_hartree','Nuclear repulsion energy')]:
-        if e.get(k) is not None: er.append([lbl,_report_fmt(e[k],10),'Eh'])
-    if len(er)>1: story += [table(er,[9.2*cm,4.6*cm,3.2*cm])]
-    fig(story,'optimization','Figure: optimization electronic-energy profile.','Values are displayed relative to the lowest parsed optimization energy.')
-    if t:
-        story += sec('Thermochemistry')
-        tr=[['Quantity','Value','Unit']]
-        for k,lbl,unit,dig in [('temperature_K','Temperature','K',3),('pressure_atm','Pressure','atm',5),('zpe_hartree','Zero-point vibrational energy','Eh',8),('energy_0K_hartree','Electronic + ZPE energy (0 K)','Eh',10),('internal_energy_hartree','Internal energy, U','Eh',10),('enthalpy_hartree','Enthalpy, H','Eh',10),('gibbs_hartree','Gibbs free energy, G','Eh',10),('entropy_J_mol_K','Entropy, S','J mol-1 K-1',5)]:
-            if t.get(k) is not None: tr.append([lbl,_report_fmt(t[k],dig),unit])
-        for k,lbl in [('thermal_energy_correction_hartree','Thermal energy correction'),('enthalpy_correction_hartree','Enthalpy correction'),('gibbs_correction_hartree','Gibbs correction')]:
-            if t.get(k) is not None: tr.append([lbl,_report_fmt(t[k],8),'Eh'])
-        story += [table(tr,[9.2*cm,4.6*cm,3.2*cm]),Paragraph('Thermodynamic totals are reported only when present in the Psi4 output or reconstructable from an explicitly printed electronic energy plus the corresponding Psi4 correction.',small)]
-    freqs=[float(x) for x in (a.get('frequencies_cm1',[]) or []) if x is not None]; imag=[x for x in freqs if x < -5.0]; nz=[x for x in freqs if abs(x)<5.0]; pos=[x for x in freqs if x>=5.0]
-    if freqs or a.get('ir_spectrum'):
-        story += sec('Vibrational analysis and IR spectroscopy')
-        vr=[['Diagnostic','Value'],['Stationary-point classification',a.get('stationary_point_status') or 'N/A'],['Thermochemistry reliability',a.get('thermochemistry_reliability') or 'N/A'],['Frequency entries parsed',len(freqs)],['Near-zero modes (|nu| < 5 cm-1)',len(nz)],['Imaginary modes (nu < -5 cm-1)',len(imag)],['Positive modes (nu >= 5 cm-1)',len(pos)]]
-        story += [table(vr,[11.3*cm,5.7*cm])]
-        if imag: story += [Paragraph('<b>Imaginary frequencies:</b> '+', '.join(f'{x:.2f} cm-1' for x in imag[:20]),small)]
-        clean=[]
-        for q in (a.get('ir_spectrum',[]) or []):
-            try:
-                f=float(q[0]); inten=abs(float(q[1] or 0))
-                if f>0: clean.append((f,inten))
-            except Exception: pass
-        if clean:
-            mx=max([v for _,v in clean] or [1]); pr=[['Frequency (cm-1)','IR intensity (km mol-1)','Relative (%)']]
-            for f,inten in sorted(clean,key=lambda z:z[1],reverse=True)[:15]: pr.append([f'{f:.2f}',f'{inten:.3f}',f'{100*inten/mx:.1f}' if mx else '0.0'])
-            story += [Spacer(1,5),Paragraph('Strongest calculated IR bands',h2),table(pr,[5.3*cm,6.0*cm,5.7*cm])]
-        fig(story,'ir','Figure: simulated FT-IR-like profile.','The curve is derived from Psi4 harmonic IR intensities; the transmittance-like scale is a visualization, not experimental percent transmittance.')
-    td=a.get('tddft_states',[]) or []
-    if td:
-        story += sec('Electronic excitations / TD-SCF')
-        rr=[['State','Energy (eV)','Wavelength (nm)','Oscillator strength']]
-        for s in td[:40]: rr.append([s.get('state',''),_report_fmt(s.get('ev'),5),_report_fmt(s.get('nm'),2),_report_fmt(s.get('f'),7)])
-        story += [table(rr,[2.2*cm,4.3*cm,4.7*cm,5.8*cm])]; fig(story,'uvvis','Figure: simulated UV-Vis profile from parsed Psi4 excited-state transitions.')
-    if o.get('homo_ev') is not None or (o.get('orbitals') or []):
-        story += sec('Frontier orbital energies')
-        fr=[['Quantity','Value']]
-        for lbl,k in [('HOMO','homo_ev'),('LUMO','lumo_ev'),('HOMO-LUMO orbital-energy gap','gap_ev'),('Alpha HOMO','alpha_homo_ev'),('Alpha LUMO','alpha_lumo_ev'),('Beta HOMO','beta_homo_ev'),('Beta LUMO','beta_lumo_ev')]:
-            if o.get(k) is not None: fr.append([lbl,_report_fmt(o[k],6,' eV')])
-        story += [table(fr,[10.8*cm,6.2*cm])]
-        desc=a.get('conceptual_dft',{}) or {}
-        if desc:
-            cr=[['Conceptual-DFT descriptor','Value']]
-            for k,lbl,unit in [('ionization_potential_ev','Ionization potential, I','eV'),('electron_affinity_ev','Electron affinity, A','eV'),('chemical_hardness_ev','Chemical hardness, eta','eV'),('chemical_potential_ev','Chemical potential, mu','eV'),('electronegativity_ev','Electronegativity, chi','eV'),('chemical_softness_ev','Chemical softness, S','eV^-1'),('electrophilicity_index_ev','Electrophilicity index, omega','eV'),('electrodonating_power_ev','Electrodonating power, omega-','eV'),('electroaccepting_power_ev','Electroaccepting power, omega+','eV'),('net_electrophilicity_ev','Net electrophilicity, Delta omega','eV')]:
-                if desc.get(k) is not None: cr.append([lbl,_report_fmt(desc[k],6,' '+unit)])
-            story += [Spacer(1,5),Paragraph('Conceptual DFT descriptors',h2),table(cr,[11*cm,6*cm]),Paragraph('These are frontier-orbital approximations. For unrestricted wavefunctions, inspect the alpha/beta frontier levels before interpreting a single combined gap.',small)]
-        fig(story,'orbitals','Figure: frontier orbital energy-level diagram.','This is not a 3D orbital isosurface; the gap is not an electronic excitation energy.')
-    charges=a.get('atomic_charges',[]) or []; geom=a.get('final_geometry',[]) or []
-    if d or charges or geom:
-        story += sec('Molecular properties')
-        pr=[['Property','Value']]
-        if d.get('magnitude_debye') is not None: pr.append(['Dipole magnitude',_report_fmt(d['magnitude_debye'],6,' D')])
-        if d.get('vector') and len(d['vector'])>=3: pr.append(['Dipole vector (X, Y, Z)','; '.join(_report_fmt(v,6) for v in d['vector'][:3])+' D'])
-        if charges: pr.append(['Mulliken atomic charges parsed',len(charges)])
-        if geom: pr.append(['Atoms in final geometry',len(geom)])
-        story += [table(pr,[10.6*cm,6.4*cm])]
-    story += sec('Calculation diagnostics')
-    errs=a.get('errors',[]) or []
-    dr=[['Check','Result'],['Psi4 normal termination','Yes' if normal else 'No'],['Stationary point',a.get('stationary_point_status') or 'N/A'],['Thermochemistry reliability',a.get('thermochemistry_reliability') or 'N/A'],['Process return code',a.get('process_returncode','N/A')],['Detected fatal/error lines',len(errs)],['Report generator',REPORT_GENERATOR_VERSION]]
-    story += [table(dr,[11.4*cm,5.6*cm])]
-    if errs:
-        story += [Spacer(1,4),Paragraph('Last diagnostic lines',h2)]
-        for line in errs[-12:]: story.append(Paragraph(esc(line),mono))
-    orbarr=o.get('orbitals',[]) or []
-    if charges or geom or orbarr: story += [PageBreak()]+sec('Appendix - detailed numerical data')
-    if charges:
-        rr=[['Index','Atom','Mulliken charge']]+[[x.get('index',''),x.get('element',''),_report_fmt(x.get('charge'),8)] for x in charges]
-        story += [Paragraph('Mulliken atomic charges',h2),table(rr,[3*cm,4*cm,10*cm])]
-    if geom:
-        rr=[['Atom','X','Y','Z']]+[[x.get('element',''),_report_fmt(x.get('x'),7),_report_fmt(x.get('y'),7),_report_fmt(x.get('z'),7)] for x in geom]
-        story += [Spacer(1,6),Paragraph('Final Cartesian geometry (Angstrom)',h2),table(rr,[3*cm,4.65*cm,4.65*cm,4.65*cm])]
-    if orbarr:
-        sel=_frontier_orbital_records_v62(o,per_side=20)
-        rr=[['Spin','Label','Index','Occ.','Energy (Eh)','Energy (eV)']]+[[spin,label,z.get('index',''),_report_fmt(z.get('occ'),3),_report_fmt(z.get('eh'),8),_report_fmt(z.get('ev'),6)] for spin,label,z in sel]
-        story += [Spacer(1,6),Paragraph('Frontier-centered orbital energies',h2),table(rr,[2.4*cm,2.6*cm,1.5*cm,1.5*cm,4.5*cm,4.5*cm])]
-    doc.build(story,onFirstPage=frame,onLaterPages=frame)
-    return pdf_path
 
-def build_pdf(a, plots, pdf_path):
-    if str((a or {}).get('engine') or '').lower()=='psi4':
-        return _build_psi4_pdf_v59(a,plots,pdf_path)
-    return _build_pdf_v58(a,plots,pdf_path)
-'''
 
-ANALYZER_V62_PATCH_CODE = r'''
+
+
 def _frontier_orbital_channels_v62(orb):
     """Return finite, energy-sorted frontier data separated by spin channel."""
     if not isinstance(orb, dict):
@@ -3284,168 +2134,10 @@ def _frontier_orbital_records_v62(orb, per_side=6):
     return output
 
 
-def _spread_frontier_labels_v62(items, low, high, minimum_gap):
-    """Move label anchors apart in data coordinates while retaining leaders."""
-    if not items:
-        return []
-    ordered = sorted(items, key=lambda x: float(x[1]['ev']))
-    positions = [float(row['ev']) for _, row in ordered]
-    for i in range(1, len(positions)):
-        positions[i] = max(positions[i], positions[i-1] + minimum_gap)
-    if positions[-1] > high:
-        shift = positions[-1] - high
-        positions = [y - shift for y in positions]
-    if positions[0] < low:
-        shift = low - positions[0]
-        positions = [y + shift for y in positions]
-    return [(ordered[i][0], ordered[i][1], positions[i]) for i in range(len(ordered))]
 
 
-def _plot_frontier_orbitals_v62(analysis, outdir):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    orb = (analysis or {}).get('orbitals') or {}
-    channels = _frontier_orbital_channels_v62(orb)
-    if not channels:
-        return None
-    os.makedirs(outdir, exist_ok=True)
-    names = list(channels)
-    shown = {}
-    all_energy = []
-    for spin in names:
-        ch = channels[spin]
-        shown[spin] = {'occupied': ch['occupied'][-3:], 'virtual': ch['virtual'][:3]}
-        all_energy.extend(float(z['ev']) for z in shown[spin]['occupied'] + shown[spin]['virtual'])
-    if not all_energy:
-        return None
-
-    low, high = min(all_energy), max(all_energy)
-    span = high - low
-    distinct_energy = sorted(set(round(v, 10) for v in all_energy))
-    min_spacing = min((b-a for a,b in zip(distinct_energy, distinct_energy[1:])), default=math.inf)
-    energy_digits = 5 if min_spacing < 0.001 else 3
-    if span < 1.8:
-        center = (high + low) / 2.0
-        low, high = center - 0.9, center + 0.9
-        span = 1.8
-    pad = max(0.24, 0.10 * span)
-    ylow, yhigh = low - pad, high + pad
-    # Each annotation has two text lines. Leave enough room in display space;
-    # closely spaced or degenerate energies must not stack their labels.
-    min_label_gap = min(1.10, max(0.82, 0.075 * span))
-    max_labels = max((max(len(v['occupied']), len(v['virtual'])) for v in shown.values()), default=1)
-    required_plot_span = max(1.8, ((max_labels - 1) * min_label_gap) / 0.78 + 0.18)
-    if (yhigh - ylow) < required_plot_span:
-        center = (yhigh + ylow) / 2.0
-        ylow, yhigh = center - required_plot_span/2.0, center + required_plot_span/2.0
-
-    fig_width = 7.8 if len(names) == 1 else 10.2
-    fig, ax = plt.subplots(figsize=(fig_width, 5.8))
-    occ_color = '#245A9B'
-    vir_color = '#D46A2E'
-    ticks = []
-    ticklabels = []
-    for ci, spin in enumerate(names):
-        channel = channels[spin]
-        selected = shown[spin]
-        base = ci * 2.55
-        xo, xv = base, base + 1.02
-        ticks.extend([xo, xv])
-        if spin == 'restricted':
-            ticklabels.extend(['Occupied', 'Virtual'])
-            linestyle = '-'
-            channel_name = 'Restricted'
-        elif spin == 'alpha':
-            ticklabels.extend(['Occupied α', 'Virtual α'])
-            linestyle = '-'
-            channel_name = 'Alpha spin'
-        else:
-            ticklabels.extend(['Occupied β', 'Virtual β'])
-            linestyle = '--'
-            channel_name = 'Beta spin'
-
-        occ_rows = selected['occupied']; vir_rows = selected['virtual']
-        for z in occ_rows:
-            energy = float(z['ev'])
-            lw = 2.6 if z is channel['homo'] else 1.45
-            ax.hlines(energy, xo-0.16, xo+0.16, color=occ_color, lw=lw, linestyle=linestyle, zorder=3)
-        for z in vir_rows:
-            energy = float(z['ev'])
-            lw = 2.6 if z is channel['lumo'] else 1.45
-            ax.hlines(energy, xv-0.16, xv+0.16, color=vir_color, lw=lw, linestyle=linestyle, zorder=3)
-
-        occ_labels = []
-        for distance, z in enumerate(reversed(occ_rows)):
-            label = 'HOMO' if distance == 0 else f'HOMO-{distance}'
-            occ_labels.append((label, z))
-        occ_labels.reverse()
-        vir_labels = [('LUMO' if i == 0 else f'LUMO+{i}', z) for i, z in enumerate(vir_rows)]
-        label_low = ylow + 0.07*span
-        label_high = yhigh - 0.10*span
-        for label, z, ytext in _spread_frontier_labels_v62(occ_labels, label_low, label_high, min_label_gap):
-            y = float(z['ev'])
-            ax.annotate(f'{label}\n{y:.{energy_digits}f} eV', xy=(xo-0.16, y), xytext=(xo-0.25, ytext),
-                        textcoords='data', ha='right', va='center', fontsize=7.1, color='#23313F',
-                        arrowprops={'arrowstyle':'-', 'lw':0.55, 'color':occ_color, 'shrinkA':1.5, 'shrinkB':1.5},
-                        annotation_clip=False, zorder=4)
-        for label, z, ytext in _spread_frontier_labels_v62(vir_labels, label_low, label_high, min_label_gap):
-            y = float(z['ev'])
-            ax.annotate(f'{label}\n{y:.{energy_digits}f} eV', xy=(xv+0.16, y), xytext=(xv+0.25, ytext),
-                        textcoords='data', ha='left', va='center', fontsize=7.1, color='#23313F',
-                        arrowprops={'arrowstyle':'-', 'lw':0.55, 'color':vir_color, 'shrinkA':1.5, 'shrinkB':1.5},
-                        annotation_clip=False, zorder=4)
-
-        homo, lumo = channel['homo'], channel['lumo']
-        if homo is not None and lumo is not None:
-            yh, yl = float(homo['ev']), float(lumo['ev'])
-            gap_x = (xo + xv) / 2.0
-            gap_low, gap_high = min(yh, yl), max(yh, yl)
-            ax.vlines(gap_x, gap_low, gap_high, color='#687583', lw=0.9, zorder=2)
-            ax.hlines([yh, yl], gap_x-0.055, gap_x+0.055, color='#687583', lw=0.9, zorder=2)
-            gap = yl-yh
-            gap_digits = 5 if abs(gap) < 0.001 else 3
-            ax.text(gap_x, yhigh - 0.035*span, f'Δε ({channel_name}) = {gap:.{gap_digits}f} eV',
-                    ha='center', va='top', fontsize=7.0, color='#4B5D6B',
-                    bbox={'facecolor':'white', 'edgecolor':'none', 'alpha':0.88, 'pad':1.1})
-
-    left = -1.38
-    right = (len(names)-1)*2.55 + 2.42
-    ax.set_xlim(left, right)
-    ax.set_ylim(ylow, yhigh)
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(ticklabels, fontsize=8)
-    ax.set_ylabel('Orbital energy (eV)')
-    ax.set_title('Frontier orbital energy levels', pad=13, fontsize=12, weight='semibold')
-    ax.grid(axis='y', color='#D7DEE5', linewidth=0.65, alpha=0.72)
-    ax.set_axisbelow(True)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_color('#9AA6B2')
-    ax.spines['bottom'].set_color('#9AA6B2')
-    ax.tick_params(axis='y', labelsize=8, colors='#34495E')
-    fig.text(0.5, 0.012, 'Energy-level diagram reconstructed from output energies and occupations; 3D isosurfaces are not available from this plot.',
-             ha='center', va='bottom', fontsize=6.8, color='#667684')
-    fig.tight_layout(rect=(0.01, 0.045, 0.99, 0.97))
-    path = os.path.join(outdir, 'orbital_energies.png')
-    try:
-        fig.savefig(path, dpi=400, bbox_inches='tight', facecolor='white')
-    finally:
-        plt.close(fig)
-    return path
 
 
-_make_plots_v62_base = make_plots
-def make_plots(a, outdir):
-    """Preserve spectrum plots and replace the legacy frontier diagram."""
-    safe_analysis = dict(a or {})
-    safe_analysis['orbitals'] = {'orbitals': []}
-    made = _make_plots_v62_base(safe_analysis, outdir)
-    orbital_path = _plot_frontier_orbitals_v62(a, outdir)
-    if orbital_path:
-        made['orbitals'] = orbital_path
-    return made
 
 
 _parse_output_v62_base = parse_output_text
@@ -3520,35 +2212,2641 @@ def section_orbitals(a):
     if extra:
         lines.extend(['','Conceptual DFT descriptors (frontier-orbital estimates):'] + extra)
     return '\n'.join(lines) if lines else 'No valid orbital-energy table was recognized.'
+
+
+# ----------------------- scientific parser corrections -----------------------
+# Public schema additions:
+# warnings/parser_warnings: list[str]; convergence fields: bool | None;
+# geometry_units: 'angstrom' | None; source_geometry_units: str | None;
+# thermochemistry_blocks and job_blocks retain independent provenance.
+BOHR_TO_ANGSTROM = 0.529177210903
+FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
+PARSER_VERSION = '7.1.0'
+REPORT_GENERATOR_VERSION = '7.1.0'
+_LEGACY_ANALYZER_PARSE = parse_output_text
+
+
+def _float(value):
+    """Finite numeric values only; missing/unrecognized data are not zero."""
+    try:
+        result = float(str(value).strip().replace('D', 'E').replace('d', 'e'))
+        return result if math.isfinite(result) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _runtime_lines(text):
+    """Exclude echoed input cards from runtime status/section recognition."""
+    return [line for line in str(text or '').splitlines()
+            if not re.match(r'^\s*\|\s*\d+>', line)
+            and not re.match(r'^\s*[#!%]', line)]
+
+
+def _simple_keywords(text):
+    groups = []
+    for line in str(text or '').splitlines():
+        match = re.match(r'^\s*(?:\|\s*\d+>\s*)?!\s*(.+)$', line)
+        if match:
+            # An ORCA comment begins with #; it cannot name the actual method.
+            groups.append(match.group(1).split('#', 1)[0].strip())
+    return groups
+
+
+def _orca_input_method(text):
+    """Exact ORCA method token, including parenthesized triples/suffixes."""
+    tokens = [token for line in _simple_keywords(text) for token in line.split()]
+    patterns = (
+        (r'DLPNO-CCSD\(T1\)', 'DLPNO-CCSD(T1)'),
+        (r'DLPNO-CCSD\(T\)', 'DLPNO-CCSD(T)'),
+        (r'DLPNO-CCSD', 'DLPNO-CCSD'),
+        (r'CCSD\(T\)', 'CCSD(T)'), (r'CCSD', 'CCSD'),
+        (r'DLPNO-MP2', 'DLPNO-MP2'), (r'RI-?MP2', 'RI-MP2'),
+        (r'MP2', 'MP2'), (r'MP3', 'MP3'),
+        (r'NEVPT2', 'NEVPT2'), (r'CASSCF', 'CASSCF'),
+        (r'CAM-?B3LYP', 'CAM-B3LYP'), (r'B3LYP', 'B3LYP'),
+        (r'PBE0', 'PBE0'), (r'M06-?2X', 'M06-2X'),
+        (r'M06-?L', 'M06-L'), (r'M06', 'M06'),
+        (r'(?:w|ω)B97X-D4', 'wB97X-D4'),
+        (r'(?:w|ω)B97X-D3', 'wB97X-D3'),
+        (r'(?:w|ω)B97X-D', 'wB97X-D'),
+        (r'(?:w|ω)B97X-V', 'wB97X-V'),
+        (r'(?:w|ω)B97X', 'wB97X'),
+        (r'(?:w|ω)B97M-V', 'wB97M-V'),
+        (r'r2SCAN-?3C', 'r2SCAN-3C'), (r'B97-?3C', 'B97-3C'),
+        (r'PBEh-?3C', 'PBEh-3C'), (r'HF-?3C', 'HF-3C'),
+        (r'B2PLYP', 'B2PLYP'), (r'PWPB95', 'PWPB95'),
+        (r'TPSSh', 'TPSSh'), (r'TPSS', 'TPSS'),
+        (r'BP86|BP', 'BP86'), (r'BLYP', 'BLYP'),
+        (r'revPBE', 'revPBE'), (r'PBE', 'PBE'),
+        (r'RHF|UHF|ROHF|HF', 'HF'),
+        (r'GFN2-xTB', 'GFN2-xTB'), (r'GFN1-xTB', 'GFN1-xTB'),
+        (r'PM3', 'PM3'), (r'AM1', 'AM1'), (r'MNDO', 'MNDO'),
+    )
+    matches = []
+    for token in tokens:
+        for pattern, canonical in patterns:
+            if re.fullmatch(pattern, token, re.I):
+                matches.append(canonical)
+                break
+    # Conflicting input method tokens need the realized runtime method;
+    # selecting the first token is not scientifically defensible.
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _orca_split_jobs(text):
+    """Split real run boundaries, never an echoed $new_job/comment."""
+    blocks, current = [], []
+    observed_result = False
+    banner = re.compile(r'^\s*\**\s*O\s{2,}R\s{2,}C\s{2,}A\s*\**\s*$')
+    for line in str(text or '').splitlines():
+        echoed = bool(re.match(r'^\s*\|\s*\d+>', line))
+        boundary = not echoed and (
+            bool(banner.match(line)) or bool(re.match(r'^\s*\$new_job\s*$', line, re.I))
+        )
+        if boundary and current and observed_result:
+            blocks.append('\n'.join(current))
+            current = []
+            observed_result = False
+        current.append(line)
+        if not echoed and re.search(r'FINAL SINGLE POINT ENERGY|ORCA TERMINATED|CARTESIAN COORDINATES', line, re.I):
+            observed_result = True
+    if current:
+        blocks.append('\n'.join(current))
+    return [block for block in blocks if block.strip()]
+
+
+def _strict_status(text, engine):
+    runtime = '\n'.join(_runtime_lines(text))
+    if engine == 'ORCA':
+        success = r'^\s*\**\s*ORCA\s+TERMINATED\s+NORMALLY\b'
+        failure = r'ORCA\s+(?:TERMINATED\s+ABNORMALLY|finished\s+by\s+error\s+termination)|INPUT\s+ERROR|ABORTING\s+THE\s+RUN|SEGMENTATION\s+FAULT|OUT\s+OF\s+MEMORY|UNRECOGNIZED\s+OR\s+DUPLICATED\s+KEYWORD'
+    elif engine == 'Psi4':
+        success = r'^\s*\**\s*Psi4\s+exiting\s+successfully\b'
+        failure = r'PSIEXCEPTION|TRACEBACK|FATAL\s+ERROR|SEGMENTATION\s+FAULT|OUT\s+OF\s+MEMORY|CONVERGENCE\s+FAILURE|SCFConvergenceError|OptimizationConvergenceError'
+    else:
+        return None, []
+    markers = [(match.start(), True) for match in re.finditer(success, runtime, re.I | re.M)]
+    markers.extend((match.start(), False) for match in re.finditer(failure, runtime, re.I | re.M))
+    status = max(markers, key=lambda item: item[0])[1] if markers else None
+    errors = [line.strip() for line in runtime.splitlines() if re.search(failure, line, re.I)]
+    return status, errors
+
+
+def _last_status_flag(runtime, success, failure):
+    marks = [(match.start(), True) for match in re.finditer(success, runtime, re.I | re.M)]
+    marks += [(match.start(), False) for match in re.finditer(failure, runtime, re.I | re.M)]
+    return max(marks, key=lambda item: item[0])[1] if marks else None
+
+
+def _convergence_flags(text, engine):
+    runtime = '\n'.join(_runtime_lines(text))
+    if engine == 'ORCA':
+        keywords = [word.lower() for group in _simple_keywords(text) for word in group.split()]
+        optimization_words = {'opt', 'tightopt', 'verytightopt', 'looseopt', 'optts', 'copt', 'neb-ts', 'zoom-neb-ts', 'neb', 'neb-ci'}
+        requested = True if any(word in optimization_words for word in keywords) else (False if keywords else None)
+        if re.search(r'GEOMETRY OPTIMIZATION|THE OPTIMIZATION HAS CONVERGED|optimization did not converge', runtime, re.I):
+            requested = True
+        optimized = _last_status_flag(
+            runtime, r'THE\s+OPTIMIZATION\s+HAS\s+CONVERGED',
+            r'optimization\s+did\s+not\s+converge|optimization\s+(?:failed|has\s+failed)|MAXIMUM\s+NUMBER\s+OF\s+OPTIMIZATION\s+CYCLES\s+(?:REACHED|EXCEEDED)')
+        scf = _last_status_flag(
+            runtime, r'\bSCF\s+CONVERGED\s+(?:AFTER|IN)\s+\d+\s+(?:CYCLES|ITERATIONS)',
+            r'\bSCF\s+(?:NOT\s+CONVERGED|DID\s+NOT\s+CONVERGE|FAILED\s+TO\s+CONVERGE)|SCF\s+CONVERGENCE\s+FAILURE')
+    else:
+        requested = None
+        if re.search(r'\b(?:optimize|opt)\s*\(|OptKing|Geometry\s+Optimization|Optimization\s+is\s+complete', text, re.I):
+            requested = True
+        elif re.search(r'\b(?:energy|frequency|frequencies)\s*\(', text, re.I):
+            requested = False
+        optimized = _last_status_flag(
+            runtime, r'Optimization\s+is\s+complete|Geometry\s+(?:optimization\s+)?converged|Optimization\s+converged',
+            r'OptimizationConvergenceError|optimization\s+(?:did\s+not\s+converge|failed)|maximum\s+(?:number\s+of\s+)?(?:geometry\s+|optimization\s+)?iterations\s+(?:exceeded|reached)')
+        scf = _last_status_flag(
+            runtime, r'Energy\s+and\s+wave\s*function\s+converged\.?|^\s*Energy\s+converged\.',
+            r'SCFConvergenceError|SCF\s+(?:failed\s+to\s+converge|did\s+not\s+converge|not\s+converged)|Could\s+not\s+converge\s+SCF')
+    return {'optimization_requested': requested, 'optimization_converged': optimized, 'scf_converged': scf}
+
+
+def _orca_geometry_strict(text):
+    """Latest complete printed coordinate table; source units retained."""
+    blocks, current, unit, active = [], [], None, False
+    for line in _runtime_lines(text):
+        header = re.search(r'^\s*CARTESIAN\s+COORDINATES\s*\(([^)]+)\)', line, re.I)
+        if header:
+            if current:
+                blocks.append((current, unit))
+            current = []
+            spelling = header.group(1).strip().upper()
+            unit = 'angstrom' if spelling in ('ANGSTROEM', 'ANGSTROM') else ('bohr' if spelling in ('A.U.', 'AU', 'BOHR') else None)
+            active = True
+            continue
+        if not active:
+            continue
+        pieces = line.split()
+        atom = None
+        if len(pieces) >= 4:
+            coordinates = [_float(value) for value in pieces[-3:]]
+            if all(value is not None for value in coordinates):
+                for label in pieces[:-3]:
+                    if re.fullmatch(r'[A-Za-z]{1,3}:?', label):
+                        factor = BOHR_TO_ANGSTROM if unit == 'bohr' else 1.0
+                        atom = dict(element=label.rstrip(':').capitalize() + (':' if label.endswith(':') else ''),
+                                    x=coordinates[0] * factor, y=coordinates[1] * factor, z=coordinates[2] * factor)
+                        break
+        if atom:
+            current.append(atom)
+        elif current:
+            blocks.append((current, unit))
+            current = []
+            active = False
+    if current:
+        blocks.append((current, unit))
+    if not blocks:
+        return [], None, None
+    geometry, source_unit = blocks[-1]
+    return geometry, ('angstrom' if source_unit in ('angstrom', 'bohr') else None), source_unit
+
+
+def _orca_frequency_table(text):
+    blocks, current, active = [], [], False
+    row = re.compile(r'^\s*(\d+)\s*:\s*(' + FLOAT_RE + r')\s*(?:cm\*\*-1|cm\^-1|cm-1)?(.*)$', re.I)
+    for line in _runtime_lines(text):
+        if re.match(r'^\s*(?:3N-[56]\s+)?VIBRATIONAL\s+FREQUENCIES\s*$', line, re.I):
+            if current:
+                blocks.append(current)
+            current = []
+            active = True
+            continue
+        if not active:
+            continue
+        match = row.match(line)
+        if match:
+            value = _float(match.group(2))
+            if value is not None:
+                if 'imaginary' in match.group(3).lower() and value > 0:
+                    value = -value
+                current.append({'mode': int(match.group(1)), 'frequency_cm1': value})
+        elif current and line.strip() and set(line.strip()) - set('-='):
+            blocks.append(current)
+            current, active = [], False
+    if current:
+        blocks.append(current)
+    return blocks[-1] if blocks else []
+
+
+def _orca_spectrum_table(text, kind):
+    """Bounded IR/Raman tables with named columns; no thermochemistry bleed."""
+    blocks, current, active, columns = [], [], False, None
+    row = re.compile(r'^\s*(\d+)\s*:\s*(.*)$')
+    for line in _runtime_lines(text):
+        if re.match(r'^\s*' + kind + r'\s+SPECTRUM\s*$', line, re.I):
+            if current:
+                blocks.append(current)
+            current, columns, active = [], None, True
+            continue
+        if not active:
+            continue
+        upper = line.upper()
+        if 'MODE' in upper and 'FREQ' in upper:
+            columns = {'intensity': 2 if re.search(r'\bEPS\b', upper) else 1} if kind == 'IR' else ({'activity': 1, 'depolarization': 2} if 'ACTIVITY' in upper else None)
+            continue
+        match = row.match(line)
+        if match:
+            values = [_float(value) for value in re.findall(FLOAT_RE, match.group(2))]
+            if not values or values[0] is None:
+                continue
+            record = {'mode': int(match.group(1)), 'frequency_cm1': values[0]}
+            if kind == 'IR':
+                pos = columns['intensity'] if columns else None
+                record['intensity_km_mol'] = values[pos] if pos is not None and len(values) > pos else None
+            else:
+                pos = columns['activity'] if columns else None
+                record['activity_angstrom4_amu'] = values[pos] if pos is not None and len(values) > pos else None
+                record['depolarization_ratio'] = values[2] if columns and len(values) > 2 else None
+            current.append(record)
+            continue
+        if current and line.strip() and set(line.strip()) - set('-='):
+            blocks.append(current)
+            current, active = [], False
+    if current:
+        blocks.append(current)
+    return blocks[-1] if blocks else []
+
+
+def parse_raman(text):
+    return [(record['frequency_cm1'], record['activity_angstrom4_amu'])
+            for record in _orca_spectrum_table(text, 'RAMAN')
+            if record.get('activity_angstrom4_amu') is not None]
+
+
+def _psi4_orbitals_v59(text):
+    """Parse Psi4 symmetry labels without reading label digits as energies."""
+    current, tables, active = [], [], False
+    spin, occupancy = 'restricted', None
+    orbital_factor = 1.0
+    table_header = re.compile(r'^\s*(?:==>\s*)?Orbital\s+Energies(?:\s*\[[^]]*\])?\s*(?:<==)?\s*$', re.I)
+    occupied_header = re.compile(r'^\s*(?:(Alpha|Beta)\s+)?(Doubly\s+Occupied|Singly\s+Occupied|Occupied|Virtual)\s*:\s*(.*)$', re.I)
+    pair = re.compile(r'(?<!\S)(\d+[A-Za-z][A-Za-z0-9\'"+\-]*|\d+)\s+(' + FLOAT_RE + r')(?=\s|$)')
+    explicit_spin = False
+    for line in _runtime_lines(text):
+        if table_header.match(line):
+            if current:
+                tables.append(current)
+            current, active, spin, occupancy = [], True, 'restricted', None
+            explicit_spin = False
+            units = re.search(r'\[([^]]+)\]', line)
+            unit = units.group(1).strip().lower() if units else 'eh'
+            orbital_factor = 1.0 if unit in ('eh', 'hartree', 'a.u.', 'au') else (1.0/HARTREE_TO_EV if unit == 'ev' else None)
+            continue
+        if not active:
+            continue
+        match = occupied_header.match(line)
+        data = line
+        if match:
+            if match.group(1):
+                spin = match.group(1).lower()
+                explicit_spin = True
+            label = match.group(2).upper()
+            occupancy = 0.0 if label == 'VIRTUAL' else (1.0 if explicit_spin or label == 'SINGLY OCCUPIED' else 2.0)
+            data = match.group(3)
+        elif re.match(r'^\s*(Alpha|Beta)\s+(?:Orbitals|Orbital\s+Energies)\s*:?\s*$', line, re.I):
+            spin = re.match(r'^\s*(Alpha|Beta)', line, re.I).group(1).lower()
+            explicit_spin = True
+            occupancy = None
+            continue
+        if occupancy is None:
+            continue
+        matches = list(pair.finditer(data))
+        consumed = pair.sub('', data).strip()
+        if matches and not consumed:
+            for value in matches:
+                energy = _float(value.group(2))
+                if energy is None or orbital_factor is None:
+                    continue
+                energy *= orbital_factor
+                label = value.group(1)
+                symmetry = re.sub(r'^\d+', '', label) or None
+                index = int(re.match(r'\d+', label).group(0))
+                current.append({'index': index, 'label': label, 'symmetry': symmetry,
+                                'spin': spin, 'occ': occupancy, 'eh': energy, 'ev': energy * HARTREE_TO_EV})
+            continue
+        # Blank separation after Virtual: must not close the table: Psi4
+        # prints the actual orbital rows below an empty line.
+        if not data.strip() or set(data.strip()) <= set('-=') or match:
+            continue
+        if current:
+            tables.append(current)
+        current, active, occupancy = [], False, None
+    if current:
+        tables.append(current)
+    return _frontiers_complete(tables[-1] if tables else [])
+
+
+def _parse_psi4_vibrations(text):
+    """Keep column alignment when a Psi4 frequency/intensity cell is missing."""
+    frequencies, intensities, pending = [], [], []
+    for line in _runtime_lines(text):
+        if re.search(r'Freq\s*\[cm\^-1\]', line, re.I):
+            pending = []
+            for token in line.split(']', 1)[-1].split():
+                imaginary = token.lower().endswith('i')
+                value = _float(token[:-1] if imaginary else token)
+                if value is not None and imaginary:
+                    value = -abs(value)
+                pending.append(value)
+                if value is not None:
+                    frequencies.append(value)
+        elif pending and re.search(r'IR\s+activ\s*\[km/mol\]', line, re.I):
+            values = [_float(token) for token in line.split(']', 1)[-1].split()]
+            intensities.extend((frequency, value) for frequency, value in zip(pending, values)
+                               if frequency is not None and value is not None)
+            pending = []
+    return frequencies, intensities
+
+
+def _frontiers_complete(orbitals):
+    """Compute each spin channel from all parsed orbitals, without trimming."""
+    output = {'orbitals': list(orbitals), 'homo_ev': None, 'lumo_ev': None, 'gap_ev': None}
+    for spin in ('restricted', 'alpha', 'beta'):
+        rows = [record for record in orbitals if record.get('spin', 'restricted') == spin]
+        occupied = [record for record in rows if _float(record.get('occ')) is not None and record['occ'] > 1e-8 and _float(record.get('ev')) is not None]
+        virtual = [record for record in rows if _float(record.get('occ')) is not None and record['occ'] <= 1e-8 and _float(record.get('ev')) is not None]
+        h = max((record['ev'] for record in occupied), default=None)
+        l = min((record['ev'] for record in virtual), default=None)
+        if spin != 'restricted':
+            output[spin + '_homo_ev'] = h
+            output[spin + '_lumo_ev'] = l
+            output[spin + '_gap_ev'] = l - h if h is not None and l is not None else None
+    occupied = [record['ev'] for record in orbitals if _float(record.get('occ')) is not None and record['occ'] > 1e-8 and _float(record.get('ev')) is not None]
+    virtual = [record['ev'] for record in orbitals if _float(record.get('occ')) is not None and record['occ'] <= 1e-8 and _float(record.get('ev')) is not None]
+    output['homo_ev'] = max(occupied, default=None)
+    output['lumo_ev'] = min(virtual, default=None)
+    if output['homo_ev'] is not None and output['lumo_ev'] is not None:
+        output['gap_ev'] = output['lumo_ev'] - output['homo_ev']
+    return output
+
+
+def _thermo_segments(text, engine):
+    runtime = '\n'.join(_runtime_lines(text))
+    if engine == 'ORCA':
+        header = r'^\s*THERMOCHEMISTRY(?:\s+AT\b[^\n]*)?\s*$'
+    else:
+        header = r'^\s*(?:==>\s*)?Thermochemistry(?:\s+Components|\s+at\b[^\n]*)?\s*(?:<==)?\s*$'
+    starts = [match.start() for match in re.finditer(header, runtime, re.I | re.M)]
+    if not starts:
+        # Recognized isolated totals can still be extracted, but their
+        # geometry/method association remains unknown.
+        return [(0, runtime)]
+    return [(start, runtime[start:(starts[index+1] if index+1 < len(starts) else len(runtime))]) for index, start in enumerate(starts)]
+
+
+def _thermo_pressure(text):
+    result = None
+    for match in re.finditer(r'\bPressure\s*(?:\.+|[:=])\s*(' + FLOAT_RE + r')\s*\[?(atm|bar|Pa|kPa)\]?', text, re.I):
+        value = _float(match.group(1))
+        unit = match.group(2).lower()
+        if value is not None:
+            result = value * {'atm': 1.0, 'bar': 100000/101325, 'pa': 1/101325, 'kpa': 1000/101325}[unit]
+    return result
+
+
+def _orca_thermo_block(text, reference=None):
+    f = FLOAT_RE
+    patterns = {
+        'temperature_K': [r'\bTemperature\s*(?:\.+|[:=])\s*(' + f + r')\s*K', r'THERMOCHEMISTRY\s+AT\s+(' + f + r')\s*K'],
+        'electronic_reference_hartree': [r'\bElectronic\s+energy\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'zpe_hartree': [r'\b(?:(?:Non-thermal|Total)\s+)?Zero[ -]point\s+(?:vibrational\s+)?energy\s*(?:\.+|[:=])?\s*(' + f + r')\s*Eh'],
+        'thermal_energy_hartree': [r'\bTotal\s+thermal\s+energy\s*(?:\.+|[:=])?\s*(' + f + r')\s*Eh'],
+        'total_internal_energy_correction_hartree': [r'^\s*Total\s+correction\s*(?:\.+|[:=])?\s*(' + f + r')\s*Eh'],
+        'thermal_energy_correction_hartree': [r'\bThermal\s+energy\s+correction\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'enthalpy_hartree': [r'\b(?:Total|Final)(?:\s+thermal)?\s+enthalpy\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'pv_correction_hartree': [r'\bThermal\s+enthalpy\s+correction\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'gibbs_hartree': [r'\b(?:Final|Total)\s+Gibbs\s+(?:free\s+)?(?:energy|enthalpy)\s*(?:\.+|[:=])?\s*(' + f + r')\s*Eh'],
+        'gibbs_correction_hartree': [r'\bThermal\s+(?:Gibbs\s+)?free\s+energy\s+correction\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'entropy_term_hartree': [r'\bFinal\s+entropy\s+term\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'entropy_correction_hartree': [r'\bTotal\s+entropy\s+correction\s*(?:\.+|[:=])\s*(' + f + r')\s*Eh'],
+        'rrho_cutoff_cm1': [r'Frequency\s+cutoff\s+for\s+the\s+RRHO\s*(?:\.+|[:=])\s*(' + f + r')\s*cm\*\*-1'],
+    }
+    result = {key: _last_number(text, values) for key, values in patterns.items()}
+    result['pressure_atm'] = _thermo_pressure(text)
+    if result['electronic_reference_hartree'] is None:
+        result['electronic_reference_hartree'] = reference
+        result['reference_energy_source'] = 'preceding electronic-energy record' if reference is not None else None
+    else:
+        result['reference_energy_source'] = 'printed thermochemistry electronic energy'
+    ref = result['electronic_reference_hartree']
+    if result['thermal_energy_hartree'] is None and ref is not None and result['total_internal_energy_correction_hartree'] is not None:
+        result['thermal_energy_hartree'] = ref + result['total_internal_energy_correction_hartree']
+        result['thermal_energy_hartree_source'] = 'electronic reference plus printed total U correction (including ZPE)'
+    # In ORCA the printed Thermal Enthalpy correction is pV = RT.
+    # H = U + RT, not E_el + RT. Never omit ZPE/thermal contributions.
+    if (result['enthalpy_hartree'] is None and result['thermal_energy_hartree'] is not None
+            and result['pv_correction_hartree'] is not None):
+        result['enthalpy_hartree'] = result['thermal_energy_hartree'] + result['pv_correction_hartree']
+        result['enthalpy_hartree_source'] = 'printed total thermal energy plus printed pV correction'
+    if result['gibbs_hartree'] is None and result['enthalpy_hartree'] is not None and result['entropy_term_hartree'] is not None:
+        result['gibbs_hartree'] = result['enthalpy_hartree'] - result['entropy_term_hartree']
+        result['gibbs_hartree_source'] = 'printed/verified enthalpy minus printed TS term'
+    # Give shared correction fields the same H-E_el / G-E_el meaning used
+    # for Gaussian and Psi4; keep ORCA's printed RT separately as pV.
+    result['enthalpy_correction_hartree'] = (result['enthalpy_hartree'] - ref
+        if result['enthalpy_hartree'] is not None and ref is not None else None)
+    if result['gibbs_hartree'] is not None and ref is not None:
+        result['gibbs_correction_hartree'] = result['gibbs_hartree'] - ref
+    contributions = []
+    for name in ('vib', 'rot', 'trans', 'elec'):
+        key = 'S_' + name + '_cal_mol_K'
+        value = _last_number(text, [r'\bS_' + name + r'\s*(?:\.+|[:=])\s*(' + f + r')\s*cal/mol-K'])
+        result[key] = value
+        contributions.append(value)
+    if all(value is not None for value in contributions):
+        result['entropy_J_mol_K'] = sum(contributions) * 4.184
+    elif all(result.get(key) is not None for key in ('enthalpy_hartree', 'gibbs_hartree', 'temperature_K')) and result['temperature_K'] > 0:
+        result['entropy_J_mol_K'] = (result['enthalpy_hartree'] - result['gibbs_hartree']) * HARTREE_TO_KJMOL * 1000 / result['temperature_K']
+    else:
+        result['entropy_J_mol_K'] = None
+    return result
+
+
+def _strict_thermochemistry(text, engine):
+    runtime = '\n'.join(_runtime_lines(text))
+    blocks = []
+    for index, (offset, segment) in enumerate(_thermo_segments(text, engine), 1):
+        preceding = runtime[:offset]
+        if engine == 'ORCA':
+            reference = _last_number(preceding, [r'FINAL SINGLE POINT ENERGY\s+(' + FLOAT_RE + r')'])
+            block = _orca_thermo_block(segment, reference)
+            block['thermo_method'] = _orca_input_method(text)
+            block['thermo_method_source'] = 'explicit input method in the same job' if block['thermo_method'] is not None else None
+            basis_match = re.findall(r'Your calculation utilizes the basis:\s*\n?\s*([^\n]+)', preceding, re.I)
+            block['thermo_basis'] = basis_match[-1].strip() if basis_match else None
+        else:
+            reference, label = _psi4_final_energy_v64(preceding)
+            # Explicit totals are authoritative. A preceding correlated
+            # single point is not silently combined with SCF corrections.
+            block = _psi4_thermo_v59(segment, reference if label == 'SCF' else None)
+            block['electronic_reference_hartree'] = reference if label == 'SCF' else None
+            block['reference_energy_source'] = 'preceding SCF electronic-energy record' if label == 'SCF' else None
+            block['pressure_atm'] = _thermo_pressure(segment)
+            thermo_method, thermo_basis, _ = _psi4_method_basis_v59(preceding)
+            block['thermo_method'] = thermo_method if label == 'SCF' else None
+            block['thermo_basis'] = thermo_basis if label == 'SCF' else None
+        block['electronic_energy_hartree'] = block.get('electronic_reference_hartree')
+        treatment = re.search(r'(quasi[ -]?RRHO(?:\s+method\s+of\s+Grimme)?|Grimme[ -]?quasi[ -]?RRHO|Standard[ -]RRHO|qRRHO|\bRRHO\b|harmonic\s+oscillator\s+approximation)', segment, re.I)
+        block['thermo_treatment'] = treatment.group(1) if treatment else None
+        block['block_index'] = index
+        for key in ('zpe_hartree', 'enthalpy_hartree', 'gibbs_hartree', 'thermal_energy_hartree', 'temperature_K', 'pressure_atm', 'entropy_J_mol_K'):
+            block.setdefault(key, None)
+        for key in list(block):
+            if key.endswith('_hartree') and _float(block[key]) is not None:
+                block[key.replace('_hartree', '_kj_mol')] = block[key] * HARTREE_TO_KJMOL
+        if any(block.get(key) is not None for key in ('zpe_hartree', 'enthalpy_hartree', 'gibbs_hartree', 'thermal_energy_hartree', 'temperature_K')):
+            blocks.append(block)
+    primary = dict(blocks[-1]) if blocks else {key: None for key in ('zpe_hartree', 'enthalpy_hartree', 'gibbs_hartree', 'thermal_energy_hartree', 'temperature_K', 'pressure_atm', 'thermo_treatment', 'thermo_method', 'thermo_basis', 'entropy_J_mol_K', 'electronic_reference_hartree', 'electronic_energy_hartree')}
+    return primary, blocks
+
+
+def _orca_protocol(text, analysis):
+    requested = _orca_input_method(text)
+    groups = _simple_keywords(text)
+    tokens = [word for group in groups for word in group.split()]
+    for token in tokens:
+        solvent_card = re.fullmatch(r'CPCM\(([^)]+)\)', token, re.I)
+        if solvent_card:
+            analysis['solvation_model'] = analysis.get('solvation_model') or 'CPCM'
+            analysis['solvent'] = analysis.get('solvent') or solvent_card.group(1)
+    if re.search(r'(?im)^\s*(?:\|\s*\d+>\s*)?%cpcm\b|CPCM\s+SOLVATION\s+MODEL', text):
+        analysis['solvation_model'] = analysis.get('solvation_model') or 'CPCM'
+    if re.search(r'SMD\s+SOLVATION\s+MODEL|(?im:^\s*(?:\|\s*\d+>\s*)?smd\s+true\b)', text, re.I):
+        analysis['solvation_model'] = 'SMD'
+    dispersion = None
+    for token in tokens:
+        if re.fullmatch(r'D3BJ|D3ZERO|D3|D4|D3M|D3MBJ|NLC|VV10', token, re.I):
+            dispersion = token.upper()
+    if dispersion is None and requested:
+        for suffix, label in [('-D4', 'D4'), ('-D3', 'D3'), ('-V', 'VV10')]:
+            if requested.upper().endswith(suffix):
+                dispersion = label
+                break
+    if dispersion is None:
+        explicit = re.search(r'(?:Dispersion\s+correction|vdW-correction)\s*(?:\.+|[:=])\s*(D3BJ|D3ZERO|D3|D4|VV10)\b', text, re.I)
+        if explicit:
+            dispersion = explicit.group(1).upper()
+    analysis['method_requested'] = requested
+    # Retain resolved output components independently of the requested name.
+    analysis['method'] = requested or analysis.get('method')
+    analysis['dispersion'] = dispersion
+    analysis['raw_simple_keywords'] = groups
+    analysis['calculation_protocol'] = {
+        'method': analysis.get('method'), 'basis': analysis.get('basis'),
+        'dispersion': dispersion, 'solvation_model': analysis.get('solvation_model'),
+        'solvent': analysis.get('solvent'), 'raw_simple_keywords': groups,
+        'method_components': analysis.get('method_components') or {},
+    }
+
+
+def _orca_td_table(text):
+    """Electric-dipole transitions only, with original state identities."""
+    tables, current, active = [], [], False
+    new_row = re.compile(r'^\s*(\S+)\s+->\s+(\S+)\s+(' + FLOAT_RE + r')\s+(' + FLOAT_RE + r')\s+(' + FLOAT_RE + r')\s+(' + FLOAT_RE + r')(?:\s|$)')
+    old_row = re.compile(r'^\s*(\d+)\s+(' + FLOAT_RE + r')\s+(' + FLOAT_RE + r')\s+(' + FLOAT_RE + r')(?:\s|$)')
+    header = re.compile(r'^\s*ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS\s*$', re.I)
+    for line in _runtime_lines(text):
+        if header.match(line):
+            if current:
+                tables.append(current)
+            current, active = [], True
+            continue
+        if not active:
+            continue
+        match = new_row.match(line)
+        if match:
+            source, target = match.group(1, 2)
+            ev, cm1, printed_nm, strength = [_float(match.group(index)) for index in range(3, 7)]
+            target_index = re.match(r'\d+', target)
+            state = int(target_index.group(0)) if target_index else None
+        else:
+            match = old_row.match(line)
+            if match:
+                state = int(match.group(1))
+                cm1, printed_nm, strength = [_float(match.group(index)) for index in range(2, 5)]
+                ev = cm1 / 8065.544005 if cm1 is not None else None
+                source, target = None, str(state)
+        if match:
+            if ev is not None and ev > 0 and cm1 is not None and cm1 > 0 and strength is not None and strength >= 0:
+                current.append({'state': state, 'initial_state': source, 'final_state': target,
+                                'ev': ev, 'cm1': cm1, 'nm': 1239.841984 / ev,
+                                'printed_nm': printed_nm, 'f': strength,
+                                'quantity': 'oscillator strength', 'gauge': 'electric dipole'})
+            continue
+        if current and line.strip() and set(line.strip()) - set('-='):
+            tables.append(current)
+            current, active = [], False
+    if current:
+        tables.append(current)
+    return tables[-1] if tables else []
+
+
+def _optimization_trace(text, engine):
+    """Recognized optimization window only; no frequency displacement SPs."""
+    active, values = False, []
+    for line in _runtime_lines(text):
+        if re.search(r'GEOMETRY OPTIMIZATION (?:CYCLE|RUN)|Optimization\s+(?:Step|Iteration)|OptKing', line, re.I):
+            active = True
+        if re.search(r'THE OPTIMIZATION HAS CONVERGED|Optimization is complete|VIBRATIONAL FREQUENCIES|Thermochemistry|optimization did not converge', line, re.I):
+            active = False
+        if not active:
+            continue
+        pattern = r'FINAL SINGLE POINT ENERGY\s+(' + FLOAT_RE + r')' if engine == 'ORCA' else r'@(?:DF-)?(?:RHF|UHF|ROHF|RKS|UKS|SCF)\s+Final Energy:\s*(' + FLOAT_RE + r')'
+        match = re.search(pattern, line, re.I)
+        if match:
+            value = _float(match.group(1))
+            if value is not None:
+                values.append(value)
+    return values
+
+
+def _psi4_split_jobs(text):
+    """Separate concatenated program runs without combining independent results."""
+    starts = [m.start() for m in re.finditer(
+        r'^\s*Psi4\s*:\s*An\s+Open[- ]Source\s+Ab\s+Initio', text, re.I | re.M)]
+    if len(starts) < 2:
+        return [str(text or '')]
+    starts[0] = 0
+    return [text[start:(starts[i+1] if i+1 < len(starts) else len(text))]
+            for i, start in enumerate(starts)]
+
+
+def _psi4_geometry_strict(text):
+    """Last printed Cartesian table, with explicit Angstrom/Bohr evidence."""
+    tables, rows, active, unit = [], [], False, None
+    row = re.compile(r'^\s*(?:\d+\s+)?([A-Za-z]{1,2})\s+(' + FLOAT_RE + r')\s+('
+                     + FLOAT_RE + r')\s+(' + FLOAT_RE + r')\s*$')
+    for line in _runtime_lines(text):
+        if re.search(r'\b(?:Cartesian\s+)?Geometry\s*\(in\s+[^)]+\)|Final optimized geometry', line, re.I):
+            if rows:
+                tables.append((rows, unit))
+            rows, active, unit = [], True, None
+            u = re.search(r'\(in\s+(Angstroms?|Bohr|a\.u\.)\)', line, re.I)
+            if u:
+                unit = 'angstrom' if u.group(1).lower().startswith('angstrom') else 'bohr'
+            continue
+        if not active:
+            continue
+        units = re.match(r'^\s*units\s+(angstroms?|bohr|au|a\.u\.)\b', line, re.I)
+        if units:
+            unit = 'angstrom' if units.group(1).lower().startswith('angstrom') else 'bohr'
+            continue
+        match = row.match(line)
+        if match:
+            xyz = [_float(match.group(i)) for i in (2, 3, 4)]
+            if all(value is not None for value in xyz):
+                rows.append(dict(element=match.group(1).capitalize(), x=xyz[0], y=xyz[1], z=xyz[2]))
+        elif rows and line.strip() and not re.match(r'^\s*[{}]', line):
+            tables.append((rows, unit))
+            rows, active = [], False
+    if rows:
+        tables.append((rows, unit))
+    if not tables:
+        return [], None, None
+    geometry, unit = tables[-1]
+    if unit == 'bohr':
+        for atom in geometry:
+            for axis in ('x', 'y', 'z'):
+                atom[axis] *= BOHR_TO_ANGSTROM
+    return geometry, ('angstrom' if unit else None), unit
+
+
+def _dipole_strict(text, engine):
+    """Do not label an atomic-unit vector/magnitude as Debye."""
+    result = {}
+    if engine == 'ORCA':
+        matches = list(re.finditer(r'^\s*Total\s+Dipole\s+Moment\s*:\s*(' + FLOAT_RE
+                                  + r')\s+(' + FLOAT_RE + r')\s+(' + FLOAT_RE + r')', text, re.I | re.M))
+        if matches:
+            result['vector_au'] = [_float(matches[-1].group(i)) for i in (1, 2, 3)]
+            result['vector'] = [v * 2.541746473 for v in result['vector_au']]
+            result['vector_units'] = 'debye'
+            result['vector_source'] = 'ORCA Total Dipole Moment vector in atomic units'
+        magnitude = _last_number(text, [r'Magnitude\s*\(\s*Debye\s*\)\s*:\s*(' + FLOAT_RE + r')'])
+        if magnitude is not None:
+            result['magnitude_debye'] = magnitude
+        elif result.get('vector'):
+            result['magnitude_debye'] = math.sqrt(sum(v*v for v in result['vector']))
+            result['magnitude_source'] = 'norm of converted printed atomic-unit vector'
+    elif engine == 'Psi4':
+        headers = list(re.finditer(r'^\s*Dipole\s+Moment\s*:?\s*(?:\[([^]]+)\]|\(([^)]+)\))', text, re.I | re.M))
+        for header in headers:
+            unit = (header.group(1) or header.group(2) or '').strip().lower()
+            factor = 1.0 if unit in ('d', 'debye') else (2.541746473 if unit in ('e a0', 'e a_0', 'a.u.', 'au') else None)
+            if factor is None:
+                continue
+            segment = text[header.end():header.end()+500]
+            match = re.search(r'X\s*[:=]\s*(' + FLOAT_RE + r')\s+Y\s*[:=]\s*('
+                              + FLOAT_RE + r')\s+Z\s*[:=]\s*(' + FLOAT_RE + r')', segment, re.I)
+            if not match:
+                match = re.search(r'\bX\s+Y\s+Z\s+Total\s*\n\s*(' + FLOAT_RE + r')\s+('
+                                  + FLOAT_RE + r')\s+(' + FLOAT_RE + r')', segment, re.I)
+            if match:
+                vector = [_float(match.group(i)) for i in (1, 2, 3)]
+                if all(v is not None for v in vector):
+                    vector = [v * factor for v in vector]
+                    result = {'vector': vector, 'vector_units': 'debye',
+                              'magnitude_debye': math.sqrt(sum(v*v for v in vector)),
+                              'source_units': unit, 'magnitude_source': 'norm of printed vector with confirmed units'}
+    return result
+
+
+def _parse_one_scientific(text, filename, engine):
+    analysis = _LEGACY_ANALYZER_PARSE(text, filename)
+    warnings = list(analysis.get('warnings') or [])
+    analysis['parser_version'] = PARSER_VERSION
+    analysis['normal_termination'], analysis['errors'] = _strict_status(text, engine)
+    analysis.update(_convergence_flags(text, engine))
+    if engine == 'ORCA':
+        analysis['final_geometry'], analysis['geometry_units'], analysis['source_geometry_units'] = _orca_geometry_strict(text)
+        modes = _orca_frequency_table(text)
+        analysis['frequency_modes'] = modes
+        analysis['freq_layout'] = '3N_WITH_RIGID' if modes else None
+        analysis['frequency_layout'] = analysis['freq_layout']
+        analysis['frequencies_cm1'] = [mode['frequency_cm1'] for mode in modes]
+        analysis['imaginary_frequencies_cm1'] = [value for value in analysis['frequencies_cm1'] if value < 0]
+        ir = _orca_spectrum_table(text, 'IR')
+        raman = _orca_spectrum_table(text, 'RAMAN')
+        analysis['ir_modes'], analysis['raman_modes'] = ir, raman
+        analysis['ir_spectrum'] = [(record['frequency_cm1'], record['intensity_km_mol']) for record in ir if record.get('intensity_km_mol') is not None]
+        analysis['raman_spectrum'] = [(record['frequency_cm1'], record['activity_angstrom4_amu']) for record in raman if record.get('activity_angstrom4_amu') is not None]
+        analysis['raman_quantity'] = 'scattering activity'
+        analysis['raman_units'] = 'angstrom^4/amu'
+        analysis['tddft_states'] = _orca_td_table(text)
+        if any(record.get('intensity_km_mol') is None for record in ir):
+            warnings.append('Some IR table rows have no confirmed intensity column; these rows are excluded from the spectrum.')
+        if any(record.get('activity_angstrom4_amu') is None for record in raman):
+            warnings.append('Some Raman table rows have no confirmed activity column; these rows are excluded from the spectrum.')
+        _orca_protocol(text, analysis)
+        # The charge/multiplicity card is explicit input evidence, useful in
+        # cropped files, and is never inferred from atoms or occupations.
+        charge_cards = list(re.finditer(r'^\s*(?:\|\s*\d+>\s*)?\*\s*(?:xyz|xyzfile|int)\s+([-+]?\d+)\s+(\d+)\b', text, re.I | re.M))
+        if charge_cards:
+            for key, index in [('charge', 1), ('multiplicity', 2)]:
+                if (analysis.get('system') or {}).get(key) is None:
+                    analysis.setdefault('system', {})[key] = int(charge_cards[-1].group(index))
+                    analysis['system'][key + '_source'] = 'explicit input coordinate card'
+    else:
+        analysis['orbitals'] = _psi4_orbitals_v59(text)
+        analysis['final_geometry'], analysis['geometry_units'], analysis['source_geometry_units'] = _psi4_geometry_strict(text)
+        analysis['freq_layout'] = 'VIBRATION_ONLY' if analysis.get('frequencies_cm1') else None
+        analysis['frequency_layout'] = analysis['freq_layout']
+        analysis['frequency_modes'] = [{'mode': None, 'frequency_cm1': value} for value in analysis.get('frequencies_cm1') or []]
+    analysis['optimization_energies'] = _optimization_trace(text, engine)
+    analysis['dipole'] = _dipole_strict(text, engine)
+    analysis['orbitals'] = _frontiers_complete((analysis.get('orbitals') or {}).get('orbitals') or [])
+    analysis['conceptual_dft'] = conceptual_dft_descriptors(analysis)
+    thermo, blocks = _strict_thermochemistry(text, engine)
+    analysis['thermochemistry'], analysis['thermochemistry_blocks'] = thermo, blocks
+    reference = thermo.get('electronic_reference_hartree')
+    final = (analysis.get('energies') or {}).get('final_energy_hartree')
+    analysis['thermo_matches_final_energy'] = abs(reference - final) < 1e-6 if reference is not None and final is not None else None
+    if analysis['thermo_matches_final_energy'] is False:
+        warnings.append('Thermochemistry belongs to an earlier electronic-energy record; a later single point was not combined with its corrections.')
+    if len(blocks) > 1:
+        warnings.append('Multiple thermochemistry blocks were retained separately; the last block is the primary thermochemistry result.')
+    if analysis.get('optimization_converged') is False:
+        warnings.append('Geometry optimization did not converge; normal program termination does not establish a stationary structure.')
+    if analysis.get('scf_converged') is False:
+        warnings.append('The final recognized SCF convergence record reports nonconvergence.')
+    if analysis.get('final_geometry') and analysis.get('geometry_units') is None:
+        warnings.append('Coordinate units could not be confirmed; no Angstrom label or conversion was inferred.')
+    # ROOT's quality gate evaluates stationarity and reliability. The parser
+    # provides evidence; it does not promote partial positive frequencies.
+    analysis['stationary_point_status'] = 'NOT_ASSESSED'
+    analysis['thermochemistry_reliability'] = 'NOT_ASSESSED'
+    analysis['warnings'] = list(dict.fromkeys(warnings))
+    analysis['parser_warnings'] = list(analysis['warnings'])
+    for key in ('final_energy_hartree', 'final_energy_ev', 'final_energy_kj_mol'):
+        analysis.setdefault('energies', {}).setdefault(key, None)
+    return analysis
+
+
+def parse_output_text(text, filename='output.out'):
+    """Public parser: explicit evidence, complete arrays and block provenance."""
+    engine = detect_engine(text)
+    if engine not in ('ORCA', 'Psi4'):
+        analysis = _LEGACY_ANALYZER_PARSE(text, filename)
+        analysis['normal_termination'] = None
+        analysis.update({'optimization_requested': None, 'optimization_converged': None, 'scf_converged': None})
+        analysis['warnings'] = ['Calculation engine could not be identified; scientific interpretation is unavailable.']
+        analysis['parser_warnings'] = list(analysis['warnings'])
+        analysis['stationary_point_status'] = 'NOT_ASSESSED'
+        analysis['thermochemistry_reliability'] = 'NOT_ASSESSED'
+        return analysis
+    blocks = _orca_split_jobs(text) if engine == 'ORCA' else _psi4_split_jobs(text)
+    parsed = [_parse_one_scientific(block, filename, engine) for block in blocks]
+    primary = parsed[-1] if parsed else _parse_one_scientific('', filename, engine)
+    if len(parsed) > 1:
+        primary['warnings'].append('Multiple calculation jobs are present; the final job is shown without combining prior jobs.')
+        primary['parser_warnings'] = list(primary['warnings'])
+    primary['job_blocks_count'] = len(parsed)
+    primary['job_blocks'] = [{key: job.get(key) for key in ('engine', 'method', 'basis', 'dispersion', 'normal_termination', 'optimization_requested', 'optimization_converged', 'scf_converged', 'energies', 'thermochemistry', 'final_geometry', 'geometry_units')} for job in parsed]
+    if engine == 'ORCA':
+        primary['orca_job_blocks_count'] = len(parsed)
+        primary['orca_job_blocks'] = [dict(index=index, **{key: job.get(key) for key in ('method', 'basis', 'normal_termination', 'optimization_converged', 'scf_converged')}, final_energy_hartree=(job.get('energies') or {}).get('final_energy_hartree'), tddft_states=len(job.get('tddft_states') or []), frequencies=len(job.get('frequencies_cm1') or [])) for index, job in enumerate(parsed, 1)]
+    return primary
+
+
+
+"""Conservative Gaussian text-output adapter, without engine/network execution.
+
+Scope: common HF/DFT, MP2/MP3 and CCSD/CCSD(T) output, printed Cartesian
+orientations, harmonic frequencies, populations, eigenvalues and transitions.
+Checkpoint extraction is intentionally left to the existing worker pipeline.
+Append after analyzer_core.py and before scientific validation/reporting.
+"""
+import math
+import re
+
+try:
+    _GAUSSIAN_PREVIOUS_PARSE = parse_output_text
+    _GAUSSIAN_PREVIOUS_DETECT = detect_engine
+except NameError:
+    _GAUSSIAN_PREVIOUS_PARSE = None
+    _GAUSSIAN_PREVIOUS_DETECT = None
+
+_GAUSS_FLOAT = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?'
+_GAUSS_HARTREE_EV = 27.211386245988
+_GAUSS_HARTREE_KJMOL = 2625.499638
+_GAUSS_SYMBOLS = ('X H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og').split()
+
+
+def _gauss_number(value):
+    try:
+        result = float(str(value).replace('D', 'E').replace('d', 'e'))
+        return result if math.isfinite(result) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _gauss_last(text, pattern, group=1):
+    matches = list(re.finditer(pattern, text, re.I | re.M))
+    return _gauss_number(matches[-1].group(group)) if matches else None
+
+
+def _is_gaussian_output(text):
+    return bool(re.search(r'^\s*(?:Gaussian\s+(?:16|09)\s*:|Entering\s+Gaussian\s+System|Normal\s+termination\s+of\s+Gaussian\s+(?:16|09))', str(text or ''), re.I | re.M))
+
+
+def _gauss_jobs(text):
+    blocks, current, results_seen = [], [], False
+    boundary = re.compile(r'^\s*(?:Link1:\s*Proceeding\s+to\s+internal\s+job\s+step|--Link1--\s*$|Entering\s+Link\s+1\s*=|Gaussian\s+(?:16|09)\s*:)', re.I)
+    for line in str(text or '').splitlines():
+        if boundary.match(line) and current and results_seen:
+            blocks.append('\n'.join(current))
+            current, results_seen = [], False
+        current.append(line)
+        if re.search(r'SCF\s+Done:|Normal\s+termination|Error\s+termination|Frequencies\s*--', line, re.I):
+            results_seen = True
+    if current:
+        blocks.append('\n'.join(current))
+    return [block for block in blocks if block.strip()]
+
+
+def _gauss_route(text):
+    routes, current, active = [], [], False
+    for line in text.splitlines():
+        if re.match(r'^\s*#\s*\S', line):
+            if current:
+                routes.append(' '.join(current))
+            current, active = [line.strip()], True
+        elif active:
+            if not line.strip() or set(line.strip()) <= set('-='):
+                routes.append(' '.join(current))
+                current, active = [], False
+            else:
+                current.append(line.strip())
+    if current:
+        routes.append(' '.join(current))
+    return routes[-1] if routes else None
+
+
+def _gauss_requested_method(route):
+    if not route:
+        return None
+    for pattern, method in [
+        (r'(?<![\w-])CCSD\(T\)(?![\w-])', 'CCSD(T)'),
+        (r'(?<![\w-])CCSD(?![\w(])', 'CCSD'),
+        (r'(?<![\w-])(?:U|R)?MP3(?![\w])', 'MP3'),
+        (r'(?<![\w-])(?:U|R)?MP2(?![\w])', 'MP2'),
+    ]:
+        if re.search(pattern, route, re.I):
+            return method
+    method = re.search(r'(?<!\S)([A-Za-z][A-Za-z0-9()+\-]*)\s*/', route)
+    return method.group(1) if method else None
+
+
+def _gauss_scf_method(raw):
+    upper = raw.upper()
+    if upper in ('RHF', 'UHF', 'ROHF', 'HF'):
+        return 'HF', upper
+    reference = 'UKS' if upper.startswith('U') else ('RKS' if upper.startswith('R') else None)
+    method = raw[1:] if reference else raw
+    aliases = {'PBE1PBE': 'PBE0', 'B3LYP': 'B3LYP', 'CAM-B3LYP': 'CAM-B3LYP'}
+    return aliases.get(method.upper(), method), reference
+
+
+def _gauss_energies(text, requested):
+    candidates, scf_records = [], []
+    pattern = r'SCF\s+Done:\s+E\(([^)]+)\)\s*=\s*(' + _GAUSS_FLOAT + r')'
+    for match in re.finditer(pattern, text, re.I):
+        value = _gauss_number(match.group(2))
+        method, reference = _gauss_scf_method(match.group(1))
+        if value is not None:
+            record = {'offset': match.start(), 'value': value, 'method': method, 'reference': reference, 'source': 'SCF Done'}
+            scf_records.append(record)
+            candidates.append(record)
+    for pattern, method in [
+        (r'\bCCSD\(T\)\s*=\s*(' + _GAUSS_FLOAT + r')', 'CCSD(T)'),
+        (r'\bE\(CCSD\)\s*=\s*(' + _GAUSS_FLOAT + r')', 'CCSD'),
+        (r'\bE(?:U|R)?MP3\s*=\s*(' + _GAUSS_FLOAT + r')', 'MP3'),
+        (r'\bE(?:U|R)?MP2\s*=\s*(' + _GAUSS_FLOAT + r')', 'MP2'),
+        (r'\bE\((?:R|U)?MP2\)\s*=\s*(' + _GAUSS_FLOAT + r')', 'MP2'),
+    ]:
+        for match in re.finditer(pattern, text, re.I):
+            value = _gauss_number(match.group(1))
+            if value is not None:
+                candidates.append({'offset': match.start(), 'value': value, 'method': method, 'reference': None, 'source': match.group(0).split('=')[0].strip()})
+    if requested in ('CCSD', 'CCSD(T)'):
+        # E(CORR) is a CC total only in a recognized CC route; in other
+        # methods this ambiguous label is not assigned as a final energy.
+        for match in re.finditer(r'\bE\(CORR\)\s*=\s*(' + _GAUSS_FLOAT + r')', text, re.I):
+            value = _gauss_number(match.group(1))
+            if value is not None:
+                candidates.append({'offset': match.start(), 'value': value, 'method': 'CCSD', 'reference': None, 'source': 'E(CORR) in explicit CCSD route'})
+    selected = max(candidates, key=lambda record: record['offset']) if candidates else None
+    reference = scf_records[-1]['reference'] if scf_records else None
+    energies = {'final_energy_hartree': None, 'final_energy_kj_mol': None, 'final_energy_ev': None,
+                'scf_energy_hartree': scf_records[-1]['value'] if scf_records else None}
+    if selected:
+        energies.update(final_energy_hartree=selected['value'], final_energy_kj_mol=selected['value']*_GAUSS_HARTREE_KJMOL,
+                        final_energy_ev=selected['value']*_GAUSS_HARTREE_EV, final_energy_source=selected['source'])
+    return energies, selected['method'] if selected else None, reference, scf_records
+
+
+def _gauss_orientation(text):
+    tables, rows, active, units = [], [], False, None
+    row = re.compile(r'^\s*(\d+)\s+(-?\d+)\s+(-?\d+)\s+(' + _GAUSS_FLOAT + r')\s+(' + _GAUSS_FLOAT + r')\s+(' + _GAUSS_FLOAT + r')\s*$')
+    for line in text.splitlines():
+        if re.match(r'^\s*(?:Standard|Input|Z-Matrix)\s+orientation\s*:', line, re.I):
+            if rows:
+                tables.append((rows, units))
+            rows, active, units = [], True, None
+            continue
+        if not active:
+            continue
+        if re.search(r'Coordinates\s*\(Angstroms?\)', line, re.I):
+            units = 'angstrom'
+        match = row.match(line)
+        if match:
+            atomic = int(match.group(2))
+            xyz = [_gauss_number(match.group(index)) for index in (4, 5, 6)]
+            if not all(value is not None for value in xyz):
+                continue
+            symbol = _GAUSS_SYMBOLS[atomic] if 0 < atomic < len(_GAUSS_SYMBOLS) else 'X'
+            rows.append({'element': symbol, 'x': xyz[0], 'y': xyz[1], 'z': xyz[2], 'source_index': int(match.group(1)), 'atomic_number': atomic})
+        elif rows:
+            tables.append((rows, units))
+            rows, active = [], False
+    if rows:
+        tables.append((rows, units))
+    return tables[-1] if tables else ([], None)
+
+
+def _gauss_vibrations(text):
+    blocks, rows, group, indices, active = [], [], [], [], False
+    for offset, line in enumerate(text.splitlines()):
+        if re.search(r'^\s*Harmonic\s+frequencies\s*\(', line, re.I):
+            if rows:
+                blocks.append(rows)
+            rows, group, indices, active = [], [], [], True
+            continue
+        if re.match(r'^\s*(?:-+\s*)?Thermochemistry\s*(?:-+)?\s*$', line, re.I):
+            active = False
+            continue
+        match = re.match(r'^\s*Frequencies\s*--\s*(.*)$', line, re.I)
+        if match:
+            active = True
+            values = [_gauss_number(token) for token in match.group(1).split()]
+            group = [{'mode': indices[index] if index < len(indices) else None,
+                      'frequency_cm1': value, 'intensity_km_mol': None,
+                      'activity_angstrom4_amu': None, 'depolarization_ratio': None}
+                     for index, value in enumerate(values)]
+            rows.extend(record for record in group if record['frequency_cm1'] is not None)
+            indices = []
+            continue
+        if not active:
+            continue
+        if re.fullmatch(r'\s*\d+(?:\s+\d+){0,2}\s*', line):
+            indices = [int(token) for token in line.split()]
+        for label, key in [(r'IR\s+Inten', 'intensity_km_mol'), (r'Raman\s+Activ', 'activity_angstrom4_amu'), (r'Depolar\s*\(P\)', 'depolarization_ratio')]:
+            match = re.match(r'^\s*'+label+r'\s*--\s*(.*)$', line, re.I)
+            if match and group:
+                values = [_gauss_number(token) for token in match.group(1).split()]
+                for record, value in zip(group, values):
+                    record[key] = value
+    if rows:
+        blocks.append(rows)
+    return blocks[-1] if blocks else [], blocks
+
+
+def _gauss_orbitals(text, reference):
+    rows, tables = [], []
+    seen_virtual = False
+    pattern = re.compile(r'^\s*(Alpha|Beta)\s+(occ\.|virt\.)\s+eigenvalues\s*--\s*(.*)$', re.I)
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        spin, occupancy = match.group(1).lower(), 1.0 if match.group(2).lower() == 'occ.' else 0.0
+        if spin == 'alpha' and occupancy == 1.0 and seen_virtual:
+            if rows:
+                tables.append(rows)
+            rows, seen_virtual = [], False
+        if spin == 'alpha' and occupancy == 0.0:
+            seen_virtual = True
+        for token in match.group(3).split():
+            energy = _gauss_number(token)
+            if energy is not None:
+                label_spin = 'restricted' if reference in ('RHF', 'RKS') else spin
+                occ = 2.0 if occupancy == 1.0 and label_spin == 'restricted' else occupancy
+                index = sum(record['spin'] == label_spin for record in rows) + 1
+                rows.append({'index': index, 'spin': label_spin, 'occ': occ, 'eh': energy, 'ev': energy*_GAUSS_HARTREE_EV})
+    if rows:
+        tables.append(rows)
+    records = tables[-1] if tables else []
+    if '_frontiers_complete' in globals():
+        return _frontiers_complete(records)
+    occupied = [record['ev'] for record in records if record['occ'] > 0]
+    virtual = [record['ev'] for record in records if record['occ'] == 0]
+    h, l = max(occupied, default=None), min(virtual, default=None)
+    return {'orbitals': records, 'homo_ev': h, 'lumo_ev': l, 'gap_ev': l-h if h is not None and l is not None else None}
+
+
+def _gauss_thermo(text, scf_records, method, basis):
+    header = list(re.finditer(r'^\s*(?:-+\s*)?Thermochemistry\s*(?:-+)?\s*$|^\s*Temperature\s+' + _GAUSS_FLOAT + r'\s+Kelvin', text, re.I | re.M))
+    # Temperature directly following a Thermochemistry header is in the same
+    # block. Start a new block only after previously printed thermal totals.
+    starts = []
+    for match in header:
+        if not starts or re.search(r'Sum of electronic and', text[starts[-1]:match.start()], re.I):
+            starts.append(match.start())
+    if not starts and re.search(r'Zero-point correction|Sum of electronic and thermal', text, re.I):
+        starts = [0]
+    blocks, warnings = [], []
+    for index, start in enumerate(starts):
+        segment = text[start:(starts[index+1] if index+1 < len(starts) else len(text))]
+        t = {key: None for key in ('temperature_K', 'pressure_atm', 'zpe_hartree', 'energy_0K_hartree', 'thermal_energy_correction_hartree', 'enthalpy_correction_hartree', 'gibbs_correction_hartree', 'internal_energy_hartree', 'thermal_energy_hartree', 'enthalpy_hartree', 'gibbs_hartree', 'entropy_J_mol_K', 'electronic_energy_hartree', 'electronic_reference_hartree', 'thermo_treatment', 'thermo_method', 'thermo_basis')}
+        t['temperature_K'] = _gauss_last(segment, r'\bTemperature\s+('+_GAUSS_FLOAT+r')\s+Kelvin')
+        t['pressure_atm'] = _gauss_last(segment, r'\bPressure\s+('+_GAUSS_FLOAT+r')\s+Atm\b')
+        labels = {
+            'zpe_hartree': r'Zero-point\s+correction',
+            'thermal_energy_correction_hartree': r'Thermal\s+correction\s+to\s+Energy',
+            'enthalpy_correction_hartree': r'Thermal\s+correction\s+to\s+Enthalpy',
+            'gibbs_correction_hartree': r'Thermal\s+correction\s+to\s+Gibbs\s+Free\s+Energy',
+            'energy_0K_hartree': r'Sum\s+of\s+electronic\s+and\s+zero-point\s+Energies',
+            'internal_energy_hartree': r'Sum\s+of\s+electronic\s+and\s+thermal\s+Energies',
+            'enthalpy_hartree': r'Sum\s+of\s+electronic\s+and\s+thermal\s+Enthalpies',
+            'gibbs_hartree': r'Sum\s+of\s+electronic\s+and\s+thermal\s+Free\s+Energies',
+        }
+        for key, label in labels.items():
+            t[key] = _gauss_last(segment, label+r'\s*=\s*('+_GAUSS_FLOAT+r')')
+        references = []
+        for total, correction in [('energy_0K_hartree', 'zpe_hartree'), ('internal_energy_hartree', 'thermal_energy_correction_hartree'), ('enthalpy_hartree', 'enthalpy_correction_hartree'), ('gibbs_hartree', 'gibbs_correction_hartree')]:
+            if t[total] is not None and t[correction] is not None:
+                references.append(t[total]-t[correction])
+        previous = [record for record in scf_records if record['offset'] < start]
+        if references and max(references)-min(references) <= 5e-6:
+            t['electronic_energy_hartree'] = references[-1]
+            t['reference_energy_source'] = 'printed thermal sum minus its printed correction'
+        elif references:
+            warnings.append('Printed Gaussian thermal sums/corrections give inconsistent electronic reference energies.')
+        elif previous:
+            t['electronic_energy_hartree'] = previous[-1]['value']
+            t['reference_energy_source'] = 'preceding SCF Done record; no paired thermal sum/correction available'
+        t['electronic_reference_hartree'] = t['electronic_energy_hartree']
+        if previous and t['electronic_energy_hartree'] is not None and abs(t['electronic_energy_hartree']-previous[-1]['value']) <= 5e-6:
+            t['thermo_method'] = previous[-1]['method']
+            t['thermo_basis'] = basis
+        # Explicit harmonic frequency context identifies the approximation;
+        # the default is not inferred merely from a Gaussian version.
+        if re.search(r'Harmonic\s+frequencies\s*\(', text[:start], re.I):
+            t['thermo_treatment'] = 'Gaussian harmonic thermochemistry'
+        t['thermal_energy_hartree'] = t['internal_energy_hartree']
+        h, g, temp = t['enthalpy_hartree'], t['gibbs_hartree'], t['temperature_K']
+        if h is not None and g is not None and temp is not None and temp > 0:
+            t['entropy_J_mol_K'] = (h-g)*_GAUSS_HARTREE_KJMOL*1000/temp
+            t['entropy_source'] = '(H-G)/T from printed totals'
+        t['block_index'] = index+1
+        for key in list(t):
+            if key.endswith('_hartree') and t[key] is not None:
+                t[key.replace('_hartree', '_kj_mol')] = t[key]*_GAUSS_HARTREE_KJMOL
+        if any(t[key] is not None for key in ('zpe_hartree', 'enthalpy_hartree', 'gibbs_hartree')):
+            blocks.append(t)
+    empty = {key: None for key in ('temperature_K', 'pressure_atm', 'zpe_hartree', 'enthalpy_hartree', 'gibbs_hartree', 'electronic_energy_hartree', 'electronic_reference_hartree', 'thermo_method', 'thermo_basis', 'thermo_treatment')}
+    return dict(blocks[-1]) if blocks else empty, blocks, warnings
+
+
+def _parse_gaussian_one(text, filename):
+    warnings = []
+    route = _gauss_route(text)
+    requested = _gauss_requested_method(route)
+    energies, method, reference, scf_records = _gauss_energies(text, requested)
+    standard = list(re.finditer(r'^\s*Standard\s+basis:\s*([^\n]+)', text, re.I | re.M))
+    basis = standard[-1].group(1).strip().split()[0] if standard else None
+    basis_details = standard[-1].group(1).strip() if standard else None
+    if basis is None and route:
+        basis_match = re.search(r'/\s*([^\s]+)', route)
+        basis = basis_match.group(1) if basis_match else None
+    normal_marks = [(match.start(), True) for match in re.finditer(r'^\s*Normal\s+termination\s+of\s+Gaussian\b', text, re.I | re.M)]
+    fail_pattern = r'^\s*Error\s+termination|Convergence\s+failure\s*--|Erroneous\s+write|Out\s+of\s+memory|galloc:|Segmentation\s+violation'
+    normal_marks += [(match.start(), False) for match in re.finditer(fail_pattern, text, re.I | re.M)]
+    normal = max(normal_marks, key=lambda pair: pair[0])[1] if normal_marks else None
+    scf_failed = list(re.finditer(r'Convergence\s+failure\s*--|SCF\s+(?:failed|did\s+not\s+converge)', text, re.I))
+    last_scf = scf_records[-1]['offset'] if scf_records else -1
+    scf_converged = False if scf_failed and scf_failed[-1].start() > last_scf else (True if scf_records else None)
+    opt_marks = [(match.start(), True) for match in re.finditer(r'^\s*(?:Optimization\s+completed\.|Stationary\s+point\s+found\.)', text, re.I | re.M)]
+    opt_marks += [(match.start(), False) for match in re.finditer(r'^\s*Optimization\s+stopped\.|Number\s+of\s+steps\s+exceeded', text, re.I | re.M)]
+    opt_converged = max(opt_marks, key=lambda pair: pair[0])[1] if opt_marks else None
+    opt_requested = True if opt_marks or re.search(r'Berny\s+optimization|\bOpt(?:\b|=|\()', route or '', re.I) else (False if route else None)
+    geometry, geometry_units = _gauss_orientation(text)
+    vibrations, vibration_blocks = _gauss_vibrations(text)
+    thermo, thermo_blocks, thermo_warnings = _gauss_thermo(text, scf_records, method, basis)
+    warnings.extend(thermo_warnings)
+    if len(vibration_blocks) > 1:
+        warnings.append('Multiple Gaussian harmonic frequency tables are retained separately; the last table is used.')
+    if len(thermo_blocks) > 1:
+        warnings.append('Multiple Gaussian thermochemistry blocks are retained separately; the last block is used.')
+    if geometry and geometry_units is None:
+        warnings.append('Gaussian Cartesian orientation units were not confirmed.')
+    if requested in ('MP2', 'MP3', 'CCSD', 'CCSD(T)') and method != requested:
+        warnings.append('Requested correlated method has no matching recognized final total energy; the parsed energy is labeled by its printed method.')
+        energies.update(final_energy_hartree=None, final_energy_kj_mol=None, final_energy_ev=None)
+        method = None
+    unsupported = bool(re.search(r'\b(?:ONIOM|CBS-QB3|G[234]|W1BD|W1U|W2U|QCISD|CAS|CASSCF)\b', route or '', re.I))
+    if unsupported:
+        warnings.append('This composite/multireference/ONIOM route is outside the supported Gaussian energy parser; subsystem SCF energies are not labeled as a final total.')
+        energies.update(final_energy_hartree=None, final_energy_kj_mol=None, final_energy_ev=None)
+        method = None
+    numerical_frequency = bool(re.search(r'\bFreq\s*=\s*\(?\s*(?:[^\n)]*\b)?Numer(?:ical)?\b', route or '', re.I))
+    if numerical_frequency:
+        warnings.append('Numerical-frequency SCF displacement energies are not promoted to a final equilibrium electronic energy.')
+        energies.update(final_energy_hartree=None, final_energy_kj_mol=None, final_energy_ev=None)
+    system_match = list(re.finditer(r'\bCharge\s*=\s*([-+]?\d+)\s+Multiplicity\s*=\s*(\d+)', text, re.I))
+    system = {'charge': int(system_match[-1].group(1)) if system_match else None, 'multiplicity': int(system_match[-1].group(2)) if system_match else None}
+    dipole = {}
+    dipoles = list(re.finditer(r'Dipole\s+moment\s*\([^\n]*Debye\)\s*:\s*\n\s*X\s*=\s*('+_GAUSS_FLOAT+r')\s+Y\s*=\s*('+_GAUSS_FLOAT+r')\s+Z\s*=\s*('+_GAUSS_FLOAT+r')\s+Tot\s*=\s*('+_GAUSS_FLOAT+r')', text, re.I))
+    if dipoles:
+        values = [_gauss_number(dipoles[-1].group(index)) for index in range(1,5)]
+        dipole = {'vector': values[:3], 'magnitude_debye': values[3], 'units': 'debye'}
+    transitions = []
+    transition_pattern = r'Excited\s+State\s+(\d+)\s*:\s*(.*?)\s+('+_GAUSS_FLOAT+r')\s+eV\s+('+_GAUSS_FLOAT+r')\s+nm\s+f\s*=\s*('+_GAUSS_FLOAT+r')'
+    for match in re.finditer(transition_pattern, text, re.I):
+        ev, nm, strength = [_gauss_number(match.group(index)) for index in (3,4,5)]
+        state_index = int(match.group(1))
+        if transitions and state_index <= transitions[-1]['state']:
+            transitions = []
+        if ev is not None and ev > 0 and nm is not None and nm > 0 and strength is not None and strength >= 0:
+            if abs(ev * nm - 1239.841984) > 2.5:
+                warnings.append('An inconsistent Gaussian excitation energy/wavelength pair was excluded from spectral rendering.')
+                continue
+            transitions.append({'state': state_index, 'symmetry': match.group(2).strip(), 'ev': ev, 'nm': nm, 'f': strength, 'cm1': ev*8065.544005})
+    charges, active = [], False
+    for line in text.splitlines():
+        if re.match(r'^\s*Mulliken\s+charges(?:\s+and\s+spin\s+densities)?\s*:', line, re.I):
+            charges, active = [], True
+            continue
+        if active:
+            match = re.match(r'^\s*(\d+)\s+([A-Za-z]{1,2})\s+('+_GAUSS_FLOAT+r')(?:\s|$)', line)
+            if match:
+                charges.append({'index': int(match.group(1)), 'element': match.group(2), 'charge': _gauss_number(match.group(3))})
+            elif charges:
+                active = False
+    orbitals = _gauss_orbitals(text, reference)
+    dispersion = None
+    dispersion_match = re.search(r'EmpiricalDispersion\s*=\s*(?:\()?\s*(GD3BJ|GD3|GD2)', route or '', re.I)
+    if dispersion_match:
+        dispersion = {'GD3BJ': 'D3BJ', 'GD3': 'D3', 'GD2': 'D2'}[dispersion_match.group(1).upper()]
+    solvent_match = re.search(r'Solvent\s*=\s*([A-Za-z0-9()_\-]+)', route or '', re.I)
+    solvent = solvent_match.group(1).rstrip(')') if solvent_match else None
+    solvation = 'SMD' if re.search(r'\bSCRF\s*=.*?\bSMD\b', route or '', re.I) else ('PCM' if re.search(r'\bSCRF\b', route or '', re.I) else None)
+    frequencies = [record['frequency_cm1'] for record in vibrations]
+    final = energies.get('final_energy_hartree')
+    thermal_ref = thermo.get('electronic_energy_hartree')
+    compatible = abs(final-thermal_ref) <= 5e-6 if final is not None and thermal_ref is not None else None
+    if compatible is False:
+        warnings.append('Gaussian thermochemistry reference differs from the final electronic energy; no composite thermal correction was applied.')
+    version = re.search(r'Gaussian\s+(16|09)\s*:', text, re.I)
+    revision = re.search(r'G(?:16|09)Rev([A-Za-z0-9.]+)', text, re.I)
+    analysis = {
+        'filename': filename, 'engine': 'Gaussian', 'version': (version.group(1) if version else None), 'revision': revision.group(1) if revision else None,
+        'parser_version': 'Gaussian-common-text-1.0', 'gaussian_parser_scope': 'Common HF/DFT, MP2/MP3 and CCSD/CCSD(T) text output; other protocols remain unverified',
+        'normal_termination': normal, 'errors': [line.strip() for line in text.splitlines() if re.search(fail_pattern, line, re.I)],
+        'optimization_requested': opt_requested, 'optimization_converged': opt_converged, 'scf_converged': scf_converged,
+        'method': method, 'method_requested': requested, 'basis': basis, 'basis_details': basis_details, 'reference': reference, 'dispersion': dispersion,
+        'route': route, 'solvation_model': solvation, 'solvent': solvent, 'method_components': {},
+        'energies': energies, 'thermochemistry': thermo, 'thermochemistry_blocks': thermo_blocks, 'thermo_matches_final_energy': compatible,
+        'final_geometry': geometry, 'geometry_units': geometry_units, 'source_geometry_units': geometry_units, 'system': system,
+        'frequency_modes': vibrations, 'frequency_blocks': vibration_blocks, 'frequencies_cm1': frequencies,
+        'imaginary_frequencies_cm1': [value for value in frequencies if value < 0], 'frequency_layout': 'VIBRATION_ONLY' if vibrations else None,
+        'ir_spectrum': [(record['frequency_cm1'], record['intensity_km_mol']) for record in vibrations if record['intensity_km_mol'] is not None],
+        'raman_spectrum': [(record['frequency_cm1'], record['activity_angstrom4_amu']) for record in vibrations if record['activity_angstrom4_amu'] is not None],
+        'ir_modes': vibrations, 'raman_modes': vibrations, 'raman_quantity': 'scattering activity', 'raman_units': 'angstrom^4/amu',
+        'orbitals': orbitals, 'dipole': dipole, 'atomic_charges': charges, 'atomic_charge_type': 'mulliken' if charges else None,
+        'tddft_states': transitions, 'timings': {'wall_seconds': None, 'cpu_seconds': None}, 'optimization_energies': [],
+        'stationary_point_status': 'NOT_ASSESSED', 'thermochemistry_reliability': 'NOT_ASSESSED', 'warnings': warnings, 'parser_warnings': list(warnings),
+    }
+    if 'conceptual_dft_descriptors' in globals():
+        analysis['conceptual_dft'] = conceptual_dft_descriptors(analysis)
+    else:
+        analysis['conceptual_dft'] = {}
+    for label, key in [('Elapsed time', 'wall_seconds'), ('Job cpu time', 'cpu_seconds')]:
+        match = re.search(label+r':\s*(\d+)\s+days\s+(\d+)\s+hours\s+(\d+)\s+minutes\s+('+_GAUSS_FLOAT+r')\s+seconds', text, re.I)
+        if match:
+            days, hours, minutes, seconds = [_gauss_number(value) for value in match.groups()]
+            analysis['timings'][key] = days*86400+hours*3600+minutes*60+seconds
+    return analysis
+
+
+def detect_engine(text):
+    if _is_gaussian_output(text):
+        return 'Gaussian'
+    return _GAUSSIAN_PREVIOUS_DETECT(text) if _GAUSSIAN_PREVIOUS_DETECT else 'Unknown'
+
+
+def parse_output_text(text, filename='output.out'):
+    if not _is_gaussian_output(text):
+        if _GAUSSIAN_PREVIOUS_PARSE:
+            return _GAUSSIAN_PREVIOUS_PARSE(text, filename)
+        return {'filename': filename, 'engine': 'Unknown', 'normal_termination': None,
+                'warnings': ['Gaussian output identity could not be confirmed.']}
+    blocks = [_parse_gaussian_one(block, filename) for block in _gauss_jobs(text)]
+    primary = blocks[-1]
+    primary['job_blocks_count'] = len(blocks)
+    primary['job_blocks'] = [{key: block.get(key) for key in ('method', 'basis', 'normal_termination', 'energies', 'thermochemistry', 'final_geometry', 'optimization_converged', 'scf_converged')} for block in blocks]
+    if len(blocks) > 1:
+        primary['warnings'].append('Multiple Gaussian Link1 jobs are present; final-job properties are shown without inheriting earlier thermal corrections.')
+        primary['parser_warnings'] = list(primary['warnings'])
+    return primary
+
+
+"""Conservative scientific validation and reaction checks (no bot/network side effects)."""
+import copy
+import hashlib
+import math
+import re
+from pathlib import Path
+
+ANALYSIS_SCHEMA_VERSION = "2.0"
+PARSER_VERSION = "7.1.0"
+HARTREE_TO_KJMOL = 2625.499638
+HARTREE_TO_EV = 27.211386245988
+GAS_CONSTANT_J_MOL_K = 8.314462618
+BOHR_TO_ANGSTROM = 0.529177210903
+IMAGINARY_NOISE_THRESHOLD_CM1 = 10.0
+
+
+def _finite_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).replace("D", "E").replace("d", "e"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _unique_messages(messages):
+    return list(dict.fromkeys(str(message) for message in messages if message))
+
+
+def _clean_nonfinite(value, path="", warnings=None):
+    warnings = [] if warnings is None else warnings
+    if isinstance(value, float) and not math.isfinite(value):
+        warnings.append("Non-finite value omitted at " + (path or "root") + ".")
+        return None
+    if isinstance(value, dict):
+        return {str(key): _clean_nonfinite(item, path + "." + str(key), warnings)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_nonfinite(item, path + "[" + str(index) + "]", warnings)
+                for index, item in enumerate(value)]
+    return value
+
+
+def _molecule_mode_counts(geometry):
+    """Return atom count, linearity and internal-mode count; reject ghost-only data."""
+    atoms = []
+    for row in geometry or []:
+        symbol = str(row.get("element", ""))
+        xyz = [_finite_number(row.get(axis)) for axis in ("x", "y", "z")]
+        if symbol.endswith(":") or symbol.upper() in ("X", "GH", "DA") or None in xyz:
+            continue
+        if not re.fullmatch(r"[A-Z][a-z]?", symbol):
+            continue
+        atoms.append(xyz)
+    count = len(atoms)
+    if not count:
+        return None, None, None
+    if count == 1:
+        return 1, None, 0
+    if count == 2:
+        return 2, True, 1
+    try:
+        import numpy as np
+        coordinates = np.asarray(atoms, dtype=float)
+        singular = np.linalg.svd(coordinates - coordinates.mean(axis=0), compute_uv=False)
+        if not len(singular) or singular[0] < 1e-8:
+            return count, None, None
+        linear = bool(len(singular) < 2 or singular[1] <= max(1e-6, singular[0] * 1e-6))
+    except ImportError:
+        return count, None, None
+    return count, linear, 3 * count - (5 if linear else 6)
+
+
+def _theory_signature(analysis):
+    details = analysis.get("method_details") or {}
+    reference = analysis.get("reference") or (analysis.get("psi4_details") or {}).get("reference")
+    return {
+        "method": analysis.get("method"),
+        "basis": analysis.get("basis"),
+        "dispersion": analysis.get("dispersion"),
+        "reference": reference,
+        "relativistic": analysis.get("relativistic") or details.get("relativistic"),
+        "solvation_model": analysis.get("solvation_model"),
+        "solvent": analysis.get("solvent"),
+        "basis_details": analysis.get("basis_details"),
+    }
+
+
+def validate_analysis(analysis, source_text=None):
+    """Validate available evidence; missing checks never become convergence claims."""
+    if not isinstance(analysis, dict):
+        raise TypeError("Analysis must be a dictionary.")
+    warnings = list(analysis.get("warnings") or []) + list(analysis.get("parser_warnings") or [])
+    a = _clean_nonfinite(copy.deepcopy(analysis), warnings=warnings)
+    for key in ("energies", "thermochemistry", "system", "orbitals", "provenance"):
+        if not isinstance(a.get(key), dict):
+            a[key] = {}
+    a["geometry_units"] = a.get("geometry_units") or "UNKNOWN"
+    a["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
+    a["parser_version"] = PARSER_VERSION
+    if source_text is not None:
+        a["source_sha256"] = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        a["source_hash_scope"] = "UTF-8 decoded output text"
+    a["units"] = {
+        "energy": "hartree", "orbital_energy": "eV", "geometry": a["geometry_units"],
+        "frequency": "cm^-1", "ir_stick_intensity": "km mol^-1",
+        "raman_activity": "angstrom^4 u^-1", "dipole": "debye",
+        "temperature": "K", "pressure": "atm", "entropy": "J mol^-1 K^-1",
+    }
+    e = _finite_number(a["energies"].get("final_energy_hartree"))
+    if e is not None:
+        a["energies"]["final_energy_kj_mol"] = e * HARTREE_TO_KJMOL
+        a["energies"]["final_energy_ev"] = e * HARTREE_TO_EV
+    if e is not None and (not a.get("method") or not a.get("basis")):
+        warnings.append("Method/basis metadata was not verified for the selected energy.")
+
+    geom = a.get("final_geometry") or []
+    count, linear, expected = _molecule_mode_counts(geom)
+    if geom and a["geometry_units"] != "angstrom":
+        linear, expected = None, None
+        warnings.append("Coordinate units are not verified; geometry-based mode completeness is withheld.")
+    frequencies = [_finite_number(value) for value in a.get("frequencies_cm1") or []]
+    frequencies = [value for value in frequencies if value is not None]
+    a["frequencies_cm1"] = frequencies
+    layout = a.get("frequency_layout")
+    rigid = []
+    internal = frequencies[:]
+    if count and a.get("engine") == "ORCA" and len(frequencies) == 3 * count:
+        rigid_count = 3 * count - expected if expected is not None else None
+        if rigid_count is not None and all(abs(v) <= IMAGINARY_NOISE_THRESHOLD_CM1 for v in frequencies[:rigid_count]):
+            rigid, internal = frequencies[:rigid_count], frequencies[rigid_count:]
+            layout = "3N_WITH_RIGID"
+        else:
+            warnings.append("Rigid-body modes could not be safely separated from the 3N frequency table.")
+    elif expected is not None and len(frequencies) == expected:
+        layout = "VIBRATION_ONLY"
+    frequency_complete = (len(internal) == expected) if expected is not None and (frequencies or expected == 0) else None
+    if expected is not None and frequencies and frequency_complete is False:
+        warnings.append("Frequency table is incomplete or its mode layout is not verified.")
+    a["frequency_layout"] = layout or "UNKNOWN"
+    a["internal_frequencies_cm1"] = internal
+    a["rigid_body_frequencies_cm1"] = rigid
+    a["expected_vibration_count"] = expected
+    a["imaginary_frequencies_cm1"] = [v for v in internal if v < -IMAGINARY_NOISE_THRESHOLD_CM1]
+    a["near_zero_imaginary_frequencies_cm1"] = [v for v in internal if -IMAGINARY_NOISE_THRESHOLD_CM1 <= v < 0]
+    significant = a["imaginary_frequencies_cm1"]
+    weak = a["near_zero_imaginary_frequencies_cm1"]
+    if weak:
+        warnings.append("Small negative internal frequencies require mode inspection; they are not automatically accepted as minima.")
+    if significant:
+        warnings.append("Imaginary internal modes require displacement/gradient inspection; a transition state also needs reaction-path verification.")
+
+    termination = a.get("normal_termination")
+    normal = termination is True
+    scf = a.get("scf_converged") if a.get("scf_converged") in (True, False, None) else None
+    opt_requested = a.get("optimization_requested")
+    opt = a.get("optimization_converged") if a.get("optimization_converged") in (True, False, None) else None
+    stationary_verified = opt is True or a.get("gradient_converged") is True or count == 1
+    process_rc = a.get("process_returncode")
+    process_failed = process_rc is not None and process_rc != 0
+    failed = termination is False or process_failed or scf is False or (opt_requested is True and opt is False)
+    if not normal:
+        warnings.append("Normal program termination was not confirmed.")
+    if process_failed:
+        warnings.append("Calculation process returned a non-zero exit status.")
+    if scf is False:
+        warnings.append("SCF convergence failed.")
+    elif scf is None:
+        warnings.append("SCF convergence was not confirmed from a recognized runtime record.")
+    if opt_requested is True and opt is not True:
+        warnings.append("Requested geometry optimization was not confirmed converged.")
+    if frequencies and not stationary_verified:
+        warnings.append("Stationarity of the frequency geometry was not independently confirmed.")
+    if failed:
+        point = "FAILED_OR_UNCONVERGED"
+    elif not normal:
+        point = "UNCONFIRMED_CALCULATION"
+    elif scf is not True:
+        point = "UNVERIFIED_ELECTRONIC_STATE"
+    elif frequency_complete is not True:
+        point = "NO_VERIFIED_HESSIAN" if not frequencies else "INCOMPLETE_FREQUENCIES"
+    elif len(significant) > 1:
+        point = "HIGHER_ORDER_SADDLE_CANDIDATE"
+    elif len(significant) == 1:
+        point = "FIRST_ORDER_SADDLE_CANDIDATE"
+    elif weak:
+        point = "NEAR_ZERO_IMAGINARY_MODES"
+    elif stationary_verified:
+        point = "LIKELY_MINIMUM" if count != 1 else "MONATOMIC_SPECIES"
+    else:
+        point = "STATIONARITY_UNVERIFIED"
+
+    t = a["thermochemistry"]
+    temperature = _finite_number(t.get("temperature_K"))
+    pressure = _finite_number(t.get("pressure_atm"))
+    h = _finite_number(t.get("enthalpy_hartree"))
+    g = _finite_number(t.get("gibbs_hartree"))
+    thermo_e = _finite_number(t.get("electronic_energy_hartree"))
+    energy_compatible = (abs(e - thermo_e) <= 5e-6) if e is not None and thermo_e is not None else None
+    if energy_compatible is False:
+        warnings.append("Thermochemical reference electronic energy differs from the selected final energy; no composite correction was applied.")
+    elif energy_compatible is None and (h is not None or g is not None):
+        warnings.append("Association of thermochemistry with the selected electronic energy was not verified.")
+    entropy = _finite_number(t.get("entropy_J_mol_K"))
+    if h is not None and g is not None and temperature and temperature > 0:
+        derived_entropy = (h - g) * HARTREE_TO_KJMOL * 1000.0 / temperature
+        t["entropy_from_H_minus_G_J_mol_K"] = derived_entropy
+        if entropy is not None and abs(derived_entropy - entropy) > max(1.0, 0.02 * abs(entropy)):
+            energy_compatible = False
+            warnings.append("Printed entropy and (H-G)/T are inconsistent; check units and thermochemistry blocks.")
+        elif entropy is None:
+            t["entropy_J_mol_K"] = derived_entropy
+            t["entropy_source"] = "(H-G)/T"
+    if a.get("solvation_model") or a.get("solvent"):
+        reference_state = t.get("standard_state") or "CONTINUUM_ELECTRONIC_PLUS_GAS_THERMAL_REFERENCE"
+    else:
+        reference_state = t.get("standard_state") or ("IDEAL_GAS_AT_PARSED_PRESSURE" if pressure and pressure > 0 else "UNVERIFIED")
+    thermo_reliable = bool(
+        normal and not failed and e is not None and scf is True and stationary_verified and frequency_complete is True
+        and not significant and not weak and energy_compatible is True
+        and temperature is not None and temperature > 0 and pressure is not None and pressure > 0
+        and h is not None and g is not None
+    )
+    a["stationary_point_status"] = point
+    a["thermochemistry_reliability"] = "VERIFIED_AVAILABLE_CHECKS" if thermo_reliable else "NOT_FULLY_VERIFIED"
+    has_thermal_values = any(_finite_number(t.get(key)) is not None for key in
+                             ("temperature_K", "zpe_hartree", "enthalpy_hartree", "gibbs_hartree", "entropy_J_mol_K"))
+    if has_thermal_values and not thermo_reliable:
+        warnings.append("Thermochemical values are extracted values; not all reliability checks are satisfied.")
+    if e is None:
+        warnings.append("A final electronic energy was not recognized.")
+    status = "FAIL" if failed else ("WARNING" if warnings else ("PASS" if scf is True else "UNVERIFIED"))
+    q = {
+        "status": status, "program_terminated_normally": normal,
+        "scf_converged": scf, "optimization_requested": opt_requested,
+        "optimization_converged": opt, "frequency_complete": frequency_complete,
+        "stationary_point_status": point, "thermochemistry_reliable": thermo_reliable,
+        "thermochemical_energy_compatible": energy_compatible,
+        "geometry_stationarity_verified": stationary_verified,
+        "imaginary_noise_threshold_cm1": IMAGINARY_NOISE_THRESHOLD_CM1,
+        "vibration_count": len(internal), "expected_vibration_count": expected,
+        "atom_count": count, "linear_molecule": linear,
+        "level_of_theory": _theory_signature(a), "standard_state": reference_state,
+        "temperature_K": temperature, "pressure_atm": pressure,
+        "warnings": _unique_messages(warnings),
+    }
+    a["quality"] = q
+    a["warnings"] = q["warnings"]
+    # Frontier-orbital descriptors are approximations, even for a converged SCF.
+    # Withhold them for failed/unverified wavefunctions; keep raw orbital rows.
+    if normal and not failed and scf is True:
+        a['conceptual_dft'] = conceptual_dft_descriptors(a)
+        a['conceptual_dft_validity'] = 'FRONTIER_ORBITAL_APPROXIMATION'
+        if a['conceptual_dft']:
+            a['conceptual_dft_convention'] = 'eta=(I-A)/2; softness=1/(I-A)=1/(2*eta)'
+    else:
+        a['conceptual_dft'] = {}
+        a['conceptual_dft_validity'] = 'WITHHELD_UNVERIFIED_WAVEFUNCTION'
+    a["provenance"].update({
+        "parser_version": PARSER_VERSION, "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "source_sha256": a.get("source_sha256"), "engine": a.get("engine"),
+        "engine_version": a.get("version"),
+    })
+    return a
+
+
+def evaluate_reaction_terms(reactants, products, analyses_by_name, equation):
+    """Calculate only differences supported by balanced, comparable evidence."""
+    def resolve(name):
+        key = Path(name).stem.lower()
+        if key not in analyses_by_name:
+            raise ValueError("No parsed output found for " + repr(name) + ". Upload its output first.")
+        return analyses_by_name[key]
+    species = [resolve(name) for _, name in reactants + products]
+    if any(not a.get("normal_termination") for a in species):
+        raise ValueError("Each species must confirm normal program termination.")
+    warnings = []
+    def canonical(value):
+        if isinstance(value, dict):
+            return tuple(sorted((key, canonical(item)) for key, item in value.items()))
+        if isinstance(value, (tuple, list)):
+            return tuple(canonical(item) for item in value)
+        return str(value).strip().casefold() if value is not None else None
+    signatures = [_theory_signature(a) for a in species]
+    comparable = all(signature.get("method") and signature.get("basis") for signature in signatures)
+    if not comparable:
+        warnings.append("Method/basis was not identified for every species.")
+    if len({canonical(signature) for signature in signatures}) != 1:
+        comparable = False
+        warnings.append("Methods, basis details, dispersion, reference, or solvation conditions differ.")
+    balance = {}
+    charge_delta = 0.0
+    balance_known = True
+    for sign, terms in ((-1.0, reactants), (1.0, products)):
+        for coefficient, name in terms:
+            if _finite_number(coefficient) is None or coefficient <= 0:
+                raise ValueError("Stoichiometric coefficients must be positive finite numbers.")
+            analysis = resolve(name)
+            geometry = analysis.get("final_geometry") or []
+            if not geometry:
+                balance_known = False
+            for atom in geometry:
+                element = str(atom.get("element", ""))
+                if element.endswith(":") or element.upper() in ("X", "GH", "DA"):
+                    continue
+                if not re.fullmatch(r"[A-Z][a-z]?", element):
+                    balance_known = False
+                    continue
+                balance[element] = balance.get(element, 0.0) + sign * coefficient
+            charge = _finite_number((analysis.get("system") or {}).get("charge"))
+            if charge is None:
+                balance_known = False
+            else:
+                charge_delta += sign * coefficient * charge
+    if any(abs(value) > 1e-6 for value in balance.values()):
+        raise ValueError("Reaction is not atom balanced: " + str(balance))
+    if abs(charge_delta) > 1e-6:
+        raise ValueError("Reaction is not charge balanced.")
+    if not balance_known:
+        comparable = False
+        warnings.append("Atom and charge balance could not both be verified.")
+    if any((a.get("quality") or {}).get("scf_converged") is not True
+           or (a.get("quality") or {}).get("status") == "FAIL" for a in species):
+        comparable = False
+        warnings.append("Electronic convergence or calculation quality is not verified for every species.")
+
+    def delta(getter):
+        total = 0.0
+        for sign, terms in ((-1.0, reactants), (1.0, products)):
+            for coefficient, name in terms:
+                value = _finite_number(getter(resolve(name)))
+                if value is None:
+                    return None
+                total += sign * coefficient * value
+        return total if math.isfinite(total) else None
+    e = delta(lambda a: (a.get("energies") or {}).get("final_energy_hartree")) if comparable else None
+    def ezpe(a):
+        energy = _finite_number((a.get("energies") or {}).get("final_energy_hartree"))
+        zpe = _finite_number((a.get("thermochemistry") or {}).get("zpe_hartree"))
+        return energy + zpe if energy is not None and zpe is not None else None
+
+    temperatures = [_finite_number((a.get("thermochemistry") or {}).get("temperature_K")) for a in species]
+    pressures = [_finite_number((a.get("thermochemistry") or {}).get("pressure_atm")) for a in species]
+    temperature = temperatures[0] if temperatures and all(t is not None and t > 0 for t in temperatures) and max(temperatures) - min(temperatures) < 1e-4 else None
+    pressure = pressures[0] if pressures and all(p is not None and p > 0 for p in pressures) and max(pressures) - min(pressures) < max(1e-6, pressures[0] * 1e-5) else None
+    treatments = [canonical((a.get("thermochemistry") or {}).get("thermo_treatment")) for a in species]
+    treatment_known = bool(treatments and all(treatments) and len(set(treatments)) == 1)
+    if temperature is None:
+        warnings.append("Thermochemical temperatures are missing or inconsistent.")
+    if pressure is None:
+        warnings.append("Thermochemical pressures are missing or inconsistent.")
+    if not treatment_known:
+        warnings.append("RRHO/quasi-RRHO treatment is missing or inconsistent.")
+    reliable = all((a.get("quality") or {}).get("thermochemistry_reliable") is True for a in species)
+    if not reliable:
+        warnings.append("At least one species lacks verified minimum/thermochemistry checks.")
+    thermo_ok = comparable and reliable and temperature is not None and pressure is not None and treatment_known
+    e0 = delta(ezpe) if comparable and reliable and treatment_known else None
+    h = delta(lambda a: (a.get("thermochemistry") or {}).get("enthalpy_hartree")) if thermo_ok else None
+    g = delta(lambda a: (a.get("thermochemistry") or {}).get("gibbs_hartree")) if thermo_ok else None
+    standard_states = [canonical((a.get("quality") or {}).get("standard_state")) for a in species]
+    standard_known = bool(standard_states and len(set(standard_states)) == 1 and standard_states[0] in
+                          ("ideal_gas_at_parsed_pressure", "solution_1m"))
+    if not standard_known:
+        warnings.append("A common validated standard state is not established; K_eq is withheld.")
+    result = {
+        "equation": equation, "temperature_K": temperature, "pressure_atm": pressure,
+        "delta_e_kj_mol": e * HARTREE_TO_KJMOL if e is not None else None,
+        "delta_e0_kj_mol": e0 * HARTREE_TO_KJMOL if e0 is not None else None,
+        "delta_h_kj_mol": h * HARTREE_TO_KJMOL if h is not None else None,
+        "delta_g_kj_mol": g * HARTREE_TO_KJMOL if g is not None else None,
+        "delta_s_j_mol_k": (h - g) * HARTREE_TO_KJMOL * 1000.0 / temperature if h is not None and g is not None and temperature else None,
+        "keq": None, "log10_keq": None, "standard_state": standard_states[0] if standard_known else None,
+        "warnings": _unique_messages(warnings),
+    }
+    if g is not None and temperature and standard_known:
+        log_keq = -g * HARTREE_TO_KJMOL * 1000.0 / (GAS_CONSTANT_J_MOL_K * temperature)
+        result["log10_keq"] = log_keq / math.log(10.0)
+        if -700.0 <= log_keq <= 700.0:
+            result["keq"] = math.exp(log_keq)
+        else:
+            result["warnings"].append("K_eq is outside a stable floating-point range; use log10(K_eq).")
+    return result
+
+
+def section_summary(a):
+    q = a.get("quality") or {}
+    energies, orbitals = a.get("energies") or {}, a.get("orbitals") or {}
+    lines = ["File: " + str(a.get("filename")), "Engine: " + str(a.get("engine")) + " " + str(a.get("version") or ""),
+             "Method / basis: " + str(a.get("method") or "unrecognized") + " / " + str(a.get("basis") or "unrecognized"),
+             "Scientific checks: " + str(q.get("status", "UNVERIFIED")),
+             "Stationary point: " + str(a.get("stationary_point_status") or "unverified")]
+    for field, label, unit in (("final_energy_hartree", "Electronic energy", "Eh"),):
+        v = _finite_number(energies.get(field))
+        if v is not None:
+            lines.append(label + ": " + format(v, ".10f") + " " + unit)
+    for field, label in (("homo_ev", "HOMO"), ("lumo_ev", "LUMO"), ("gap_ev", "Orbital-energy gap")):
+        v = _finite_number(orbitals.get(field))
+        if v is not None:
+            lines.append(label + ": " + format(v, ".6f") + " eV")
+    for warning in (a.get("warnings") or [])[:4]:
+        lines.append("Warning: " + str(warning)[:300])
+    if len(a.get("warnings") or []) > 4:
+        lines.append("See Diagnostics/PDF for all warnings.")
+    return "\n".join(lines)
+
+
+def section_diagnostics(a):
+    q = a.get("quality") or {}
+    fields = ("status", "program_terminated_normally", "scf_converged", "optimization_requested",
+              "optimization_converged", "frequency_complete", "geometry_stationarity_verified",
+              "stationary_point_status", "thermochemistry_reliable", "standard_state")
+    lines = [field.replace("_", " ").capitalize() + ": " + str(q.get(field)) for field in fields]
+    lines.extend("Warning: " + str(w) for w in a.get("warnings") or [])
+    lines.extend("Program diagnostic: " + str(w) for w in a.get("errors") or [])
+    return "\n".join(lines)
+
+
+def section_structure(a):
+    lines = []
+    dipole = a.get("dipole") or {}
+    value = _finite_number(dipole.get("magnitude_debye")) if isinstance(dipole, dict) else _finite_number(dipole)
+    if value is not None:
+        lines.append("Dipole magnitude: " + format(value, ".6f") + " debye")
+    charges = a.get("atomic_charges") or []
+    if charges:
+        lines.append("\nAtomic charges (" + str(a.get("atomic_charge_type") or "scheme unrecognized") + "):")
+        for atom in charges:
+            q = _finite_number(atom.get("charge"))
+            if q is not None:
+                lines.append(str(atom.get("index")) + " " + str(atom.get("element")) + " " + format(q, ".8f"))
+    geometry = a.get("final_geometry") or []
+    if geometry:
+        lines.append("\nCartesian coordinates (" + str(a.get("geometry_units") or "unverified units") + "):")
+        for atom in geometry:
+            xyz = [_finite_number(atom.get(axis)) for axis in ("x", "y", "z")]
+            if None not in xyz:
+                lines.append(str(atom.get("element")) + " " + " ".join(format(v, ".8f") for v in xyz))
+    return "\n".join(lines) if lines else "No valid structure/property table was recognized."
+
+
+# In combined source this wraps the corrected core parser exactly once.
+if "parse_output_text" in globals():
+    _parse_output_before_validation = parse_output_text
+    def parse_output_text(text, filename="calculation.out"):
+        return validate_analysis(_parse_output_before_validation(text, filename), source_text=text)
+
+def section_thermo(a, which="all"):
+    t=a.get("thermochemistry") or {}
+    q=a.get("quality") or {}
+    rows=["Thermochemistry checks: "+("VERIFIED AVAILABLE CHECKS" if q.get("thermochemistry_reliable") else "NOT FULLY VERIFIED"),
+          "Reference: "+str(q.get("standard_state") or "unverified")]
+    for key,label,unit in (("temperature_K","Temperature","K"),("pressure_atm","Pressure","atm")):
+        value=_finite_number(t.get(key))
+        if value is not None:
+            rows.append(label+": "+format(value,".8g")+" "+unit)
+    rows.append("Treatment: "+str(t.get("thermo_treatment") or "unrecognized"))
+    fields=[
+        ("zpe_hartree","Zero-point vibrational energy","Eh","zpe"),
+        ("energy_0K_hartree","Electronic energy + ZPE","Eh","zpe"),
+        ("electronic_energy_hartree","Thermochemistry electronic reference","Eh","all"),
+        ("internal_energy_hartree","Internal energy U","Eh","h"),
+        ("thermal_energy_hartree","Total thermal energy","Eh","h"),
+        ("enthalpy_hartree","Total enthalpy H","Eh","h"),
+        ("gibbs_hartree","Gibbs free energy G","Eh","g"),
+        ("entropy_J_mol_K","Entropy S","J mol^-1 K^-1","s"),
+    ]
+    found=False
+    for key,label,unit,group in fields:
+        value=_finite_number(t.get(key))
+        if value is not None and (which=="all" or group in (which,"all")):
+            rows.append(label+": "+format(value,".10g")+" "+unit)
+            found=True
+    if not found:
+        rows.append("The selected thermochemical quantity was not recognized.")
+    if q.get("thermochemistry_reliable") is not True:
+        rows.extend("Warning: "+str(w) for w in (a.get("warnings") or []))
+    return "\n".join(rows)
+
+
+def section_vibrations(a):
+    raw=a.get("frequencies_cm1") or []
+    internal=a.get("internal_frequencies_cm1") or []
+    q=a.get("quality") or {}
+    if not raw:
+        return "No verified vibrational-frequency table was recognized."
+    lines=["Parsed frequency records: "+str(len(raw)),
+           "Internal modes / expected: "+str(len(internal))+" / "+str(a.get("expected_vibration_count")),
+           "Hessian complete: "+str(q.get("frequency_complete")),
+           "Stationary point: "+str(a.get("stationary_point_status")),
+           "Imaginary internal modes below -10 cm^-1: "+str(len(a.get("imaginary_frequencies_cm1") or [])),
+           "Small negative internal modes requiring inspection: "+str(len(a.get("near_zero_imaginary_frequencies_cm1") or [])),
+           "Raw frequencies (cm^-1; unscaled):",
+           ", ".join(format(value,".4f") for value in raw[:500])]
+    if len(raw)>500:
+        lines.append("The complete frequency table is available in CSV/JSON.")
+    lines.append("Mode count alone does not confirm a transition state; inspect displacements and the reaction path.")
+    return "\n".join(lines)
+
+
+
+
+"""Scientific reporting appended after the analyzer in the same namespace.
+
+This source is deliberately self-contained: Kaggle receives the entire analyzer
+as one Python source string.  No project-relative imports are permitted here.
+Only parsed, finite numerical data are rendered; missing intensities are never
+replaced by invented equal-height bands.
+"""
+
+import csv
+import datetime
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+REPORT_GENERATOR_VERSION = "7.1.0"
+_RF_HARTREE_TO_KJMOL = 2625.499638
+_RF_HC_EV_NM = 1239.841984
+_RF_EV_TO_CM1 = 8065.544005
+_RF_FWHM_FACTOR = 2.0 * math.sqrt(2.0 * math.log(2.0))
+_RF_DEFAULT_PLOT_CONFIG = {
+    "ir_sigma_cm1": 12.0,
+    "raman_sigma_cm1": 10.0,
+    "uv_sigma_ev": 0.15,
+    "grid_points": 5500,
+    "frequency_scale_factor": 1.0,
+    "png_dpi": 600,
+    "figure_width_in": 7.0,
+    "figure_height_in": 4.5,
+}
+_RF_COLORS = ("#24567A", "#B64C33", "#568044", "#735890", "#84653C")
+
+
+def _rf_num(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(str(value).replace("D", "E").replace("d", "e"))
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _rf_json_safe(value, omitted=None, location=""):
+    """JSON-safe copy, replacing nonfinite numbers with null, never NaN/Inf."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        if omitted is not None:
+            omitted.append(location or "<root>")
+        return None
+    if isinstance(value, dict):
+        return {str(k): _rf_json_safe(v, omitted, f"{location}.{k}".strip(".")) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_rf_json_safe(v, omitted, f"{location}[{i}]") for i, v in enumerate(value)]
+    # Numpy scalars may appear when helpers are called programmatically.
+    if hasattr(value, "item"):
+        try:
+            return _rf_json_safe(value.item(), omitted, location)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _rf_json_write(path, data):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(_rf_json_safe(data), handle, ensure_ascii=False, indent=2, allow_nan=False)
+        handle.write("\n")
+    return str(path)
+
+
+def _rf_csv_write(path, header, rows):
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow(["" if item is None else item for item in row])
+    return str(path)
+
+
+def _rf_safe_base(value, fallback="calculation"):
+    name = Path(str(value or fallback)).stem
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return name[:120] or fallback
+
+
+def _rf_config(analysis=None):
+    config = dict(_RF_DEFAULT_PLOT_CONFIG)
+    raw = (analysis or {}).get("plot_config", {})
+    if isinstance(raw, dict):
+        for key in ("ir_sigma_cm1", "raman_sigma_cm1", "uv_sigma_ev", "frequency_scale_factor"):
+            number = _rf_num(raw.get(key))
+            if number is not None and number > 0:
+                config[key] = number
+        number = _rf_num(raw.get("grid_points"))
+        if number is not None:
+            config["grid_points"] = max(2000, min(20000, int(number)))
+    # Publication outputs always meet the promised resolution.
+    config["png_dpi"] = 600
+    return config
+
+
+def _rf_style():
+    return {
+        "font.family": "DejaVu Sans",
+        "font.size": 8.5,
+        "axes.labelsize": 9,
+        "axes.titlesize": 10,
+        "axes.linewidth": 0.65,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "legend.fontsize": 7.5,
+        "legend.frameon": False,
+        "lines.linewidth": 1.25,
+        "savefig.facecolor": "white",
+        "figure.facecolor": "white",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    }
+
+
+def _rf_plot_imports():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    return plt, np
+
+
+def _rf_synthetic(analysis):
+    provenance = (analysis or {}).get("provenance", {})
+    return bool((analysis or {}).get("synthetic_demo") or (analysis or {}).get("is_synthetic") or
+                (isinstance(provenance, dict) and "synthetic" in str(provenance.get("data_origin", "")).lower()))
+
+
+def _rf_plot_note(fig, analysis, note=""):
+    lines = []
+    if _rf_synthetic(analysis):
+        lines.append("SYNTHETIC VALIDATION EXAMPLE")
+    else:
+        quality = (analysis or {}).get("quality", {}) or {}
+        validation = quality.get("status", "UNVERIFIED") if isinstance(quality, dict) else "UNVERIFIED"
+        if str(validation).upper() != "PASS":
+            lines.append("Validation: " + str(validation).upper())
+    if note:
+        lines.append(note)
+    if lines:
+        fig.text(0.5, 0.016, "  |  ".join(lines), ha="center", va="bottom", fontsize=6.5, color="#444444")
+    fig.tight_layout(rect=(0, 0.045 if lines else 0, 1, 1))
+
+
+def _rf_gaussian_density(points, grid, sigma, positive_domain=True):
+    """Area equals sum(stick weights) on the full positive coordinate domain.
+
+    A stick of weight w has w/(sigma*sqrt(2*pi)) times a Gaussian.  When the
+    physical domain is positive, its normalizing factor is Phi(center/sigma).
+    Finite exported grids capture a documented fraction of the total area.
+    """
+    import numpy as np
+    width = _rf_num(sigma)
+    if width is None or width <= 0:
+        raise ValueError("Gaussian sigma must be positive and finite.")
+    x = np.asarray(grid, dtype=float)
+    result = np.zeros_like(x)
+    for center, weight in points:
+        center = _rf_num(center)
+        weight = _rf_num(weight)
+        if center is None or weight is None or weight < 0 or (positive_domain and center <= 0):
+            continue
+        denominator = width * math.sqrt(2.0 * math.pi)
+        if positive_domain:
+            denominator *= 0.5 * (1.0 + math.erf(center / (width * math.sqrt(2.0))))
+        result += (weight / denominator) * np.exp(-0.5 * ((x - center) / width) ** 2)
+    if positive_domain:
+        result[x < 0] = 0.0
+    if not np.all(np.isfinite(result)):
+        raise ValueError("Gaussian density exceeds the finite numerical range; verify sigma and stick strengths.")
+    return result
+
+
+def _rf_captured_area(points, low, high, sigma):
+    captured = 0.0
+    total = 0.0
+    for center, weight in points:
+        if center <= 0 or weight < 0:
+            continue
+        z = 0.5 * (1.0 + math.erf(center / (sigma * math.sqrt(2.0))))
+        cdf_high = 0.5 * (1.0 + math.erf((high - center) / (sigma * math.sqrt(2.0))))
+        cdf_low = 0.5 * (1.0 + math.erf((max(0.0, low) - center) / (sigma * math.sqrt(2.0))))
+        captured += weight * (cdf_high - cdf_low) / z
+        total += weight
+    return captured / total if total > 0 else None
+
+
+def _rf_spectrum_points(analysis, kind, scale=1.0):
+    key = "raman_spectrum" if kind == "raman" else "ir_spectrum"
+    points, omitted = [], 0
+    for item in (analysis or {}).get(key, []) or []:
+        if isinstance(item, dict):
+            x = next((_rf_num(item[k]) for k in ("frequency_cm1", "frequency_cm", "freq", "cm1") if item.get(k) is not None), None)
+            ykeys = ("activity", "raman_activity", "intensity") if kind == "raman" else ("intensity_km_mol", "intensity")
+            y = next((_rf_num(item[k]) for k in ykeys if item.get(k) is not None), None)
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            x, y = _rf_num(item[0]), _rf_num(item[1])
+        else:
+            x = y = None
+        if x is None or y is None or x <= 0 or y < 0:
+            omitted += 1
+            continue
+        scaled = _rf_num(x * scale)
+        if scaled is None:
+            omitted += 1
+            continue
+        points.append((scaled, y))
+    return points, omitted
+
+
+def _rf_transitions(analysis):
+    states, omitted = [], 0
+    for number, item in enumerate((analysis or {}).get("tddft_states", []) or [], 1):
+        if not isinstance(item, dict):
+            omitted += 1
+            continue
+        energy = _rf_num(item.get("ev"))
+        printed_nm = _rf_num(item.get("nm"))
+        cm1 = _rf_num(item.get("cm1"))
+        weight = _rf_num(item.get("f"))
+        if energy is None and cm1 is not None and cm1 > 0:
+            energy = cm1 / _RF_EV_TO_CM1
+        if energy is None and printed_nm is not None and printed_nm > 0:
+            energy = _RF_HC_EV_NM / printed_nm
+        energy = _rf_num(energy)
+        if energy is None or energy <= 0 or weight is None or weight < 0:
+            omitted += 1
+            continue
+        wavelength = _rf_num(_RF_HC_EV_NM / energy)
+        if wavelength is None or wavelength <= 0:
+            omitted += 1
+            continue
+        states.append({"state": item.get("state", number), "ev": energy,
+                       "nm": wavelength, "printed_nm": printed_nm, "f": weight})
+    return states, omitted
+
+
+def _rf_export_figure(fig, basepath, metadata, analysis=None):
+    """Save an editable SVG, vector PDF, 600 dpi PNG and finite JSON metadata."""
+    plt, _ = _rf_plot_imports()
+    basepath = os.path.abspath(str(basepath))
+    os.makedirs(os.path.dirname(basepath), exist_ok=True)
+    settings = dict(metadata)
+    settings.update({"report_generator_version": REPORT_GENERATOR_VERSION, "png_dpi": 600,
+                     "svg_text_is_editable": True, "vector_pdf_fonts_embedded": True,
+                     "source_sha256": (analysis or {}).get("source_sha256") or ((analysis or {}).get("provenance") or {}).get("source_sha256"),
+                     "software_versions": ((analysis or {}).get("report_provenance") or {}).get("software_versions"),
+                     "synthetic_validation_example": _rf_synthetic(analysis)})
+    try:
+        for extension in (".png", ".svg", ".pdf"):
+            # Publish each complete file atomically. Readers must never see a
+            # partially written PNG when two workers share an output directory.
+            descriptor, temporary_path = tempfile.mkstemp(prefix=".figure-", suffix=extension, dir=os.path.dirname(basepath))
+            os.close(descriptor)
+            try:
+                fig.savefig(temporary_path, format=extension[1:], dpi=600 if extension == ".png" else None,
+                            bbox_inches="tight", facecolor="white")
+                os.replace(temporary_path, basepath + extension)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+        _rf_json_write(basepath + "_plot_settings.json", settings)
+    finally:
+        plt.close(fig)
+    return basepath + ".png"
+
+
+def _rf_frontier_channels(analysis):
+    """Use actual finite orbital rows only, never fabricate missing MO records."""
+    section = (analysis or {}).get("orbitals", {}) or {}
+    if not isinstance(section, dict):
+        return {}
+    groups = {}
+    for row in section.get("orbitals", []) or []:
+        if not isinstance(row, dict) or row.get("_synthetic"):
+            continue
+        occ, energy, hartree = _rf_num(row.get("occ")), _rf_num(row.get("ev")), _rf_num(row.get("eh"))
+        if energy is None and hartree is not None:
+            energy = _rf_num(hartree * 27.211386245988)
+        if occ is None or energy is None or occ < 0 or occ > 2.0001:
+            continue
+        spin = str(row.get("spin") or "restricted").lower().strip()
+        if spin in ("alpha", "a", "up", "spin-up", "spin up"):
+            spin = "alpha"
+        elif spin in ("beta", "b", "down", "spin-down", "spin down"):
+            spin = "beta"
+        else:
+            spin = "restricted"
+        if spin != "restricted" and occ > 1.0001:
+            continue
+        groups.setdefault(spin, []).append(dict(row, occ=occ, ev=energy, eh=hartree, spin=spin))
+    if "alpha" in groups or "beta" in groups:
+        groups.pop("restricted", None)
+    return {name: sorted(rows, key=lambda r: r["ev"]) for name, rows in groups.items()}
+
+
+def _rf_frontier_records(analysis, each_side=3):
+    records = []
+    for spin, rows in _rf_frontier_channels(analysis).items():
+        occupied = [r for r in rows if r["occ"] > 1e-8]
+        virtual = [r for r in rows if r["occ"] <= 1e-8]
+        for i, row in enumerate(occupied[-each_side:]):
+            distance = len(occupied[-each_side:]) - i - 1
+            records.append((spin, "HOMO" if distance == 0 else f"HOMO-{distance}", row))
+        for i, row in enumerate(virtual[:each_side]):
+            records.append((spin, "LUMO" if i == 0 else f"LUMO+{i}", row))
+    return records
+
+
+def _rf_level_labels(energies, low, high):
+    """Spread text labels; connector endpoints preserve the actual energies."""
+    if not energies:
+        return []
+    gap = (high - low) / max(8.0, 1.6 * len(energies))
+    positions = [max(low, min(high, energies[0]))]
+    for energy in energies[1:]:
+        positions.append(max(energy, positions[-1] + gap))
+    if positions[-1] > high:
+        excess = positions[-1] - high
+        positions = [p - excess for p in positions]
+    return positions
+
+
+def make_plots(a, outdir):
+    """Return preview PNG paths; vectors, numerical CSVs and settings accompany them."""
+    outdir = os.path.abspath(str(outdir))
+    os.makedirs(outdir, exist_ok=True)
+    plt, np = _rf_plot_imports()
+    config = _rf_config(a)
+    made = {}
+    size = (config["figure_width_in"], config["figure_height_in"])
+    with plt.rc_context(_rf_style()):
+        energies = [(i + 1, _rf_num(value)) for i, value in enumerate(a.get("optimization_energies", []) or [])]
+        energies = [(i, value) for i, value in energies if value is not None]
+        if len(energies) >= 2:
+            minimum = min(value for _, value in energies)
+            rows = [(i, value, (value - minimum) * _RF_HARTREE_TO_KJMOL) for i, value in energies]
+            base = os.path.join(outdir, "optimization_energy")
+            _rf_csv_write(base + ".csv", ["parsed_cycle", "energy_hartree", "relative_energy_kj_mol"], rows)
+            fig, ax = plt.subplots(figsize=size)
+            ax.plot([r[0] for r in rows], [r[2] for r in rows], "o-", color=_RF_COLORS[0], markersize=3)
+            ax.set(xlabel="Parsed optimization cycle", ylabel=r"Relative energy (kJ mol$^{-1}$)", title="Optimization energy profile")
+            ax.grid(axis="y", color="#DEDEDE", linewidth=0.4)
+            _rf_plot_note(fig, a, "Reference: lowest parsed optimization energy")
+            made["optimization"] = _rf_export_figure(fig, base, {"kind": "optimization", "reference_energy_hartree": minimum}, a)
+
+        for kind, key in (("ir", "ir"), ("raman", "raman")):
+            points, omitted = _rf_spectrum_points(a, kind, config["frequency_scale_factor"])
+            if not points or not any(weight > 0 for _, weight in points):
+                continue
+            sigma = config["ir_sigma_cm1" if kind == "ir" else "raman_sigma_cm1"]
+            low, high = max(0.0, min(x for x, _ in points) - 6 * sigma), max(x for x, _ in points) + 6 * sigma
+            grid = np.linspace(low, high, config["grid_points"])
+            density = _rf_gaussian_density(points, grid, sigma)
+            base = os.path.join(outdir, kind + "_spectrum")
+            weight_name = "ir_intensity_km_mol" if kind == "ir" else "raman_activity_angstrom4_u"
+            _rf_csv_write(base + "_sticks.csv", ["frequency_cm1", weight_name], points)
+            _rf_csv_write(base + "_curve.csv", ["wavenumber_cm1", weight_name + "_per_cm1"], zip(grid.tolist(), density.tolist()))
+            fig, ax = plt.subplots(figsize=size)
+            ax.plot(grid, density, color=_RF_COLORS[0])
+            ax.set_xlabel(r"Wavenumber (cm$^{-1}$)" if kind == "ir" else r"Raman shift (cm$^{-1}$)")
+            unit_label = r"IR intensity density (km mol$^{-1}$ per cm$^{-1}$)" if kind == "ir" else r"Raman activity density ($\AA^4$ u$^{-1}$ per cm$^{-1}$)"
+            ax.set_ylabel(unit_label)
+            ax.set_title("Calculated IR spectrum" if kind == "ir" else "Calculated Raman activity profile")
+            ax.set_xlim(high, low)
+            ax.set_ylim(bottom=0)
+            scaling = "Unscaled frequencies" if config["frequency_scale_factor"] == 1 else f"Frequency scale factor: {config['frequency_scale_factor']:g}"
+            _rf_plot_note(fig, a, f"{scaling}; Gaussian sigma = {sigma:g} cm-1; FWHM = {sigma*_RF_FWHM_FACTOR:.2f} cm-1")
+            metadata = {"kind": kind, "gaussian_domain": "wavenumber_cm1", "sigma": sigma, "sigma_units": "cm^-1",
+                        "fwhm": sigma * _RF_FWHM_FACTOR, "normalization": "area-preserving positive-domain Gaussian",
+                        "ordinate_units": "km mol^-1 / (cm^-1)" if kind == "ir" else "angstrom^4 u^-1 / (cm^-1)",
+                        "frequency_scale_factor": config["frequency_scale_factor"], "domain_cm1": [low, high],
+                        "displayed_fraction_of_total_area": _rf_captured_area(points, low, high, sigma), "omitted_nonphysical_or_missing_records": omitted}
+            made[key] = _rf_export_figure(fig, base, metadata, a)
+
+        transitions, omitted = _rf_transitions(a)
+        if transitions and any(state["f"] > 0 for state in transitions):
+            sigma = config["uv_sigma_ev"]
+            points = [(state["ev"], state["f"]) for state in transitions]
+            low = max(1e-5, min(x for x, _ in points) - 6 * sigma)
+            high = max(x for x, _ in points) + 6 * sigma
+            energy = np.linspace(low, high, config["grid_points"])
+            density_ev = _rf_gaussian_density(points, energy, sigma)
+            _rf_csv_write(os.path.join(outdir, "uvvis_transitions.csv"), ["state", "excitation_energy_ev", "wavelength_nm_from_energy", "printed_wavelength_nm", "oscillator_strength"],
+                          [(s["state"], s["ev"], s["nm"], s["printed_nm"], s["f"]) for s in transitions])
+            _rf_csv_write(os.path.join(outdir, "uvvis_energy_curve.csv"), ["energy_ev", "oscillator_strength_density_per_ev"], zip(energy.tolist(), density_ev.tolist()))
+            for domain, name in (("energy", "uvvis_energy"), ("wavelength", "uvvis")):
+                fig, ax = plt.subplots(figsize=size)
+                metadata = {"kind": "uvvis", "gaussian_domain": "energy_ev", "sigma": sigma, "sigma_units": "eV",
+                            "fwhm": sigma * _RF_FWHM_FACTOR, "normalization": "area-preserving positive-energy Gaussian",
+                            "energy_to_wavelength_constant_ev_nm": _RF_HC_EV_NM, "omitted_nonphysical_or_missing_records": omitted}
+                if domain == "energy":
+                    x, y = energy, density_ev
+                    ax.set(xlabel="Excitation energy (eV)", ylabel=r"Oscillator-strength density (eV$^{-1}$)")
+                    metadata.update({"display_domain": "energy_ev", "display_energy_domain_ev": [low, high],
+                                     "displayed_fraction_of_total_area": _rf_captured_area(points, low, high, sigma)})
+                else:
+                    # Bound the viewing domain, not the available transitions. All
+                    # transition wavelengths are included, including near infrared.
+                    view_low = max(min(x for x, _ in points) * 0.2, min(x for x, _ in points) - 3.5 * sigma)
+                    view_high = max(x for x, _ in points) + 3.5 * sigma
+                    selected = (energy >= view_low) & (energy <= view_high)
+                    e_selected = energy[selected]
+                    x = (_RF_HC_EV_NM / e_selected)[::-1]
+                    y = (density_ev[selected] * (e_selected ** 2 / _RF_HC_EV_NM))[::-1]
+                    ax.set(xlabel="Wavelength (nm)", ylabel=r"Oscillator-strength density (nm$^{-1}$)")
+                    metadata.update({"display_domain": "wavelength_nm", "display_energy_domain_ev": [view_low, view_high],
+                                     "wavelength_transform": "lambda=hc/E; density_lambda=density_E*hc/lambda^2",
+                                     "displayed_fraction_of_total_area": _rf_captured_area(points, view_low, view_high, sigma)})
+                    _rf_csv_write(os.path.join(outdir, "uvvis_wavelength_curve.csv"), ["wavelength_nm", "oscillator_strength_density_per_nm"], zip(x.tolist(), y.tolist()))
+                ax.plot(x, y, color=_RF_COLORS[0])
+                ax.set(title="Calculated electronic absorption profile")
+                ax.set_xlim(float(x.min()), float(x.max()))
+                ax.set_ylim(bottom=0)
+                _rf_plot_note(fig, a, f"Energy-domain Gaussian sigma = {sigma:g} eV; FWHM = {sigma*_RF_FWHM_FACTOR:.3f} eV")
+                made[name] = _rf_export_figure(fig, os.path.join(outdir, name + "_spectrum"), metadata, a)
+
+        records = _rf_frontier_records(a, each_side=3)
+        if records:
+            spin_names = [spin for spin in ("restricted", "alpha", "beta") if any(row[0] == spin for row in records)]
+            values = [row[2]["ev"] for row in records]
+            span = max(2.0, max(values) - min(values))
+            low, high = min(values) - 0.15 * span, max(values) + 0.15 * span
+            fig, ax = plt.subplots(figsize=size)
+            for channel, spin in enumerate(spin_names):
+                selected = sorted([r for r in records if r[0] == spin], key=lambda r: r[2]["ev"])
+                anchors = _rf_level_labels([r[2]["ev"] for r in selected], low + 0.06 * span, high - 0.06 * span)
+                center = channel * 1.7
+                for (_, label, row), anchor in zip(selected, anchors):
+                    color = _RF_COLORS[0] if row["occ"] > 1e-8 else _RF_COLORS[1]
+                    ax.hlines(row["ev"], center - 0.23, center + 0.15, color=color, linewidth=1.4)
+                    ax.plot([center + 0.15, center + 0.28], [row["ev"], anchor], color="#777777", linewidth=0.5)
+                    ax.text(center + 0.3, anchor, f"{label}: {row['ev']:.3f}", va="center", fontsize=7.5)
+            ax.set(ylim=(low, high), xlim=(-0.55, (len(spin_names)-1)*1.7 + 1.25), ylabel="Orbital energy (eV)", title="Frontier orbital energies")
+            ax.set_xticks([i * 1.7 for i in range(len(spin_names))], [s.capitalize() for s in spin_names])
+            ax.tick_params(axis="x", length=0)
+            ax.grid(axis="y", color="#E0E0E0", linewidth=0.4)
+            _rf_plot_note(fig, a, "Energy levels from parsed MO data; no orbital isosurfaces")
+            base = os.path.join(outdir, "frontier_orbitals")
+            _rf_csv_write(base + ".csv", ["spin", "frontier_label", "parsed_mo_index", "occupation", "energy_hartree", "energy_ev"],
+                          [(spin, label, row.get("index"), row["occ"], row.get("eh"), row["ev"]) for spin, label, row in records])
+            made["orbitals"] = _rf_export_figure(fig, base, {"kind": "frontier_orbitals", "spin_channels": spin_names,
+                                               "frontier_window_each_side": 3, "missing_or_synthetic_rows_are_not_drawn": True}, a)
+    return made
+
+
+def make_overlay_plot(analyses, kind, outpath, normalize=True, sigma=None):
+    """Compare finite parsed spectra. UV sigma is in eV; IR sigma is in cm^-1.
+
+    UV is broadened in energy and transformed with the Jacobian to wavelength.
+    Raw mode preserves amplitudes; normalized mode divides each density by its
+    own peak height and uses an explicit dimensionless relative-intensity axis.
+    """
+    is_uv = str(kind).lower() in ("uv", "uvvis", "td", "tddft")
+    is_raman = str(kind).lower() == "raman"
+    width = _rf_num(sigma if sigma is not None else (0.15 if is_uv else (10.0 if is_raman else 12.0)))
+    if width is None or width <= 0:
+        raise ValueError("Gaussian sigma must be positive and finite; UV uses eV, IR/Raman use cm^-1.")
+    plt, np = _rf_plot_imports()
+    prepared, names = [], {}
+    for analysis in analyses:
+        if is_uv:
+            states, omitted = _rf_transitions(analysis)
+            points = [(row["ev"], row["f"]) for row in states]
+        else:
+            points, omitted = _rf_spectrum_points(analysis, "raman" if is_raman else "ir", _rf_config(analysis)["frequency_scale_factor"])
+        if not points or not any(weight > 0 for _, weight in points):
+            continue
+        name = Path(str(analysis.get("filename", "spectrum"))).stem
+        names[name] = names.get(name, 0) + 1
+        label = name if names[name] == 1 else f"{name} [{names[name]}]"
+        prepared.append((analysis, label, points, omitted))
+    if len(prepared) < 2:
+        return None
+    allpoints = [point for _, _, points, _ in prepared for point in points]
+    if is_uv:
+        low = max(min(x for x, _ in allpoints) * 0.2, min(x for x, _ in allpoints) - 3.5 * width)
+        high = max(x for x, _ in allpoints) + 3.5 * width
+    else:
+        low, high = max(0.0, min(x for x, _ in allpoints) - 6 * width), max(x for x, _ in allpoints) + 6 * width
+    grid = np.linspace(low, high, 5500)
+    curve_rows = []
+    metadata = {"kind": "uvvis_overlay" if is_uv else ("raman_overlay" if is_raman else "ir_overlay"),
+                "sigma": width, "sigma_units": "eV" if is_uv else "cm^-1", "fwhm": width * _RF_FWHM_FACTOR,
+                "gaussian_domain": "energy_ev" if is_uv else "wavenumber_cm1", "positive_domain_area_preserving": True,
+                "display_coordinate": "wavelength_nm" if is_uv else "wavenumber_cm1", "normalize_to_individual_maximum": bool(normalize),
+                "ordinate_units": "dimensionless" if normalize else ("nm^-1" if is_uv else ("angstrom^4 u^-1 / (cm^-1)" if is_raman else "km mol^-1 / (cm^-1)")),
+                "spectra": []}
+    with plt.rc_context(_rf_style()):
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        try:
+            for i, (analysis, label, points, omitted) in enumerate(prepared):
+                raw = _rf_gaussian_density(points, grid, width)
+                if is_uv:
+                    x = (_RF_HC_EV_NM / grid)[::-1]
+                    density = (raw * grid ** 2 / _RF_HC_EV_NM)[::-1]
+                else:
+                    x, density = grid, raw
+                if normalize and density.max() > 0:
+                    density = density / density.max()
+                ax.plot(x, density, label=label, color=_RF_COLORS[i % len(_RF_COLORS)], linestyle=("-", "--", "-.")[i // len(_RF_COLORS) % 3])
+                curve_rows.append(density)
+                metadata["spectra"].append({"label": label, "filename": analysis.get("filename"), "source_sha256": analysis.get("source_sha256"),
+                                             "omitted_records": omitted, "frequency_scale_factor": _rf_config(analysis)["frequency_scale_factor"] if not is_uv else None,
+                                             "displayed_fraction_of_total_area": _rf_captured_area(points, low, high, width)})
+            if is_uv:
+                ylabel = "Relative intensity (unitless)" if normalize else r"Oscillator-strength density (nm$^{-1}$)"
+                ax.set(xlabel="Wavelength (nm)", ylabel=ylabel, title="Electronic absorption comparison", xlim=(float(x.min()), float(x.max())))
+                metadata["wavelength_transform"] = "lambda=hc/E; density_lambda=density_E*hc/lambda^2"
+            else:
+                raw_label = r"Raman activity density ($\AA^4$ u$^{-1}$ per cm$^{-1}$)" if is_raman else r"IR intensity density (km mol$^{-1}$ per cm$^{-1}$)"
+                ax.set(xlabel=r"Wavenumber (cm$^{-1}$)", ylabel="Relative intensity (unitless)" if normalize else raw_label,
+                       title="Raman activity comparison" if is_raman else "Calculated IR comparison", xlim=(high, low))
+            ax.set_ylim(bottom=0)
+            ax.legend(loc="best")
+            units = "eV" if is_uv else "cm-1"
+            validation_states = [str((row[0].get("quality") or {}).get("status", "UNVERIFIED")).upper() for row in prepared]
+            aggregate = "FAIL" if "FAIL" in validation_states else ("UNVERIFIED" if "UNVERIFIED" in validation_states else ("WARNING" if "WARNING" in validation_states else "PASS"))
+            demo = {"synthetic_demo": any(_rf_synthetic(row[0]) for row in prepared), "quality": {"status": aggregate}}
+            metadata["validation_status"] = aggregate
+            _rf_plot_note(fig, demo, f"Gaussian sigma = {width:g} {units}; FWHM = {width*_RF_FWHM_FACTOR:.3f} {units}; {'peak normalized' if normalize else 'raw amplitude'}")
+            base = str(Path(os.path.abspath(str(outpath))).with_suffix(""))
+            os.makedirs(os.path.dirname(base), exist_ok=True)
+            header = ["wavelength_nm" if is_uv else "wavenumber_cm1"] + ["spectrum_" + str(i+1) for i in range(len(curve_rows))]
+            _rf_csv_write(base + "_curve.csv", header, zip(x.tolist(), *[row.tolist() for row in curve_rows]))
+            metadata["csv_columns"] = {header[i+1]: row[1] for i, row in enumerate(prepared)}
+            return _rf_export_figure(fig, base, metadata, demo)
+        finally:
+            plt.close(fig)
+
+
+def _rf_warnings(analysis):
+    quality = analysis.get("quality", {}) or {}
+    sources = [analysis.get("warnings", []), quality.get("warnings", []) if isinstance(quality, dict) else [], analysis.get("errors", [])]
+    result = []
+    for source in sources:
+        source = [source] if isinstance(source, str) else source or []
+        for item in source:
+            message = str(item).strip()
+            if message and message not in result:
+                result.append(message)
+    return result
+
+
+def _rf_fmt(value, digits=6):
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if value is None:
+        return "Unverified / unavailable"
+    number = _rf_num(value)
+    if number is not None:
+        return f"{number:.{digits}f}"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(_rf_json_safe(value), ensure_ascii=False, allow_nan=False)
+    return str(value)
+
+
+def _rf_pdf_font_names():
+    from matplotlib import font_manager
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    regular, bold = "ChemReportRegular", "ChemReportBold"
+    for name, weight in ((regular, "normal"), (bold, "bold")):
+        if name not in pdfmetrics.getRegisteredFontNames():
+            filename = font_manager.findfont(font_manager.FontProperties(family="DejaVu Sans", weight=weight))
+            pdfmetrics.registerFont(TTFont(name, filename))
+    pdfmetrics.registerFontFamily(regular, normal=regular, bold=bold, italic=regular, boldItalic=bold)
+    return regular, bold
+
+
+def build_pdf(a, plots, pdf_path):
+    """Scientific numerical report with explicit validation and provenance."""
+    a = _rf_json_safe(a)
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, LongTable, TableStyle, Image, KeepTogether
+    regular, bold = _rf_pdf_font_names()
+    body = ParagraphStyle("ReportBody7", fontName=regular, fontSize=8.2, leading=11)
+    small = ParagraphStyle("ReportSmall7", parent=body, fontSize=7.2, leading=9.6, textColor=colors.HexColor("#444444"))
+    heading = ParagraphStyle("ReportHeading7", parent=body, fontName=bold, fontSize=11, leading=14, spaceBefore=12, spaceAfter=5, keepWithNext=True)
+    title = ParagraphStyle("ReportTitle7", parent=heading, fontSize=18, leading=22, spaceBefore=0, spaceAfter=8)
+    label = ParagraphStyle("ReportTableHeading7", parent=small, fontName=bold)
+    def esc(value):
+        return str(value if value is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def table(rows, widths=None):
+        cooked = [[Paragraph(esc(item), label if i == 0 else small) for item in row] for i, row in enumerate(rows)]
+        item = LongTable(cooked, colWidths=widths or [8.0*cm, 9.0*cm], repeatRows=1, hAlign="LEFT")
+        item.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"), ("LINEABOVE",(0,0),(-1,0),0.6,colors.black),
+                                 ("LINEBELOW",(0,0),(-1,0),0.4,colors.black), ("LINEBELOW",(0,-1),(-1,-1),0.4,colors.black),
+                                 ("TOPPADDING",(0,0),(-1,-1),4), ("BOTTOMPADDING",(0,0),(-1,-1),4),
+                                 ("LEFTPADDING",(0,0),(-1,-1),4), ("RIGHTPADDING",(0,0),(-1,-1),4)]))
+        return item
+    filename = str(a.get("filename") or "calculation.out")
+    quality = a.get("quality", {}) or {}
+    quality = quality if isinstance(quality, dict) else {}
+    status = str(quality.get("status", "UNVERIFIED"))
+    story = [Paragraph("Computational chemistry report", title), Paragraph("Source file: " + esc(filename), body)]
+    if _rf_synthetic(a):
+        story += [Paragraph("SYNTHETIC VALIDATION EXAMPLE", heading), Paragraph("The values in this example are synthetic and demonstrate report generation.", body)]
+    story += [Spacer(1, 6), table([["Validation check", "Result"], ["Overall validation", status],
+                    ["Program terminated normally", _rf_fmt(quality.get("program_terminated_normally", a.get("normal_termination")))],
+                    ["SCF converged", _rf_fmt(quality.get("scf_converged"))],
+                    ["Optimization requested", _rf_fmt(quality.get("optimization_requested"))],
+                    ["Optimization converged", _rf_fmt(quality.get("optimization_converged"))],
+                    ["Frequency calculation complete", _rf_fmt(quality.get("frequency_complete"))],
+                    ["Stationary-point assessment", quality.get("stationary_point_status", a.get("stationary_point_status", "Unverified"))],
+                    ["Thermochemistry verified", _rf_fmt(quality.get("thermochemistry_reliable"))]])]
+    warnings = _rf_warnings(a)
+    if status.upper() != "PASS":
+        story += [Spacer(1, 6), Paragraph("Interpretation requires the validation checks above. Parsed values from incomplete or unconverged calculations remain unverified.", body)]
+    if warnings:
+        story += [Paragraph("Warnings and limitations", heading)]
+        for message in warnings:
+            story.append(Paragraph(esc(message), small))
+            story.append(Spacer(1, 3))
+    story += [Paragraph("Calculation and provenance", heading)]
+    provenance = a.get("provenance", {}) or {}
+    provenance = provenance if isinstance(provenance, dict) else {}
+    metadata_rows = [["Field", "Value"], ["Program / version", f"{a.get('engine') or 'Unverified'} / {a.get('version') or 'Unverified'}"],
+                     ["Method", a.get("method") or "Unverified"], ["Basis", a.get("basis") or "Unverified"],
+                     ["Solvation model / solvent", f"{a.get('solvation_model') or 'Unverified'} / {a.get('solvent') or 'Unverified'}"],
+                     ["Total charge / multiplicity", f"{_rf_fmt((a.get('system') or {}).get('charge'),0)} / {_rf_fmt((a.get('system') or {}).get('multiplicity'),0)}"],
+                     ["Source SHA-256", a.get("source_sha256") or provenance.get("source_sha256") or "Unavailable"],
+                     ["Source hash scope", a.get("source_hash_scope") or provenance.get("source_hash_scope") or "Unspecified"],
+                     ["Parser / schema", f"{a.get('parser_version') or 'Unverified'} / {a.get('analysis_schema_version') or 'Unverified'}"],
+                     ["Report generator", REPORT_GENERATOR_VERSION]]
+    story.append(table(metadata_rows))
+    energies = a.get("energies", {}) or {}
+    thermochemistry = a.get("thermochemistry", {}) or {}
+    story += [Paragraph("Electronic energies", heading)]
+    rows = [["Quantity", "Value", "Unit"]]
+    for key, name in (("final_energy_hartree", "Final electronic energy"), ("reference_energy_hartree", "Reference energy"),
+                      ("scf_energy_hartree", "SCF energy"), ("correlation_energy_hartree", "Correlation energy"),
+                      ("dispersion_energy_hartree", "Dispersion correction"), ("nuclear_repulsion_hartree", "Nuclear repulsion energy")):
+        if _rf_num(energies.get(key)) is not None:
+            rows.append([name, _rf_fmt(energies[key], 10), "hartree"])
+    if len(rows) > 1:
+        story.append(table(rows, [8.5*cm, 5.0*cm, 3.5*cm]))
+    else:
+        story.append(Paragraph("A finite final electronic energy was not available in the parsed output.", body))
+    if thermochemistry:
+        story += [Paragraph("Thermochemistry", heading)]
+        if quality.get("thermochemistry_reliable") is not True:
+            story.append(Paragraph("These thermochemical values are unverified for quantitative interpretation.", body))
+        rows = [["Quantity", "Value", "Unit"]]
+        thermo_fields = [("temperature_K", "Temperature", "K", 3), ("pressure_atm", "Pressure", "atm", 6),
+                        ("zpe_hartree", "Zero-point energy", "hartree", 8), ("energy_0K_hartree", "Electronic energy + ZPE", "hartree", 10),
+                        ("thermal_energy_correction_hartree", "Thermal energy correction", "hartree", 8),
+                        ("enthalpy_correction_hartree", "Enthalpy correction (H-Eel)", "hartree", 8), ("gibbs_correction_hartree", "Gibbs correction (G-Eel)", "hartree", 8),
+                        ("internal_energy_hartree", "Internal energy", "hartree", 10), ("enthalpy_hartree", "Total enthalpy", "hartree", 10),
+                        ("gibbs_hartree", "Gibbs free energy", "hartree", 10), ("entropy_J_mol_K", "Entropy", "J mol−1 K−1", 5)]
+        for key, name, unit, digits in thermo_fields:
+            if _rf_num(thermochemistry.get(key)) is not None:
+                rows.append([name, _rf_fmt(thermochemistry[key], digits), unit])
+        if len(rows) > 1:
+            story.append(table(rows, [8.5*cm, 5.0*cm, 3.5*cm]))
+        standard_state = quality.get("standard_state", a.get("standard_state"))
+        story.append(Paragraph("Standard state: " + esc(_rf_fmt(standard_state)), small))
+    frequencies = [number for value in a.get("frequencies_cm1", []) or [] if (number := _rf_num(value)) is not None]
+    if frequencies or a.get("ir_spectrum") or a.get("raman_spectrum"):
+        story += [Paragraph("Vibrational data", heading)]
+        threshold = _rf_num(quality.get("imaginary_noise_threshold_cm1")) or 10.0
+        story.append(table([["Quantity", "Value"], ["Parsed frequency records", str(len(frequencies))],
+                            ["Negative frequencies", str(sum(value < 0 for value in frequencies))],
+                            [f"Negative frequencies below −{threshold:g} cm−1", str(sum(value < -threshold for value in frequencies))],
+                            ["Validated vibration count / expected", f"{quality.get('vibration_count', 'Unverified')} / {quality.get('expected_vibration_count', 'Unverified')}"],
+                            ["Frequency scaling factor for plots", _rf_fmt(_rf_config(a)["frequency_scale_factor"], 6)]]))
+        story.append(Paragraph("Frequencies are unscaled unless an explicit plot scale factor is recorded. Imaginary-mode counts alone do not establish a transition state; geometry convergence and a complete Hessian require verification.", small))
+        for kind, name, unit in (("ir", "Strongest parsed IR bands", "km mol−1"), ("raman", "Strongest parsed Raman activities", "Å4 u−1")):
+            points, omitted = _rf_spectrum_points(a, kind)
+            positive = [(x, y) for x, y in points if y > 0]
+            if positive:
+                rows = [["Frequency (cm−1)", "IR intensity (" + unit + ")" if kind == "ir" else "Raman activity (" + unit + ")"]]
+                rows += [[_rf_fmt(x, 3), _rf_fmt(y, 6)] for x, y in sorted(positive, key=lambda p: p[1], reverse=True)[:12]]
+                story += [Paragraph(name, heading), table(rows)]
+            elif (kind == "ir" and frequencies) or a.get(kind + "_spectrum"):
+                story.append(Paragraph("No positive finite " + ("IR intensities" if kind == "ir" else "Raman activities") + " were parsed; the corresponding spectrum is unavailable.", small))
+            if omitted:
+                story.append(Paragraph(f"{omitted} {kind.upper()} entries with missing, nonfinite or nonphysical values were omitted from rendering.", small))
+    transitions, omitted = _rf_transitions(a)
+    if transitions:
+        story += [Paragraph("Electronic transitions", heading)]
+        rows = [["State", "Energy (eV)", "Wavelength (nm)", "Oscillator strength"]]
+        rows += [[state["state"], _rf_fmt(state["ev"], 5), _rf_fmt(state["nm"], 3), _rf_fmt(state["f"], 7)] for state in transitions[:40]]
+        story.append(table(rows, [1.8*cm, 4.7*cm, 4.8*cm, 5.7*cm]))
+        story.append(Paragraph("Wavelengths are computed from parsed excitation energies. Absorption profiles use a Gaussian in energy; the wavelength density includes the Jacobian hc/λ². The ordinate is oscillator-strength density, rather than a calibrated molar absorption coefficient.", small))
+        if len(transitions) > 40:
+            story.append(Paragraph("The table shows the first 40 transitions; the complete numerical export is provided as CSV and JSON.", small))
+        if not any(state["f"] > 0 for state in transitions):
+            story.append(Paragraph("All parsed oscillator strengths are zero; no absorption profile was generated.", small))
+    elif a.get("tddft_states"):
+        story += [Paragraph("Electronic transitions", heading), Paragraph("Positive finite excitation energies and finite nonnegative oscillator strengths were not jointly available; an absorption profile could not be generated.", body)]
+    orbitals = a.get("orbitals", {}) or {}
+    records = _rf_frontier_records(a, each_side=6)
+    if records or orbitals.get("homo_ev") is not None:
+        story += [Paragraph("Frontier orbital energies", heading)]
+        rows = [["Quantity", "Energy (eV)"]]
+        for key, name in (("homo_ev", "HOMO"), ("lumo_ev", "LUMO"), ("gap_ev", "HOMO–LUMO gap"),
+                          ("alpha_homo_ev", "Alpha HOMO"), ("alpha_lumo_ev", "Alpha LUMO"), ("beta_homo_ev", "Beta HOMO"), ("beta_lumo_ev", "Beta LUMO")):
+            if _rf_num(orbitals.get(key)) is not None:
+                rows.append([name, _rf_fmt(orbitals[key], 6)])
+        if len(rows) > 1:
+            story.append(table(rows))
+        story.append(Paragraph("Orbital-energy gaps and frontier-orbital reactivity estimates require a converged wavefunction and are distinct from optical excitation energies. Spin channels are retained separately where valid rows are available.", small))
+        descriptors = a.get("conceptual_dft", {}) or {}
+        if descriptors:
+            rows = [["Frontier-orbital estimate", "Value", "Unit"]]
+            for key, name in (("ionization_potential_ev", "Ionization potential"), ("electron_affinity_ev", "Electron affinity"),
+                              ("chemical_hardness_ev", "Chemical hardness"), ("chemical_potential_ev", "Chemical potential"),
+                              ("electronegativity_ev", "Electronegativity"), ("chemical_softness_ev", "Chemical softness"),
+                              ("electrophilicity_index_ev", "Electrophilicity index"), ("electrodonating_power_ev", "Electrodonating power"),
+                              ("electroaccepting_power_ev", "Electroaccepting power"), ("net_electrophilicity_ev", "Net electrophilicity")):
+                if _rf_num(descriptors.get(key)) is not None:
+                    rows.append([name, _rf_fmt(descriptors[key], 6), "eV−1" if "softness" in key else "eV"])
+            if len(rows) > 1:
+                story += [Spacer(1, 6), table(rows, [8.5*cm, 5.0*cm, 3.5*cm])]
+    dipole = a.get("dipole", {}) or {}
+    charges = a.get("atomic_charges", []) or []
+    geometry = a.get("final_geometry", []) or []
+    if dipole or charges or geometry:
+        story += [Paragraph("Molecular properties", heading)]
+        rows = [["Property", "Value"]]
+        if isinstance(dipole, dict) and _rf_num(dipole.get("magnitude_debye")) is not None:
+            rows.append(["Dipole magnitude (debye)", _rf_fmt(dipole["magnitude_debye"], 6)])
+        if charges:
+            rows.append(["Atomic charge scheme", a.get("atomic_charge_type") or "Unverified"])
+        if geometry:
+            rows += [["Atoms in parsed geometry", str(len(geometry))], ["Geometry units", a.get("geometry_units") or "Unverified"]]
+        story.append(table(rows))
+    if plots:
+        story += [Paragraph("Figures and export conventions", heading)]
+        config = _rf_config(a)
+        story.append(Paragraph("Each figure is supplied as a 600 dpi PNG, an editable SVG and a vector PDF. Numerical data and plot settings accompany the figures. Gaussian profiles preserve integrated stick strength; finite plot ranges and captured area are recorded in plot-settings JSON. σ is the standard deviation and FWHM = 2.354820 σ.", small))
+        labels = {"optimization": "Optimization energy profile", "ir": "Calculated IR intensity density", "raman": "Calculated Raman activity density",
+                  "uvvis": "Electronic absorption, wavelength density", "uvvis_energy": "Electronic absorption, energy density", "orbitals": "Frontier orbital energies"}
+        for i, (key, path) in enumerate(plots.items(), 1):
+            if not path or not os.path.isfile(path):
+                continue
+            image = Image(path)
+            factor = min(17.0*cm/image.imageWidth, 9.0*cm/image.imageHeight)
+            image.drawWidth = image.imageWidth * factor
+            image.drawHeight = image.imageHeight * factor
+            caption = Paragraph(f"Figure {i}. " + esc(labels.get(key, key)), small)
+            story.append(KeepTogether([Spacer(1, 8), image, Spacer(1, 3), caption, Spacer(1, 7)]))
+    for name, records_data in (("Atomic charges", charges), ("Cartesian geometry", geometry)):
+        if not records_data:
+            continue
+        section_items = [Paragraph(name + " - numerical extract", heading)]
+        if name == "Atomic charges":
+            rows = [["Index", "Element", "Charge"]] + [[row.get("index", ""), row.get("element", ""), _rf_fmt(row.get("charge"), 8)] for row in records_data[:200] if isinstance(row, dict)]
+            section_items.append(table(rows, [3*cm, 4*cm, 10*cm]))
+        else:
+            unit = str(a.get("geometry_units") or "unverified units")
+            rows = [["Element", "X ("+unit+")", "Y ("+unit+")", "Z ("+unit+")"]] + [[row.get("element", ""), _rf_fmt(row.get("x"), 7), _rf_fmt(row.get("y"), 7), _rf_fmt(row.get("z"), 7)] for row in records_data[:200] if isinstance(row, dict)]
+            section_items.append(table(rows, [2.5*cm, 4.83*cm, 4.83*cm, 4.84*cm]))
+        if len(records_data) <= 12:
+            story.append(KeepTogether(section_items))
+        else:
+            story.extend(section_items)
+        if len(records_data) > 200:
+            story.append(Paragraph("The report shows 200 entries; complete data are preserved in JSON and CSV.", small))
+    pdf_path = os.path.abspath(str(pdf_path))
+    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+    document = SimpleDocTemplate(pdf_path, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=1.5*cm, bottomMargin=1.5*cm,
+                                 title="Computational chemistry report", author="ChemBot", pageCompression=1)
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(regular, 7)
+        canvas.setFillColor(colors.HexColor("#555555"))
+        canvas.drawString(doc.leftMargin, 0.85*cm, "ChemBot | scientific report " + REPORT_GENERATOR_VERSION)
+        canvas.drawRightString(A4[0]-doc.rightMargin, 0.85*cm, str(doc.page))
+        canvas.restoreState()
+    document.build(story, onFirstPage=footer, onLaterPages=footer)
+    return pdf_path
+
+
+def _rf_sha256(path):
+    checksum = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024*1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def _rf_data_csvs(a, outdir):
+    paths = {}
+    frequencies = [(i, _rf_num(value)) for i, value in enumerate(a.get("frequencies_cm1", []) or [])]
+    frequencies = [(i, value) for i, value in frequencies if value is not None]
+    if frequencies:
+        paths["frequencies"] = _rf_csv_write(os.path.join(outdir, "frequencies.csv"), ["parsed_index", "frequency_cm1_unscaled"], frequencies)
+    for name, fields in (("final_geometry", ["element", "x", "y", "z"]), ("atomic_charges", ["index", "element", "charge"])):
+        rows = [row for row in a.get(name, []) or [] if isinstance(row, dict)]
+        if rows:
+            header = ["element", "x", "y", "z", "coordinate_units"] if name == "final_geometry" else fields + ["charge_scheme"]
+            values = [[_rf_num(row.get(f)) if f in ("x", "y", "z", "charge") else row.get(f) for f in fields] + [a.get("geometry_units") if name == "final_geometry" else a.get("atomic_charge_type")] for row in rows]
+            paths[name] = _rf_csv_write(os.path.join(outdir, name + ".csv"), header, values)
+    orbitals = (a.get("orbitals", {}) or {}).get("orbitals", [])
+    orbitals = [row for row in orbitals or [] if isinstance(row, dict) and not row.get("_synthetic")]
+    if orbitals:
+        fields = ["index", "spin", "occ", "eh", "ev"]
+        paths["orbitals_all"] = _rf_csv_write(os.path.join(outdir, "orbitals_all.csv"), ["parsed_mo_index", "spin", "occupation", "energy_hartree", "energy_ev"],
+                                             [[row.get(f) if f in ("index", "spin") else _rf_num(row.get(f)) for f in fields] for row in orbitals])
+    return paths
+
+
+def generate_report_bundle(a, outdir, base_name=None):
+    """Build portable scientific exports; every returned file path is absolute."""
+    outdir = os.path.abspath(str(outdir))
+    os.makedirs(outdir, exist_ok=True)
+    omitted = []
+    analysis = _rf_json_safe(a, omitted)
+    if not isinstance(analysis, dict):
+        raise TypeError("Report analysis must be a dictionary.")
+    warnings = _rf_warnings(analysis)
+    if omitted:
+        warnings.append(f"Nonfinite numbers in {len(omitted)} fields were exported as null; see export_nonfinite_fields.")
+    analysis["warnings"] = warnings
+    analysis["export_nonfinite_fields"] = omitted
+    analysis["report_generator_version"] = REPORT_GENERATOR_VERSION
+    analysis["plot_config"] = _rf_config(analysis)
+    import numpy
+    import matplotlib
+    import reportlab
+    software = {"python": sys.version.split()[0], "numpy": numpy.__version__, "matplotlib": matplotlib.__version__, "reportlab": reportlab.Version}
+    generated_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    analysis["report_provenance"] = {"software_versions": software, "generated_utc": generated_utc,
+                                     "report_generator_version": REPORT_GENERATOR_VERSION,
+                                     "source_sha256": analysis.get("source_sha256") or (analysis.get("provenance") or {}).get("source_sha256")}
+    plots = make_plots(analysis, outdir)
+    numerical_csvs = _rf_data_csvs(analysis, outdir)
+    figure_metadata = {}
+    for key, path in plots.items():
+        settings_path = str(Path(path).with_suffix("")) + "_plot_settings.json"
+        if os.path.isfile(settings_path):
+            with open(settings_path, encoding="utf-8") as handle:
+                figure_metadata[key] = json.load(handle)
+    analysis["plot_metadata"] = figure_metadata
+    base = _rf_safe_base(base_name or analysis.get("filename") or "calculation")
+    pdf_path = os.path.join(outdir, base + "_analysis_report.pdf")
+    build_pdf(analysis, plots, pdf_path)
+    analysis_path = _rf_json_write(os.path.join(outdir, "analysis.json"), analysis)
+    # Only files generated for this bundle are included, even if callers reuse
+    # an output directory containing unrelated or older report artifacts.
+    candidates = set(numerical_csvs.values())
+    for path in plots.values():
+        figure_base = str(Path(path).with_suffix(""))
+        candidates.update(figure_base + suffix for suffix in (".png", ".svg", ".pdf", "_plot_settings.json", "_sticks.csv", "_curve.csv", ".csv"))
+    if "uvvis" in plots or "uvvis_energy" in plots:
+        candidates.update(os.path.join(outdir, name) for name in ("uvvis_transitions.csv", "uvvis_energy_curve.csv", "uvvis_wavelength_curve.csv"))
+    publication_files = sorted(os.path.abspath(path) for path in candidates if os.path.isfile(path))
+    csv_files = {Path(path).stem: path for path in publication_files if path.endswith(".csv")}
+    csv_files.update(numerical_csvs)
+    archive_path = None
+    if publication_files:
+        archive_path = os.path.join(outdir, base + "_publication_figures.zip")
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in publication_files:
+                archive.write(path, arcname=os.path.basename(path))
+    manifest = {"report_generator_version": REPORT_GENERATOR_VERSION, "filename": analysis.get("filename"), "engine": analysis.get("engine"),
+                "source_sha256": analysis.get("source_sha256") or (analysis.get("provenance") or {}).get("source_sha256"),
+                "source_hash_scope": analysis.get("source_hash_scope"), "source_bytes_sha256": analysis.get("source_bytes_sha256"),
+                "parser_version": analysis.get("parser_version"), "analysis_schema_version": analysis.get("analysis_schema_version"),
+                "generated_utc": generated_utc, "software_versions": software,
+                "quality": analysis.get("quality", {}), "warnings": warnings, "units": analysis.get("units", {}),
+                "geometry_units": analysis.get("geometry_units"), "atomic_charge_scheme": analysis.get("atomic_charge_type"),
+                "plot_config": analysis["plot_config"], "plot_metadata": figure_metadata, "pdf": os.path.basename(pdf_path),
+                "pdf_sha256": _rf_sha256(pdf_path), "analysis_json": os.path.basename(analysis_path), "analysis_sha256": _rf_sha256(analysis_path),
+                "publication_files": [{"filename": os.path.basename(path), "sha256": _rf_sha256(path), "bytes": os.path.getsize(path)} for path in publication_files],
+                "figures_zip": os.path.basename(archive_path) if archive_path else None,
+                "synthetic_validation_example": _rf_synthetic(analysis)}
+    manifest_path = _rf_json_write(os.path.join(outdir, "report_manifest.json"), manifest)
+    return {"plots": plots, "pdf": pdf_path, "analysis_json": analysis_path, "manifest": manifest_path,
+            "publication_files": publication_files, "csv_files": csv_files, "csv_paths": csv_files,
+            "figure_metadata_paths": [str(Path(path).with_suffix("")) + "_plot_settings.json" for path in plots.values()],
+            "figures_zip": archive_path, "version": REPORT_GENERATOR_VERSION}
 '''
 
-ANALYZER_MODULE_CODE = ANALYZER_MODULE_CODE + "\n" + ANALYZER_V41_PATCH_CODE + "\n" + ANALYZER_V58_PATCH_CODE + "\n" + ANALYZER_V59_PATCH_CODE + "\n" + ANALYZER_V62_PATCH_CODE
-
-exec(ANALYZER_MODULE_CODE, globals())
-
-# ------------------------- Psi4 dependency detection -------------------------
-PSI4_EXTRA_RULES = [
-    (re.compile(r"(?:-d3bj|-d3zero|-d3m|-d3\b|s-dftd3|dftd3)", re.I), "dftd3-python"),
-    (re.compile(r"(?:-d4\b|dftd4)", re.I), "dftd4-python"),
-    (re.compile(r"(?:\bgcp\b|mctc-gcp)", re.I), "gcp-correction"),
-    (re.compile(r"(?:geometric|optimizer\s*=\s*['\"]?geometric)", re.I), "geometric"),
-    (re.compile(r"\bqcengine\b", re.I), "qcengine"),
-    (re.compile(r"\bqcelemental\b", re.I), "qcelemental"),
-]
-
-
-def detect_psi4_extras(inp_text):
-    found = []
-    for rx, pkg in PSI4_EXTRA_RULES:
-        if rx.search(inp_text) and pkg not in found:
-            found.append(pkg)
-    return found
-
-
-# ------------------------- Kaggle runner code -------------------------
 KAGGLE_RUNNER_CODE = r'''
+
+
 import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib, re, signal, threading
 from pathlib import Path
+import uuid
 START_TIME=time.time()
 HARD_LIMIT=11.5*3600
 SAFETY_MARGIN=20*60
@@ -3557,51 +4855,79 @@ MAX_DISK_MB=20000
 MAX_DISK_BYTES=MAX_DISK_MB*1000*1000
 
 def tg(method, fields=None, file_field=None, file_path=None, timeout=90):
-    """Call Telegram Bot API and fail loudly on HTTP/API-level errors."""
-    fields=fields or {}
-    url='https://api.telegram.org/bot'+BOT_TOKEN+'/'+method
+    fields = fields or {}
+    url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/' + method
+    timeout = _phase_timeout(timeout)
     if file_field and file_path:
-        # File uploads use requests so multipart responses can be validated.
         import requests
-        with open(file_path,'rb') as fh:
-            r=requests.post(url,data=fields,files={file_field:fh},timeout=timeout)
-        r.raise_for_status()
+        with open(file_path, 'rb') as handle:
+            response = requests.post(url, data=fields, files={file_field: handle}, timeout=timeout)
         try:
-            payload=r.json()
+            payload = response.json()
         except Exception:
-            payload=None
-        if isinstance(payload,dict) and not payload.get('ok',False):
-            raise RuntimeError('Telegram API error: '+str(payload.get('description') or payload))
-        return payload if payload is not None else r.content
-    data=urllib.parse.urlencode(fields).encode('utf-8')
-    raw=urllib.request.urlopen(urllib.request.Request(url,data=data),timeout=timeout).read()
-    try:
-        payload=json.loads(raw.decode('utf-8'))
-        if isinstance(payload,dict) and not payload.get('ok',False):
-            raise RuntimeError('Telegram API error: '+str(payload.get('description') or payload))
+            payload = None
+        if not isinstance(payload, dict):
+            raise RuntimeError('Telegram returned a response that could not be validated.')
+        if not payload.get('ok', False):
+            error = RuntimeError('Telegram API error: ' + _redact_message(payload.get('description', 'unspecified error')))
+            error.retry_after = (payload.get('parameters') or {}).get('retry_after')
+            raise error
+        response.raise_for_status()
         return payload
-    except UnicodeDecodeError:
-        return raw
+    data = urllib.parse.urlencode(fields).encode('utf-8')
+    try:
+        raw = urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout).read()
+    except Exception as exc:
+        raise RuntimeError('Telegram request failed: ' + _redact_message(exc)) from exc
+    try:
+        payload = json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError('Telegram returned a response that could not be validated.')
+    if not isinstance(payload, dict) or not payload.get('ok', False):
+        raise RuntimeError('Telegram API error: ' + _redact_message(payload.get('description') if isinstance(payload, dict) else 'invalid payload'))
+    return payload
 
 def send_msg(msg):
     for attempt in range(3):
         try:
-            tg('sendMessage',{'chat_id':CHAT_ID,'text':str(msg)[:3900]})
+            prefix = '[' + str(_JOB_STATUS.get('job_id') or 'ChemBot') + '] '
+            tg('sendMessage', {'chat_id': CHAT_ID, 'text': (prefix + _redact_message(msg))[:3900]})
             return True
         except Exception:
-            if attempt<2:
-                time.sleep(2**attempt)
-    print('[Kaggle] Telegram message delivery failed after three attempts.',file=sys.stderr)
+            if attempt < 2:
+                try:
+                    _sleep_with_budget(2 ** attempt)
+                except TimeoutError:
+                    break
+    print('[Kaggle] Telegram message could not be delivered.', file=sys.stderr)
     return False
 
-def safe_install(cmd):
-    send_msg('[Kaggle] Installing: '+' '.join(cmd))
-    p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-    if p.returncode!=0:
-        raise RuntimeError('Dependency installation failed: '+' '.join(cmd)+'\n'+p.stdout[-2500:])
+def safe_install(cmd, max_seconds=2400):
+    send_msg('[Kaggle] Installing: ' + ' '.join(map(str, cmd)))
+    log_path = os.path.join('/tmp', 'chembot_setup_' + uuid.uuid4().hex + '.log')
+    try:
+        timeout = _phase_timeout(max_seconds, reserve_seconds=SAFETY_MARGIN)
+        with open(log_path, 'wb') as log:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                rc = proc.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, TimeoutError) as exc:
+                _stop_process_group(proc)
+                proc.wait(timeout=5)
+                raise TimeoutError('Dependency installation exceeded its bounded time budget.') from exc
+        if rc != 0:
+            with open(log_path, 'rb') as log:
+                log.seek(max(0, os.path.getsize(log_path) - 3000))
+                excerpt = log.read().decode('utf-8', errors='replace')
+            raise RuntimeError('Dependency installation failed: ' + ' '.join(map(str, cmd)) + '\n' + _redact_message(excerpt))
+    finally:
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
 
 def remaining_time():
-    return max(60, HARD_LIMIT-SAFETY_MARGIN-(time.time()-START_TIME))
+    return _phase_timeout(reserve_seconds=SAFETY_MARGIN)
 
 
 def _windows_safe_basename(value):
@@ -3653,7 +4979,7 @@ def _cap_gaussian_maxdisk(inp):
     disk_option=re.compile(r'(?i)\bMaxDisk\s*=\s*(?P<number>[-+]?\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?B|[KMG]W)?\b')
     # Use conservative binary conversions for larger units. For example,
     # 20 GB may mean 20,480 MB and must therefore be capped at 20,000 MB.
-    unit_mb={'KB':1/1024,'MB':1.0,'GB':1024.0,'TB':1048576.0,
+    unit_mb={'B':1/(1024*1024),'KB':1/1024,'MB':1.0,'GB':1024.0,'TB':1048576.0,
              'KW':8/1024,'MW':8.0,'GW':8192.0,'':8/(1024*1024)}
     for start in reversed(starts):
         end=start+1
@@ -3681,42 +5007,47 @@ def _cap_gaussian_maxdisk(inp):
 
 
 def _cap_orca_maxdisk(inp):
-    """Limit ORCA conventional SCF integral files to 20,000 MB per job."""
-    jobs=re.split(r'(?im)(^\s*\$new_job\s*$)',inp)
-    for index in range(0,len(jobs),2):
-        job=jobs[index]
-        # Respect existing %scf blocks; cap an existing directive instead of
-        # inserting a duplicate keyword (which ORCA can reject).
-        maxdisk_pattern=(r'(?im)^(\s*(?:%scf\b[^\n]*?\b)?MaxDisk\s*(?:=\s*)?)'
-                         r'([-+]?\d+(?:\.\d+)?)\b')
-        maxdisk=re.search(maxdisk_pattern,job)
-        if maxdisk:
-            job=re.sub(maxdisk_pattern,
-                       lambda m:m.group(1)+str(int(float(m.group(2))))
-                       if 0<float(m.group(2))<=20000 else m.group(1)+'20000',job)
+    """Cap only the conventional-SCF disk option; retain other input tokens."""
+    jobs = re.split(r'(?im)(^\s*\$new_job\s*$)', inp)
+    for index in range(0, len(jobs), 2):
+        job = jobs[index]
+        scf = re.search(r'(?im)^\s*%scf\b', job)
+        if scf is None:
+            jobs[index] = '%scf\n  MaxDisk 20000\nend\n' + job
+            continue
+        # Preserve offsets while ignoring quoted filenames and comments.
+        masked = re.sub(r'"[^"\n]*"|#[^\n]*', lambda m: ' ' * len(m.group()), job)
+        end = re.search(r'(?i)\bend\b', masked[scf.end():])
+        if end is None:
+            raise RuntimeError('ORCA %scf block has no closing end keyword.')
+        stop = scf.end() + end.start()
+        content = job[scf.end():stop]
+        pattern = r'(?i)\bMaxDisk\s*(?:=\s*)?([-+]?\d+(?:\.\d+)?)\b'
+        visible = masked[scf.end():stop]
+        choices = list(re.finditer(pattern, visible))
+        if choices:
+            for match in reversed(choices):
+                number = float(match.group(1))
+                if number <= 0 or number > MAX_DISK_MB:
+                    content = content[:match.start(1)] + str(MAX_DISK_MB) + content[match.end(1):]
+            jobs[index] = job[:scf.end()] + content + job[stop:]
         else:
-            scf=re.search(r'(?im)^\s*%scf\b[^\n]*',job)
-            if scf:
-                line=scf.group(0)
-                if re.search(r'(?i)\bend\b',line):
-                    replacement=re.sub(r'(?i)\bend\b','MaxDisk 20000 end',line,count=1)
-                else:
-                    replacement=line+'\n  MaxDisk 20000'
-                job=job[:scf.start()]+replacement+job[scf.end():]
-            else:
-                job='%scf\n  MaxDisk 20000\nend\n'+job
-        jobs[index]=job
+            jobs[index] = job[:stop] + ' MaxDisk 20000\n' + job[stop:]
     return ''.join(jobs)
 
 
 def _working_disk_bytes(root):
-    """Measure allocated file blocks in the active job directory."""
-    total=0
-    for parent,dirs,files in os.walk(root,followlinks=False):
+    total = 0
+    seen = set()
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(parent, name))]
         for name in files:
             try:
-                st=os.stat(os.path.join(parent,name),follow_symlinks=False)
-                total+=st.st_blocks*512 if hasattr(st,'st_blocks') else st.st_size
+                info = os.stat(os.path.join(parent, name), follow_symlinks=False)
+                inode = (info.st_dev, info.st_ino)
+                if inode not in seen:
+                    seen.add(inode)
+                    total += info.st_blocks * 512 if hasattr(info, 'st_blocks') else info.st_size
             except FileNotFoundError:
                 continue
     return total
@@ -3728,11 +5059,13 @@ def _stop_process_group(proc):
         if proc.poll() is None: proc.kill()
 
 
-def _start_disk_guard(proc, root):
+def _start_disk_guard(proc, root, extra_roots=()):
     stop=threading.Event(); exceeded=threading.Event()
     def watch():
         while proc.poll() is None and not stop.wait(2):
-            if _working_disk_bytes(root)>MAX_DISK_BYTES:
+            roots = list(dict.fromkeys([os.path.realpath(root)] + [os.path.realpath(p) for p in extra_roots if p]))
+            if (sum(_working_disk_bytes(p) for p in roots if os.path.isdir(p)) > MAX_DISK_BYTES
+                    or shutil.disk_usage(root).free < 256 * 1024 * 1024):
                 exceeded.set()
                 _stop_process_group(proc)
                 break
@@ -3748,155 +5081,499 @@ TG_SEND_RETRIES=3
 TG_SEND_DELAY=1.10
 
 
-def _sha256(path, chunk=4*1024*1024):
-    h=hashlib.sha256()
-    with open(path,'rb') as f:
+def _sha256(path, chunk=4 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
         while True:
-            block=f.read(chunk)
-            if not block: break
-            h.update(block)
-    return h.hexdigest()
+            _phase_timeout(reserve_seconds=20)
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def _send_document_retry(path, caption='', retries=TG_SEND_RETRIES):
-    """Send one document with bounded retries and Telegram flood spacing."""
-    last=None
-    for attempt in range(1,retries+1):
+def _send_document_retry(path, caption='', retries=TG_SEND_RETRIES, reserve_seconds=30):
+    last = None
+    for attempt in range(1, retries + 1):
         try:
-            tg('sendDocument',{'chat_id':CHAT_ID,'caption':str(caption)[:1024]},'document',path,timeout=180)
-            time.sleep(TG_SEND_DELAY)
+            timeout = _phase_timeout(180, reserve_seconds=reserve_seconds)
+            tg('sendDocument', {'chat_id': CHAT_ID, 'caption': _redact_message(caption)[:1024]},
+               'document', path, timeout=timeout)
+            try:
+                _sleep_with_budget(TG_SEND_DELAY, reserve_seconds=reserve_seconds)
+            except TimeoutError:
+                pass
             return True
-        except Exception as e:
-            last=e
-            if attempt<retries:
-                time.sleep(min(2**attempt,8))
-    send_msg('[Transfer] Failed to send '+os.path.basename(path)+': '+str(last))
+        except TimeoutError as exc:
+            last = exc
+            break
+        except Exception as exc:
+            last = exc
+            if attempt < retries:
+                delay = getattr(exc, 'retry_after', None) or min(2 ** attempt, 8)
+                try:
+                    _sleep_with_budget(float(delay), reserve_seconds=reserve_seconds)
+                except TimeoutError:
+                    break
+    _record_error('telegram_transfer', last or RuntimeError('Unspecified delivery failure.'), os.path.basename(path))
     return False
 
 
-def _split_file(path, chunk_bytes=None):
-    """Split a too-large result into lossless Telegram-safe binary parts."""
-    chunk_bytes=TG_SAFE_FILE_BYTES if chunk_bytes is None else int(chunk_bytes)
-    parts=[]
-    total=os.path.getsize(path)
-    count=(total+chunk_bytes-1)//chunk_bytes
-    with open(path,'rb') as src:
-        for idx in range(1,count+1):
-            part=path+'.part%03d-of-%03d' % (idx,count)
-            with open(part,'wb') as dst:
-                remaining=chunk_bytes
-                while remaining>0:
-                    block=src.read(min(4*1024*1024,remaining))
-                    if not block: break
-                    dst.write(block); remaining-=len(block)
-            parts.append(part)
-    return parts
+def _iter_file_parts(path, chunk_bytes=None, part_prefix=None):
+    """Yield one lossless part and remove it before creating the next."""
+    chunk_bytes = TG_SAFE_FILE_BYTES if chunk_bytes is None else int(chunk_bytes)
+    if chunk_bytes <= 0:
+        raise ValueError('Part size must be positive.')
+    total = os.path.getsize(path)
+    count = (total + chunk_bytes - 1) // chunk_bytes
+    prefix = _windows_safe_basename(part_prefix or os.path.basename(path))
+    with tempfile.TemporaryDirectory(prefix='chembot_part_') as part_dir:
+        with open(path, 'rb') as original:
+            for index in range(1, count + 1):
+                _phase_timeout(reserve_seconds=30)
+                _require_space(part_dir, min(chunk_bytes, total - (index - 1) * chunk_bytes))
+                part = os.path.join(part_dir, prefix + '.part%03d-of-%03d' % (index, count))
+                try:
+                    with open(part, 'wb') as handle:
+                        remaining = chunk_bytes
+                        while remaining:
+                            _phase_timeout(reserve_seconds=30)
+                            block = original.read(min(4 * 1024 * 1024, remaining))
+                            if not block:
+                                break
+                            handle.write(block)
+                            remaining -= len(block)
+                    yield part, index, count
+                finally:
+                    try:
+                        os.unlink(part)
+                    except FileNotFoundError:
+                        pass
 
 
 def _write_transfer_manifest(results_dir, manifest_path):
-    entries=[]
-    for name in sorted(os.listdir(results_dir)):
-        path=os.path.join(results_dir,name)
-        if not os.path.isfile(path): continue
-        entries.append({'file':name,'size_bytes':os.path.getsize(path),'sha256':_sha256(path)})
-    with open(manifest_path,'w',encoding='utf-8') as f:
-        f.write('ChemBot result transfer manifest\n')
-        f.write('Files are listed with SHA-256 for integrity verification.\n\n')
-        for x in entries:
-            f.write('%s\t%d bytes\tSHA256=%s\n' % (x['file'],x['size_bytes'],x['sha256']))
-        f.write('\nIf a file was sent as .partNNN-of-NNN pieces, reconstruct it in binary order.\n')
-        f.write('Linux/macOS: cat filename.part* > filename\n')
-        f.write('Windows CMD: copy /b filename.part001-of-NNN+filename.part002-of-NNN+... filename\n')
+    entries = _result_entries(results_dir)
+    with open(manifest_path, 'w', encoding='utf-8') as handle:
+        handle.write('ChemBot recursive result transfer manifest\n')
+        handle.write('Scientific results, exact uploaded inputs, reports, figures and numeric data.\n\n')
+        for entry in entries:
+            handle.write('%s\t%d bytes\tSHA256=%s\n' % (
+                entry['file'], entry['size_bytes'], entry.get('sha256') or 'UNAVAILABLE'))
+            if entry.get('checksum_error'):
+                handle.write('  Checksum error: ' + _redact_message(entry['checksum_error']) + '\n')
+            if entry.get('part_prefix'):
+                handle.write('  Part prefix: ' + entry['part_prefix'] + '\n')
+        handle.write('\nLossless parts are numbered; reconstruct each original in binary numeric order.\n')
+        handle.write('Linux/macOS: cat PREFIX.part* > original_filename\n')
+        handle.write('Windows CMD: copy /b PREFIX.part001-of-NNN+PREFIX.part002-of-NNN+... original_filename\n')
+        if _EXPORT_FAILURES:
+            handle.write('\nPackaging failures (original files may remain in the Kaggle working directory):\n')
+            for name in dict.fromkeys(_EXPORT_FAILURES):
+                handle.write(_redact_message(name) + '\n')
     return entries
 
 
 def send_results_with_fallback(archive, results_dir):
-    """Deliver results without silently discarding oversized ORCA/Psi4 artifacts.
-
-    Strategy:
-      1) Try the complete ZIP only when it is Telegram-safe.
-      2) On oversize or any ZIP-upload failure, send result files individually.
-      3) Split files larger than the safe Telegram payload into lossless parts.
-      4) Send an integrity manifest containing size and SHA-256 for every original file.
-    """
-    archive_size=os.path.getsize(archive) if os.path.exists(archive) else 0
-    if archive_size and archive_size<=TG_SAFE_FILE_BYTES:
-        if _send_document_retry(archive,'Calculation files archive'):
-            return {'mode':'archive','sent':1,'failed':[]}
-        send_msg('[Transfer] ZIP upload failed after retries; switching to per-file rescue mode.')
-    elif archive_size:
-        send_msg('[Transfer] ZIP is %.1f MB and exceeds the safe Telegram upload size. Starting per-file rescue.' % (archive_size/1024/1024))
-
-    manifest_path=os.path.join(results_dir,'CHEMBOT_TRANSFER_MANIFEST.txt')
-    entries=_write_transfer_manifest(results_dir,manifest_path)
-    # Scientific text/checkpoint artifacts first; very large trajectories/cubes later.
-    priority={'.log':0,'.out':1,'.fchk':2,'.chk':3,'.gjf':4,'.com':4,'.property.txt':5,'.property.json':6,'.xyz':7,'.hess':8,'.gbw':9,'.molden.input':10,'.engrad':11,'.opt':12,'.trj':13,'.allxyz':14,'.cube':15,'.dat':16}
-    def key_for(entry):
-        name=entry['file'].lower()
-        rank=50
-        for ext,r in priority.items():
-            if name.endswith(ext): rank=min(rank,r)
-        return (rank,entry['size_bytes'],name)
-    sent=0; failed=[]; split_temp=[]
-    try:
-        for entry in sorted(entries,key=key_for):
-            path=os.path.join(results_dir,entry['file'])
-            size=entry['size_bytes']
-            if size<=TG_SAFE_FILE_BYTES:
-                cap='Result file: %s (%.2f MB)' % (entry['file'],size/1024/1024)
-                if _send_document_retry(path,cap): sent+=1
-                else: failed.append(entry['file'])
+    failed = list(dict.fromkeys(_EXPORT_FAILURES))
+    archive_size = os.path.getsize(archive) if archive and os.path.isfile(archive) else 0
+    if archive_size and archive_size <= TG_SAFE_FILE_BYTES:
+        if _send_document_retry(archive, 'Complete calculation and scientific report bundle'):
+            return {'mode': 'archive', 'sent': 1, 'failed': failed}
+        send_msg('[Transfer] Archive delivery failed; preserving and retrying the original files individually.')
+    entries = _result_entries(results_dir, include_status=False)
+    priority = {'.out': 0, '.log': 0, '.pdf': 1, '.json': 2, '.csv': 3, '.png': 4,
+                '.svg': 5, '.fchk': 6, '.chk': 7, '.gbw': 8, '.cube': 20, '.dat': 21}
+    def order(entry):
+        name = entry['file'].lower()
+        rank = min((value for suffix, value in priority.items() if name.endswith(suffix)), default=10)
+        return rank, entry['size_bytes'], name
+    sent = 0
+    for entry in sorted(entries, key=order):
+        path = os.path.join(results_dir, entry['file'])
+        try:
+            _phase_timeout(reserve_seconds=30)
+            if entry['size_bytes'] <= TG_SAFE_FILE_BYTES:
+                if _send_document_retry(path, 'Result: ' + entry['file']):
+                    sent += 1
+                else:
+                    failed.append(entry['file'])
                 continue
-            parts=_split_file(path)
-            split_temp.extend(parts)
-            send_msg('[Transfer] %s is %.1f MB; sending %d lossless parts.' % (entry['file'],size/1024/1024,len(parts)))
-            ok=True
-            for i,part in enumerate(parts,1):
-                cap='%s — part %d/%d | original SHA256 %s' % (entry['file'],i,len(parts),entry['sha256'][:16]+'…')
-                if _send_document_retry(part,cap): sent+=1
-                else: ok=False
-            if not ok: failed.append(entry['file'])
-        # Manifest last so it remains easy to find after all parts.
-        if _send_document_retry(manifest_path,'Transfer manifest / SHA-256 checksums'): sent+=1
-        else: failed.append(os.path.basename(manifest_path))
-    finally:
-        for part in split_temp:
-            try: os.remove(part)
-            except Exception: pass
-    if failed:
-        send_msg('[Transfer] Rescue completed with unsent item(s): '+', '.join(failed[:30]))
-    else:
-        send_msg('[Transfer] Rescue completed successfully. All result bytes were delivered.')
-    return {'mode':'fallback','sent':sent,'failed':failed}
+            iterator = _iter_file_parts(path, part_prefix=entry.get('part_prefix'))
+            complete = True
+            try:
+                for part, index, count in iterator:
+                    caption = '%s | part %d/%d | SHA256 %s' % (
+                        entry['file'], index, count, str(entry.get('sha256') or 'unavailable'))
+                    if _send_document_retry(part, caption):
+                        sent += 1
+                    else:
+                        complete = False
+            finally:
+                iterator.close()
+            if not complete:
+                failed.append(entry['file'])
+        except Exception as exc:
+            failed.append(entry['file'])
+            _record_error('result_transfer', exc, entry['file'])
+    return {'mode': 'fallback', 'sent': sent, 'failed': list(dict.fromkeys(failed))}
+
+
+import tempfile
+import stat
+
+_JOB_STATUS = {
+    'schema_version': 1,
+    'job_id': str(globals().get('JOB_ID') or str(globals().get('KAGGLE_NOTEBOOK_URL', '')).rstrip('/').rsplit('/', 1)[-1]),
+    'engine': str(globals().get('JOB_ENGINE', 'unknown')),
+    'input_file': str(globals().get('INPUT_FILE', '')),
+    'notebook_url': str(globals().get('KAGGLE_NOTEBOOK_URL', '')),
+    'calculation': {'state': 'not_started'},
+    'analysis': {'state': 'not_started'},
+    'transfer': {'state': 'not_started'},
+    'errors': [],
+}
+_JOB_FINALIZED = False
+_EXPORT_FAILURES = []
+
+
+def _redact_message(value):
+    text = str(value or '')
+    values = [globals().get('BOT_TOKEN'), globals().get('DRIVE_LINK')]
+    values += [os.environ.get(name) for name in ('CHEMBOT_BOT_TOKEN', 'KAGGLE_API_TOKEN', 'KAGGLE_KEY')]
+    for secret in values:
+        if secret and len(str(secret)) >= 8:
+            text = text.replace(str(secret), '[REDACTED]')
+    text = re.sub(r'https://api\.telegram\.org/bot[^/\s]+', 'https://api.telegram.org/bot[REDACTED]', text)
+    text = re.sub(r'\b\d{6,16}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_BOT_TOKEN]', text)
+    return text
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not __import__('math').isfinite(value):
+        return None
+    if isinstance(value, str):
+        return _redact_message(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact_message(value)
+
+
+def _status_path():
+    return os.path.join(WORK_DIR, 'outputs', 'job_status.json')
+
+
+def _write_status(phase=None, **updates):
+    if phase is not None:
+        _JOB_STATUS['phase'] = phase
+    _JOB_STATUS.update(updates)
+    _JOB_STATUS['updated_at_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    _JOB_STATUS['elapsed_seconds'] = round(max(0.0, time.time() - START_TIME), 3)
+    path = _status_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = path + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(_json_safe(_JOB_STATUS), handle, ensure_ascii=False, indent=2, allow_nan=False)
+        os.replace(temporary, path)
+    except Exception as exc:
+        print('[Status] Could not persist job status: ' + _redact_message(exc), file=sys.stderr)
+    return path
+
+
+def _record_error(stage, exc, filename=None):
+    item = {'stage': stage, 'type': type(exc).__name__, 'message': _redact_message(exc)[:2000]}
+    if filename:
+        item['file'] = _redact_message(filename)
+    _JOB_STATUS.setdefault('errors', []).append(item)
+    _write_status()
+    return item
+
+
+def _phase_timeout(max_seconds=None, reserve_seconds=0):
+    available = HARD_LIMIT - (time.time() - START_TIME) - float(reserve_seconds)
+    if available <= 0:
+        raise TimeoutError('The job time budget is exhausted; available artifacts are being preserved.')
+    return available if max_seconds is None else min(float(max_seconds), available)
+
+
+def _sleep_with_budget(seconds, reserve_seconds=0):
+    time.sleep(min(float(seconds), _phase_timeout(reserve_seconds=reserve_seconds)))
+
+
+def _persisted_bytes(root):
+    total = 0
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(parent, name))]
+        for name in files:
+            path = os.path.join(parent, name)
+            if os.path.islink(path):
+                continue
+            try:
+                total += os.path.getsize(path)
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _require_space(destination, additional_bytes=0):
+    os.makedirs(destination, exist_ok=True)
+    reserve = 32 * 1024 * 1024
+    if shutil.disk_usage(destination).free < int(additional_bytes) + reserve:
+        raise OSError('Insufficient free disk space to preserve/export the next artifact.')
+
+
+def _stage_artifact(source, destination, remove_source=False):
+    """Keep one canonical artifact; hard links avoid temporary copies on one filesystem."""
+    source = os.path.abspath(source)
+    destination = os.path.abspath(destination)
+    if source == destination:
+        return destination
+    if os.path.islink(source) or not os.path.isfile(source):
+        raise ValueError('Artifact is not a regular file: ' + os.path.basename(source))
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    if os.path.lexists(destination):
+        if os.path.isfile(destination) and os.path.samefile(source, destination):
+            if remove_source:
+                os.unlink(source)
+            return destination
+        os.unlink(destination)
+    try:
+        os.link(source, destination)
+    except OSError:
+        _require_space(os.path.dirname(destination), os.path.getsize(source))
+        partial = destination + '.partial'
+        try:
+            with open(source, 'rb') as original, open(partial, 'wb') as copied:
+                while True:
+                    _phase_timeout(reserve_seconds=60)
+                    block = original.read(4 * 1024 * 1024)
+                    if not block:
+                        break
+                    copied.write(block)
+            if os.path.getsize(partial) != os.path.getsize(source):
+                raise OSError('Artifact changed or the copy was incomplete.')
+            shutil.copystat(source, partial)
+            os.replace(partial, destination)
+        finally:
+            if os.path.exists(partial):
+                os.unlink(partial)
+    if remove_source:
+        os.unlink(source)
+    return destination
+
+
+def _stage_uploaded_inputs():
+    """Persist exact received bytes before installs or engine input normalization."""
+    global INPUT_FILE
+    files = json.loads(base64.b64decode(ENCODED_FILES_JSON).decode('utf-8'))
+    seen = set()
+    original_dir = os.path.join(WORK_DIR, 'outputs', 'inputs')
+    os.makedirs(original_dir, exist_ok=True)
+    index = []
+    for original_name, encoded in files.items():
+        safe_name = _windows_safe_basename(original_name)
+        if safe_name in seen:
+            raise RuntimeError('Two uploaded files map to the same Windows-safe filename: ' + safe_name)
+        seen.add(safe_name)
+        data = base64.b64decode(encoded, validate=True)
+        _require_space(WORK_DIR, 2 * len(data))
+        Path(WORK_DIR, safe_name).write_bytes(data)
+        Path(original_dir, safe_name).write_bytes(data)
+        index.append({'original_name': str(original_name), 'staged_name': safe_name,
+                      'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+    Path(original_dir, 'received_inputs.json').write_text(
+        json.dumps(_json_safe(index), ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+    INPUT_FILE = _windows_safe_basename(INPUT_FILE)
+    # Preserve the exact attachment before writing the normalized executable input.
+    prepared = globals().get('PREPARED_INPUT_TEXT')
+    if prepared is not None:
+        if not isinstance(prepared, str) or '\x00' in prepared:
+            raise RuntimeError('The prepared calculation input is not valid text.')
+        Path(WORK_DIR, INPUT_FILE).write_text(prepared, encoding='utf-8', newline='\n')
+    _write_status('preparing', input_file=INPUT_FILE, raw_inputs_preserved=True)
+
+
+def _collect_calculation_files(results_dir):
+    failures = []
+    root = os.path.abspath(WORK_DIR)
+    excluded = {os.path.join(root, name) for name in ('outputs', 'analysis_report', 'psi4_scratch', 'gaussian_scratch')}
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [name for name in dirs if os.path.join(parent, name) not in excluded
+                   and not os.path.islink(os.path.join(parent, name))]
+        for filename in sorted(files):
+            source = os.path.join(parent, filename)
+            if os.path.islink(source):
+                continue
+            # Kaggle runtime source and secret/config files are not scientific results.
+            low = filename.lower()
+            if low.endswith(('.py', '.ipynb', '.pyc')) or low in {'kaggle.json', 'access_token', '.env', 'restart_files.zip'}:
+                continue
+            relative = os.path.relpath(source, root)
+            destination = os.path.join(results_dir, 'calculation', relative)
+            try:
+                _stage_artifact(source, destination, remove_source=True)
+            except Exception as exc:
+                failures.append(relative)
+                _record_error('result_preservation', exc, relative)
+    if failures:
+        _EXPORT_FAILURES.extend(failures)
+    _write_status(raw_results_preserved=not failures, preservation_failures=failures)
+    return failures
+
+
+def _bundle_file_paths(bundle):
+    if not isinstance(bundle, dict):
+        return []
+    paths = []
+    for key in ('pdf', 'analysis_json', 'manifest', 'figures_zip'):
+        if bundle.get(key):
+            paths.append(str(bundle[key]))
+    paths.extend(str(path) for path in (bundle.get('publication_files') or []))
+    for key in ('plots', 'csv_files', 'csv_paths'):
+        value = bundle.get(key) or {}
+        if isinstance(value, dict):
+            paths.extend(str(path) for path in value.values() if path)
+    return list(dict.fromkeys(paths))
+
+
+def _stage_scientific_report(bundle, results_dir):
+    """Include canonical bundle keys and partial report files if generation failed."""
+    report_root = os.path.abspath(os.path.join(WORK_DIR, 'analysis_report'))
+    paths = _bundle_file_paths(bundle)
+    if os.path.isdir(report_root):
+        for parent, dirs, files in os.walk(report_root, followlinks=False):
+            dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(parent, name))]
+            paths.extend(os.path.join(parent, name) for name in files)
+    for source in dict.fromkeys(map(os.path.abspath, paths)):
+        if not os.path.isfile(source) or os.path.islink(source):
+            continue
+        if source.startswith(report_root + os.sep):
+            relative = os.path.relpath(source, report_root)
+        else:
+            relative = hashlib.sha256(source.encode()).hexdigest()[:10] + '_' + _windows_safe_basename(source)
+        destination = os.path.join(results_dir, 'analysis_report', relative)
+        try:
+            _stage_artifact(source, destination, remove_source=source.startswith(report_root + os.sep))
+        except Exception as exc:
+            _EXPORT_FAILURES.append('analysis_report/' + relative)
+            _record_error('report_preservation', exc, relative)
+
+
+def _restore_orca_executable_permissions(package_dir):
+    restored = []
+    for parent, dirs, files in os.walk(package_dir, followlinks=False):
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(parent, name))]
+        for filename in files:
+            known = bool(re.fullmatch(r'orca(?:_[A-Za-z0-9_-]+)?', filename)) or filename in {
+                'mpirun', 'mpiexec', 'orted', 'prted', 'ompi_info'}
+            path = os.path.join(parent, filename)
+            if not known or os.path.islink(path) or not os.path.isfile(path):
+                continue
+            with open(path, 'rb') as handle:
+                signature = handle.read(4)
+            if not (signature.startswith(b'\x7fELF') or signature.startswith(b'#!')):
+                continue
+            try:
+                mode = stat.S_IMODE(os.stat(path).st_mode)
+                if mode & 0o111 != 0o111:
+                    os.chmod(path, mode | 0o111)
+                    restored.append(os.path.relpath(path, package_dir))
+            except OSError as exc:
+                raise RuntimeError('Could not restore executable permission for ' + filename) from exc
+    return restored
+
+
+def _result_entries(results_dir, include_status=True, with_checksums=True):
+    entries = []
+    for parent, dirs, files in os.walk(results_dir, followlinks=False):
+        dirs[:] = [name for name in sorted(dirs) if not os.path.islink(os.path.join(parent, name))]
+        for filename in sorted(files):
+            if filename == 'CHEMBOT_TRANSFER_MANIFEST.txt' or (filename == 'job_status.json' and not include_status):
+                continue
+            path = os.path.join(parent, filename)
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            relative = os.path.relpath(path, results_dir).replace(os.sep, '/')
+            item = {'file': relative, 'size_bytes': os.path.getsize(path)}
+            if with_checksums:
+                try:
+                    item['sha256'] = _sha256(path)
+                except Exception as exc:
+                    item['sha256'] = None
+                    item['checksum_error'] = _redact_message(exc)
+                    _record_error('checksum', exc, relative)
+            if item['size_bytes'] > TG_SAFE_FILE_BYTES:
+                item['part_prefix'] = hashlib.sha256(relative.encode()).hexdigest()[:10] + '_' + _windows_safe_basename(filename)
+            entries.append(item)
+    return entries
+
+
+def _make_bounded_zip(results_dir, archive_stem):
+    """Only build a small transfer ZIP, outside saved output; large raw files stream individually."""
+    entries = _result_entries(results_dir, include_status=False, with_checksums=False)
+    total = sum(item['size_bytes'] for item in entries)
+    if total > TG_SAFE_FILE_BYTES - 256 * 1024:
+        return ''
+    _phase_timeout(reserve_seconds=90)
+    folder = tempfile.mkdtemp(prefix='chembot_archive_')
+    archive = os.path.join(folder, _windows_safe_basename(archive_stem) + '.zip')
+    try:
+        _require_space(folder, total + 1024 * 1024)
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=4) as handle:
+            for entry in entries:
+                _phase_timeout(reserve_seconds=60)
+                handle.write(os.path.join(results_dir, entry['file']), arcname=entry['file'])
+        return archive
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+
+def _deliver_final_metadata(results_dir, transfer):
+    status_path = _write_status()
+    manifest_path = os.path.join(results_dir, 'CHEMBOT_TRANSFER_MANIFEST.txt')
+    _write_transfer_manifest(results_dir, manifest_path)
+    missing = []
+    for path, caption in ((status_path, 'Final calculation, analysis and delivery status'),
+                          (manifest_path, 'Complete recursive transfer manifest / SHA-256')):
+        if not _send_document_retry(path, caption, reserve_seconds=0):
+            missing.append(os.path.basename(path))
+    if missing:
+        transfer.setdefault('failed', []).extend(missing)
+        _JOB_STATUS['transfer'] = dict(transfer, state='partial')
+        _write_status()
+        _write_transfer_manifest(results_dir, manifest_path)
+    return missing
 
 GAUSSIAN_SCRATCH_DIR=None
 try:
+    os.makedirs(WORK_DIR, exist_ok=True)
+    os.chdir(WORK_DIR)
+    _write_status('preparing')
+    _stage_uploaded_inputs()
     PY_DEPS='/tmp/chembot_python_packages'
     os.makedirs(PY_DEPS,exist_ok=True)
     os.environ['PIP_CACHE_DIR']='/tmp/chembot_pip_cache'
     safe_install([sys.executable,'-m','pip','install','-q','--target',PY_DEPS,
-                  'requests','matplotlib>=3.7','reportlab>=4.0','numpy'])
+                  'requests==2.34.2','matplotlib==3.10.8','reportlab==4.4.9','numpy==2.3.5'])
     sys.path.insert(0,PY_DEPS)
     send_msg('[Kaggle] Session connected. Preparing calculation...')
     os.makedirs(WORK_DIR,exist_ok=True)
     os.chdir(WORK_DIR)
 
-    files_dict=json.loads(base64.b64decode(ENCODED_FILES_JSON).decode('utf-8'))
-    staged_names=set()
-    for fname,b64content in files_dict.items():
-        safe_name=_windows_safe_basename(fname)
-        if safe_name in staged_names:
-            raise RuntimeError('Two uploaded files map to the same Windows-safe filename: '+safe_name)
-        staged_names.add(safe_name)
-        with open(safe_name,'wb') as f: f.write(base64.b64decode(b64content))
-    INPUT_FILE=_windows_safe_basename(INPUT_FILE)
+    # Inputs were staged and snapshotted before dependency preparation.
 
     if DRIVE_LINK:
         send_msg('[Kaggle] Downloading restart archive...')
         if urllib.parse.urlsplit(DRIVE_LINK).scheme.lower()!='https':
             raise RuntimeError('Restart archive URL must use HTTPS.')
         req=urllib.request.Request(DRIVE_LINK,headers={'User-Agent':'ChemBot/4.0'})
-        with urllib.request.urlopen(req,timeout=120) as r, open('restart_files.zip','wb') as f:
+        with urllib.request.urlopen(req,timeout=_phase_timeout(120, reserve_seconds=SAFETY_MARGIN)) as r, open('restart_files.zip','wb') as f:
             if urllib.parse.urlsplit(r.geturl()).scheme.lower()!='https':
                 raise RuntimeError('Restart archive redirected to a non-HTTPS URL.')
             downloaded=0
@@ -3909,13 +5586,20 @@ try:
                 f.write(chunk)
         with zipfile.ZipFile('restart_files.zip') as z:
             infos=z.infolist()
-            if sum(max(0,info.file_size) for info in infos)>20*1024*1024*1024:
-                raise RuntimeError('Restart archive expands beyond 20 GiB.')
+            expanded = sum(max(0,info.file_size) for info in infos)
+            if expanded > MAX_DISK_BYTES:
+                raise RuntimeError('Restart archive expands beyond the calculation disk budget.')
+            _require_space(WORK_DIR, expanded)
             restart_root=os.path.abspath('.')
             for info in infos:
                 target=os.path.abspath(os.path.join('.',info.filename))
                 if not (target.startswith(restart_root+os.sep) or (target==restart_root and info.is_dir())):
                     raise RuntimeError('Unsafe ZIP path detected.')
+                relative = os.path.relpath(target, restart_root)
+                if relative.split(os.sep)[0] in {'outputs', 'analysis_report'}:
+                    raise RuntimeError('Restart ZIP cannot overwrite report/status directories.')
+                if not info.is_dir() and os.path.lexists(target):
+                    raise RuntimeError('Restart ZIP would overwrite an uploaded or active file: ' + relative)
             z.extractall('.')
         os.remove('restart_files.zip')
 
@@ -3966,7 +5650,7 @@ try:
             if not path or not os.path.isfile(path):
                 return False
             try:
-                p=subprocess.run([path,'--version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=20)
+                p=subprocess.run([path,'--version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=_phase_timeout(20))
                 out=(p.stdout or '').lower()
                 return p.returncode==0 and 'conda' in out
             except Exception:
@@ -4011,7 +5695,7 @@ try:
             installer='/tmp/Psi4conda-1.11-py312-Linux-x86_64.sh'
             send_msg('[Kaggle] Conda was not available; using the official Psi4 1.11 standalone installer...')
             req=urllib.request.Request(url,headers={'User-Agent':'ChemBot/5.6'})
-            with urllib.request.urlopen(req,timeout=1800) as r, open(installer,'wb') as f:
+            with urllib.request.urlopen(req,timeout=_phase_timeout(1800, reserve_seconds=SAFETY_MARGIN)) as r, open(installer,'wb') as f:
                 shutil.copyfileobj(r,f)
             if not os.path.exists(installer) or os.path.getsize(installer)<1024*1024:
                 raise RuntimeError('Psi4 standalone installer download failed or was unexpectedly small.')
@@ -4042,11 +5726,11 @@ try:
             pass
 
         # Smoke-test the exact executable that will run the user's input.
-        probe=subprocess.run([psi4_exe,'--version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=60)
+        probe=subprocess.run([psi4_exe,'--version'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=_phase_timeout(60))
         if probe.returncode!=0:
             raise RuntimeError('Psi4 executable failed its version check:\n'+(probe.stdout or '')[-1500:])
         send_msg('[Kaggle] '+(probe.stdout or 'Psi4 ready').strip().splitlines()[0][:300])
-        psi4_scratch=os.path.join(WORK_DIR,'psi4_scratch')
+        psi4_scratch=os.path.join('/tmp','chembot_psi4_scratch')
         os.makedirs(psi4_scratch,exist_ok=True)
         psi4_env=os.environ.copy()
         psi4_env['PSI_SCRATCH']=psi4_scratch
@@ -4119,7 +5803,7 @@ try:
         if not os.path.isfile(os.path.join(gaussian_home,'g16')):
             raise RuntimeError('Gaussian archive extracted, but the g16 executable is missing next to bsd/g16.profile.')
         send_msg('[Kaggle] Gaussian 16 archive extracted and executable found. Preparing the runtime...')
-        GAUSSIAN_SCRATCH_DIR=os.path.join(WORK_DIR,'gaussian_scratch')
+        GAUSSIAN_SCRATCH_DIR=os.path.join('/tmp','chembot_gaussian_scratch')
         os.makedirs(GAUSSIAN_SCRATCH_DIR,exist_ok=True)
         gaussian_env=os.environ.copy()
         gaussian_env['g16root']=gaussian_root
@@ -4131,7 +5815,7 @@ try:
         if os.path.isfile(install_script):
             try: os.chmod(install_script,0o755)
             except OSError: pass
-            install=subprocess.run([install_script],cwd=gaussian_home,env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=300)
+            install=subprocess.run([install_script],cwd=gaussian_home,env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=_phase_timeout(300))
             if install.returncode!=0:
                 raise RuntimeError('Gaussian bsd/install failed:\n'+(install.stdout or '')[-2500:])
         gaussian_exe=os.path.join(gaussian_home,'g16')
@@ -4212,7 +5896,7 @@ try:
                             t.extractall(dest)
                     return True
             except Exception as exc:
-                send_msg('[Kaggle] ORCA archive extraction failed: '+str(exc))
+                send_msg('[Kaggle] ORCA archive extraction failed: '+_redact_message(exc))
             return False
 
         # Keep the ORCA program and its adjacent shared libraries together in
@@ -4242,9 +5926,10 @@ try:
                 shutil.rmtree(dest,ignore_errors=True)
         if not orca_exe:
             raise RuntimeError("Could not locate the ORCA executable in attached Dataset 'abdulsalsmsalih/orca-6-1-0'. Ensure it contains the Linux ORCA package or archive.")
-        try: os.chmod(orca_exe,0o755)
-        except Exception: pass
         orca_dir=os.path.dirname(os.path.realpath(orca_exe))
+        _restore_orca_executable_permissions(orca_dir)
+        if not os.access(orca_exe, os.X_OK):
+            raise RuntimeError('ORCA executable has no usable execute permission.')
         os.environ['PATH']=orca_dir+os.pathsep+os.environ.get('PATH','')
         os.environ['LD_LIBRARY_PATH']=orca_dir+os.pathsep+os.environ.get('LD_LIBRARY_PATH','')
         os.environ['OMPI_ALLOW_RUN_AS_ROOT']='1'
@@ -4259,33 +5944,37 @@ try:
         cmd=[orca_exe,INPUT_FILE]
 
     engine_label='Gaussian 16' if is_gaussian else ('Psi4' if is_psi4 else 'ORCA')
+    scratch_roots = ([psi4_scratch] if is_psi4 else ([GAUSSIAN_SCRATCH_DIR] if is_gaussian else []))
     if _working_disk_bytes(WORK_DIR)>MAX_DISK_BYTES:
         raise RuntimeError('The working directory already exceeds the 20,000 MB calculation disk limit.')
     send_msg(f"[Kaggle] Launching {engine_label} calculation in {WORK_DIR}: {INPUT_FILE}; MaxDisk limit {MAX_DISK_MB} MB")
+    _write_status('calculating', calculation={'state': 'running', 'engine': engine_label})
     timeout_triggered=False
     disk_guard_stop=None; disk_guard_exceeded=None; disk_guard_thread=None
+    calculation_timeout = remaining_time()  # Check budget before starting a process.
     try:
         if is_psi4:
-            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
-                                  cwd=WORK_DIR,env=psi4_env,start_new_session=True)
-            disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
-            send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
-            try:
-                proc_stdout,_=proc.communicate(timeout=remaining_time())
-            except subprocess.TimeoutExpired:
-                _stop_process_group(proc); proc_stdout,_=proc.communicate(); timeout_triggered=True
-                send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
-            rc=proc.returncode
-            if not os.path.exists(output_file) and proc_stdout:
-                Path(output_file).write_text(proc_stdout,encoding='utf-8',errors='replace')
+            launch_log = basename + '_launcher.log'
+            with open(launch_log, 'wb') as launcher:
+                proc=subprocess.Popen(cmd,stdout=launcher,stderr=subprocess.STDOUT,
+                                      cwd=WORK_DIR,env=psi4_env,start_new_session=True)
+                disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR,scratch_roots)
+                send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
+                try:
+                    rc = proc.wait(timeout=calculation_timeout)
+                except subprocess.TimeoutExpired:
+                    _stop_process_group(proc); proc.wait(); rc=124; timeout_triggered=True
+                    send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
+            if not os.path.exists(output_file):
+                shutil.copyfile(launch_log, output_file)
         elif is_gaussian:
             with open(INPUT_FILE,'rb') as fin, open(output_file,'wb') as fout:
                 proc=subprocess.Popen(cmd,stdin=fin,stdout=fout,stderr=subprocess.STDOUT,
                                       cwd=WORK_DIR,env=gaussian_env,start_new_session=True)
-                disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
+                disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR,scratch_roots)
                 send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
                 try:
-                    rc=proc.wait(timeout=remaining_time())
+                    rc=proc.wait(timeout=calculation_timeout)
                 except subprocess.TimeoutExpired:
                     _stop_process_group(proc); proc.wait(); rc=124; timeout_triggered=True
                     send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
@@ -4296,12 +5985,15 @@ try:
                 disk_guard_stop,disk_guard_exceeded,disk_guard_thread=_start_disk_guard(proc,WORK_DIR)
                 send_msg('✅ '+engine_label+' calculation process started on Kaggle. The private job link was sent by the bot when Kaggle accepted the submission.')
                 try:
-                    rc=proc.wait(timeout=remaining_time())
+                    rc=proc.wait(timeout=calculation_timeout)
                 except subprocess.TimeoutExpired:
                     _stop_process_group(proc); proc.wait(); rc=124; timeout_triggered=True
                     send_msg('[Kaggle] Safety timeout reached; preserving available restart/results files.')
     except Exception as exc:
-        send_msg('[Kaggle] Could not start or wait for '+engine_label+' process: '+str(exc))
+        if 'proc' in globals() and proc.poll() is None:
+            _stop_process_group(proc)
+            proc.wait(timeout=10)
+        send_msg('[Kaggle] Could not start or wait for '+engine_label+' process: '+_redact_message(exc))
         raise
     finally:
         if disk_guard_stop is not None:
@@ -4311,8 +6003,16 @@ try:
     if disk_limit_exceeded:
         send_msg('[Kaggle] The calculation reached the 20,000 MB working-disk limit. Available output files will still be returned.')
 
+    calculation_cause = ('disk_limit' if disk_limit_exceeded else
+                         ('timeout' if timeout_triggered else ('success' if rc == 0 else 'process_failed')))
+    _write_status('calculated', calculation={'state': 'complete' if calculation_cause == 'success' else 'failed',
+                  'returncode': rc, 'cause': calculation_cause})
     bundle=None
+    analysis={}
+    report_error=None
     if is_gaussian:
+        _write_status('converting_checkpoints', analysis={'state': 'pending',
+                      'reason': 'Portable checkpoint conversion precedes scientific analysis.'})
         checkpoints=[]
         runtime_real=os.path.realpath(GAUSSIAN_RUNTIME_ROOT)
         for parent,dirs,files in os.walk(os.getcwd()):
@@ -4329,7 +6029,7 @@ try:
         for chk_path in sorted(set(checkpoints)):
             fchk_path=os.path.splitext(chk_path)[0]+'.fchk'
             try:
-                conversion=subprocess.run(['bash','-c',formchk_script,'formchk',chk_path,fchk_path],env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=max(60,min(remaining_time(),1800)))
+                conversion=subprocess.run(['bash','-c',formchk_script,'formchk',chk_path,fchk_path],env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=_phase_timeout(1800, reserve_seconds=90))
                 if conversion.returncode==0 and os.path.isfile(fchk_path) and os.path.getsize(fchk_path)>0:
                     converted+=1
                 else:
@@ -4342,112 +6042,484 @@ try:
             send_msg('[GaussView] No usable checkpoint was found. The .log and executed input will still be returned; include a %chk= line to save orbitals.')
         if rc!=0 and not timeout_triggered:
             send_msg('[Kaggle] Gaussian exited with code %d. Available files will still be returned.' % rc)
+
+    # Gaussian checkpoint conversion above is followed by the same validated
+    # analysis/report path when the shared analyzer is injected for that engine.
+    if callable(globals().get('parse_output_text')):
+        _write_status('analyzing', analysis={'state': 'running'})
+        try:
+            _phase_timeout(reserve_seconds=120)
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 128 * 1024 * 1024:
+                raise RuntimeError('Text output exceeds the 128 MiB analysis budget. Complete raw results are preserved without truncating scientific records.')
+            out_bytes = Path(output_file).read_bytes() if os.path.exists(output_file) else b''
+            out_text = out_bytes.decode('utf-8', errors='replace')
+            analysis = parse_output_text(out_text, output_file)
+            analysis['source_bytes_sha256'] = hashlib.sha256(out_bytes).hexdigest()
+            analysis['process_returncode'] = rc
+            analysis['process_return_cause'] = calculation_cause
+            if callable(globals().get('validate_analysis')):
+                analysis = validate_analysis(analysis, source_text=out_text)
+            quality = analysis.get('quality') or analysis.get('validation') or {}
+            _write_status('analyzing', analysis={'state': 'validated',
+                          'quality_status': quality.get('status', 'UNVERIFIED'),
+                          'normal_termination': bool(analysis.get('normal_termination')),
+                          'quality': quality})
+            work = 'analysis_report'
+            os.makedirs(work, exist_ok=True)
+            bundle = generate_report_bundle(analysis, work, basename)
+            _write_status('analyzed', analysis={'state': 'complete',
+                          'quality_status': quality.get('status', 'UNVERIFIED'),
+                          'normal_termination': bool(analysis.get('normal_termination')),
+                          'quality': quality})
+            try:
+                send_msg('[Analysis]\n' + section_summary(analysis))
+            except Exception as exc:
+                _record_error('analysis_notification', exc)
+            # Preview only PNGs. Vector figures, numeric tables, plot settings and
+            # source data remain in the complete publication/report bundle.
+            for name, path in (bundle.get('plots') or {}).items():
+                try:
+                    tg('sendPhoto', {'chat_id': CHAT_ID, 'caption': str(name).replace('_', ' ').title()}, 'photo', path)
+                except Exception as exc:
+                    _record_error('preview_delivery', exc, str(name))
+        except Exception as exc:
+            report_error = exc
+            _record_error('scientific_analysis', exc)
+            _write_status('report_failed', analysis={'state': 'failed', 'error_type': type(exc).__name__,
+                          'quality_status': (analysis.get('quality') or {}).get('status', 'UNVERIFIED'),
+                          'quality': analysis.get('quality') or {}})
+            send_msg('[Analysis] The scientific report could not be completed. Raw calculation files are being returned.')
+
+    results_dir = os.path.join(WORK_DIR, 'outputs')
+    os.makedirs(results_dir, exist_ok=True)
+    _write_status('preserving')
+    _collect_calculation_files(results_dir)
+    _stage_scientific_report(bundle, results_dir)
+    saved_size = _persisted_bytes(WORK_DIR)
+    if saved_size > MAX_DISK_BYTES:
+        error = RuntimeError('Saved output exceeds the configured 20,000 MB budget; direct delivery will be attempted.')
+        _record_error('output_quota', error)
+        _EXPORT_FAILURES.append('saved-output-quota')
+    result_prefix = 'Gaussian16_Results_' if is_gaussian else ('Psi4_Results_' if is_psi4 else 'ORCA_Results_')
+    archive = ''
+    try:
+        archive = _make_bounded_zip(results_dir, result_prefix + basename)
+    except Exception as exc:
+        _record_error('archive_creation', exc)
+    _write_status('transferring', transfer={'state': 'running'})
+    try:
+        transfer = send_results_with_fallback(archive, results_dir)
+    finally:
+        if archive:
+            shutil.rmtree(os.path.dirname(archive), ignore_errors=True)
+    if calculation_cause != 'success':
+        final_state = calculation_cause.upper()
+    elif report_error is not None:
+        final_state = 'REPORT_FAILED'
+    elif not analysis:
+        final_state = 'RAW_RESULTS_COMPLETE'
+    elif not analysis.get('normal_termination') or (analysis.get('quality') or {}).get('status', 'UNVERIFIED') != 'PASS':
+        final_state = 'COMPLETED_WITH_SCIENTIFIC_WARNINGS'
     else:
-        out_text=Path(output_file).read_text(encoding='utf-8',errors='replace') if os.path.exists(output_file) else ''
-        analysis=parse_output_text(out_text,output_file)
-        analysis['process_returncode']=rc
-        if rc!=0 and not timeout_triggered: send_msg(f'[Kaggle] Program exited with code {rc}. Results will still be analyzed and returned.')
-
-        work='analysis_report'; os.makedirs(work,exist_ok=True)
-        bundle=generate_report_bundle(analysis,work,basename)
-        plots=bundle['plots']; pdf_path=bundle['pdf']
-
-        send_msg('[Analysis]\n'+section_summary(analysis))
-        for name,path in plots.items():
-            try: tg('sendPhoto',{'chat_id':CHAT_ID,'caption':name.replace('_',' ').title()},'photo',path)
-            except Exception as e: send_msg('Could not send plot '+name+': '+str(e))
-        try: tg('sendDocument',{'chat_id':CHAT_ID,'caption':'Complete scientific analysis PDF'},'document',pdf_path)
-        except Exception as e: send_msg('Could not send PDF: '+str(e))
-
-    results_dir='outputs'; os.makedirs(results_dir,exist_ok=True)
-    allowed_ext=('.log','.out','.chk','.fchk','.gjf','.com','.gau','.gbw','.xyz','.molden.input','.property.txt','.property.json','.prop','.hess','.interp','.allxyz','.opt','.dat','.cube','.cub','.engrad','.trj') if is_gaussian else ('.out','.gbw','.xyz','.molden.input','.property.txt','.property.json','.prop','.hess','.interp','.allxyz','.opt','.dat','.cube','.engrad','.trj')
-    excluded_roots=[os.path.realpath(results_dir)]
-    if os.path.isdir('analysis_report'):
-        excluded_roots.append(os.path.realpath('analysis_report'))
-    if is_gaussian:
-        excluded_roots.append(os.path.realpath(GAUSSIAN_RUNTIME_ROOT))
-    for parent,dirs,files in os.walk(os.getcwd()):
-        parent_real=os.path.realpath(parent)
-        if any(parent_real==root or parent_real.startswith(root+os.sep) for root in excluded_roots):
-            dirs[:]=[]
-            continue
-        dirs[:]=[d for d in dirs if not any(os.path.realpath(os.path.join(parent,d))==root or os.path.realpath(os.path.join(parent,d)).startswith(root+os.sep) for root in excluded_roots)]
-        for fn in files:
-            if fn==INPUT_FILE or fn.lower().endswith(allowed_ext):
-                src=os.path.join(parent,fn)
-                if os.path.isfile(src):
-                    try:
-                        result_name=_windows_safe_basename(fn) if is_gaussian else os.path.basename(fn)
-                        result_path=os.path.join(results_dir,result_name)
-                        if os.path.exists(result_path) and os.path.realpath(src)!=os.path.realpath(result_path):
-                            stem,ext=os.path.splitext(result_name)
-                            parent_tag=_windows_safe_basename(os.path.basename(parent))
-                            result_path=os.path.join(results_dir,stem+'_'+parent_tag+ext)
-                        shutil.copy2(src,result_path)
-                    except Exception: pass
-
-    # Include the exact same canonical report bundle that was sent to Telegram.
-    if bundle:
-        report_out=os.path.join(results_dir,'analysis_report')
-        os.makedirs(report_out,exist_ok=True)
-        for rp in [bundle.get('pdf'), bundle.get('analysis_json'), bundle.get('manifest')] + list(bundle.get('plots',{}).values()):
-            if rp and os.path.isfile(rp):
-                try: shutil.copy2(rp, os.path.join(report_out, os.path.basename(rp)))
-                except Exception: pass
-    result_prefix='Gaussian16_Results_' if is_gaussian else ('Psi4_Results_' if is_psi4 else 'ORCA_Results_')
-    archive='' if disk_limit_exceeded else shutil.make_archive(result_prefix+basename,'zip',results_dir)
-    transfer=send_results_with_fallback(archive,results_dir)
-    status=('DISK_LIMIT' if disk_limit_exceeded else ('SUCCESS' if rc==0 else ('TIMEOUT' if timeout_triggered else 'FAILED'))) if is_gaussian else ('DISK_LIMIT' if disk_limit_exceeded else ('SUCCESS' if (rc==0 and analysis.get('normal_termination')) else ('TIMEOUT' if timeout_triggered else 'FINISHED WITH WARNINGS/ERROR')))
+        final_state = 'SUCCESS'
     if transfer.get('failed'):
-        status += ' | PARTIAL_TRANSFER'
-    send_msg('[Kaggle] Final status: '+status)
-except Exception as e:
-    send_msg('Fatal Kaggle error:\n'+str(e)+'\n'+traceback.format_exc()[-2500:])
+        final_state += '_PARTIAL_TRANSFER'
+    _write_status('finished', final_state=final_state,
+                  transfer=dict(transfer, state='partial' if transfer.get('failed') else 'complete'),
+                  saved_output_bytes=_persisted_bytes(WORK_DIR))
+    _deliver_final_metadata(results_dir, transfer)
+    _JOB_FINALIZED = True
+    send_msg('[Kaggle] Final status: ' + final_state +
+             (' | Some artifacts need retry from the saved Kaggle output.' if transfer.get('failed') else ''))
+    if calculation_cause != 'success':
+        raise RuntimeError('Calculation ended with ' + calculation_cause + '; available files and status were preserved.')
+    if report_error is not None:
+        raise RuntimeError('Scientific report generation failed; raw files and diagnostics were preserved.') from report_error
+except Exception as exc:
+    if not _JOB_FINALIZED:
+        _record_error('runner', exc)
+        _write_status('failed', final_state='FAILED', runner_error_type=type(exc).__name__)
+        results_dir = os.path.join(WORK_DIR, 'outputs')
+        os.makedirs(results_dir, exist_ok=True)
+        try:
+            _collect_calculation_files(results_dir)
+            _stage_scientific_report(globals().get('bundle'), results_dir)
+            transfer = send_results_with_fallback('', results_dir)
+            _write_status('failed', final_state='FAILED', transfer=dict(transfer,
+                          state='partial' if transfer.get('failed') else 'complete'))
+            _deliver_final_metadata(results_dir, transfer)
+        except Exception as rescue_error:
+            _record_error('failure_recovery', rescue_error)
+    sanitized = _redact_message(exc)
+    print('[Kaggle] Fatal job error: ' + sanitized, file=sys.stderr)
+    send_msg('[Kaggle] Job failed: ' + sanitized[:1800] +
+             '\nExact uploaded inputs, available raw results and job_status.json are preserved in notebook output.')
+    # Never include a credential-bearing Requests exception as a chained cause.
+    raise RuntimeError('ChemBot runner failed: ' + sanitized) from None
 finally:
     if GAUSSIAN_SCRATCH_DIR:
-        shutil.rmtree(GAUSSIAN_SCRATCH_DIR,ignore_errors=True)
+        shutil.rmtree(GAUSSIAN_SCRATCH_DIR, ignore_errors=True)
 '''
 
+SELF_TEST_CODE = "import base64, copy, hashlib, json, math, os, tempfile, unittest\nfrom pathlib import Path\nORCA = '''O   R   C   A\nProgram Version 6.1.0\n| 1> ! PBE0 def2-SVP Opt Freq\n| 2> * xyz 0 1\nYour calculation utilizes the basis: def2-SVP\nSCF CONVERGED AFTER 8 CYCLES\nFINAL SINGLE POINT ENERGY -75.000000000\nTHE OPTIMIZATION HAS CONVERGED\nCARTESIAN COORDINATES (ANGSTROEM)\nO 0.0 0.0 0.0\nH 0.8 0.0 0.6\nH -0.8 0.0 0.6\n\nVIBRATIONAL FREQUENCIES\n0: 0.0 cm**-1\n1: 0.0 cm**-1\n2: 0.0 cm**-1\n3: 0.0 cm**-1\n4: 0.0 cm**-1\n5: 0.0 cm**-1\n6: 1200.0 cm**-1\n7: 3200.0 cm**-1\n8: 3300.0 cm**-1\n\nIR SPECTRUM\nMode freq eps Int T**2 TX TY TZ\n6: 1200.0 0.001 10.0 0.002 (0.1 0.2 0.3)\n7: 3200.0 0.003 20.0 0.004 (0.2 0.3 0.4)\n8: 3300.0 0.005 30.0 0.006 (0.3 0.4 0.5)\n\nORBITAL ENERGIES\nNO OCC E(Eh) E(eV)\n0 2.0000 -1.000000 -27.211386\n1 2.0000 -0.250000 -6.802847\n2 0.0000 0.050000 1.360569\n\nABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS\nState Energy Wavelength fosc\n1 20000.0 500.0 0.2\n2 25000.0 400.0 0.1\n\nTHERMOCHEMISTRY AT 298.15K\nTemperature ... 298.15 K\nPressure ... 1.0 atm\nElectronic energy ... -75.000000000 Eh\nZero point energy ... 0.018 Eh\nTotal thermal energy -74.978 Eh\nThermal Enthalpy correction ... 0.00094421 Eh\nTotal Enthalpy ... -74.97705579 Eh\nFinal Gibbs free energy ... -75.0 Eh\nStandard-RRHO\nORCA TERMINATED NORMALLY\n'''\n\nPSI4 = '''Psi4: An Open-Source Ab Initio Electronic Structure Package\nPsi4 1.11\nset basis sto-3g\nReference: RHF\nGeometry (in Angstrom), charge = 0, multiplicity = 1:\nO 0.0 0.0 0.0\nH 0.8 0.0 0.6\nH -0.8 0.0 0.6\n\nEnergy and wave function converged.\n@RHF Final Energy: -75.000000\n==> Orbital Energies [Eh] <==\nDoubly Occupied:\n1A1 -1.0 2A1 -0.25\nVirtual:\n\n3A1 0.05 1B2 0.10\n\nProperty section\nOptimization is complete\nPsi4 exiting successfully\n'''\n\nGAUSSIAN = '''Gaussian 16: synthetic format regression\n #p b3lyp/6-31g(d) opt freq\n ------------------------------------\n Standard basis: 6-31G(d) (6D, 7F)\n Charge = 0 Multiplicity = 1\n SCF Done: E(RB3LYP) = -75.000000 A.U. after 10 cycles\n Optimization completed.\n Standard orientation:\n ---------------------------------------------------------------------\n Center Atomic Atomic Coordinates (Angstroms)\n Number Number Type X Y Z\n ---------------------------------------------------------------------\n 1 8 0 0.0 0.0 0.0\n 2 1 0 0.8 0.0 0.6\n 3 1 0 -0.8 0.0 0.6\n ---------------------------------------------------------------------\n Harmonic frequencies (cm**-1), IR intensities (KM/Mole)\n                      1             2              3\n Frequencies --   1200.0       3200.0         3300.0\n IR Inten    --     10.0         20.0           30.0\n - Thermochemistry -\n Temperature 298.15 Kelvin. Pressure 1.0 Atm.\n Zero-point correction= 0.018000 (Hartree/Particle)\n Thermal correction to Energy= 0.022000\n Thermal correction to Enthalpy= 0.02294421\n Thermal correction to Gibbs Free Energy= 0.000000\n Sum of electronic and zero-point Energies= -74.982000\n Sum of electronic and thermal Energies= -74.978000\n Sum of electronic and thermal Enthalpies= -74.97705579\n Sum of electronic and thermal Free Energies= -75.000000\n Normal termination of Gaussian 16\n'''\n\ndef parse(text=ORCA, name='water.out'):\n    return A['parse_output_text'](text, name)\n\n\nclass ScientificChecks(unittest.TestCase):\n    def test_orca_minimum_and_thermochemistry(self):\n        a = parse()\n        self.assertEqual(a['quality']['status'], 'PASS')\n        self.assertEqual(a['expected_vibration_count'], 3)\n        self.assertEqual(a['stationary_point_status'], 'LIKELY_MINIMUM')\n        self.assertTrue(a['quality']['thermochemistry_reliable'])\n        self.assertAlmostEqual(a['energies']['final_energy_hartree'], -75.0)\n\n    def test_source_hash(self):\n        self.assertEqual(parse()['source_sha256'], hashlib.sha256(ORCA.encode()).hexdigest())\n\n    def test_finite_fortran_numbers(self):\n        self.assertEqual(A['_float']('-1.5D+02'), -150.)\n        self.assertIsNone(A['_float']('NaN'))\n        self.assertIsNone(A['_float']('inf'))\n\n    def test_termination_is_not_input_comment(self):\n        a = parse(ORCA.replace('ORCA TERMINATED NORMALLY', '| 9> # ORCA TERMINATED NORMALLY'))\n        self.assertIsNone(a['normal_termination'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_failed_calculation(self):\n        a = parse(ORCA.replace('ORCA TERMINATED NORMALLY', 'ORCA finished by error termination'))\n        self.assertEqual(a['quality']['status'], 'FAIL')\n\n    def test_opt_failure_despite_normal_termination(self):\n        a = parse(ORCA.replace('THE OPTIMIZATION HAS CONVERGED', 'The optimization did not converge'))\n        self.assertEqual(a['quality']['status'], 'FAIL')\n\n    def test_scf_failure_withholds_descriptors(self):\n        a = parse(ORCA.replace('SCF CONVERGED AFTER 8 CYCLES', 'SCF NOT CONVERGED'))\n        self.assertEqual(a['conceptual_dft'], {})\n\n    def test_unknown_scf_withholds_minimum(self):\n        a = parse(ORCA.replace('SCF CONVERGED AFTER 8 CYCLES', ''))\n        self.assertEqual(a['stationary_point_status'], 'UNVERIFIED_ELECTRONIC_STATE')\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_incomplete_frequencies(self):\n        a = parse(ORCA.replace('8: 3300.0 cm**-1', ''))\n        self.assertFalse(a['quality']['frequency_complete'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_one_imaginary_is_candidate(self):\n        a = parse(ORCA.replace('6: 1200.0 cm**-1', '6: -120.0 cm**-1'))\n        self.assertEqual(a['stationary_point_status'], 'FIRST_ORDER_SADDLE_CANDIDATE')\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_small_negative_is_not_ignored(self):\n        a = parse(ORCA.replace('6: 1200.0 cm**-1', '6: -3.0 cm**-1'))\n        self.assertEqual(a['stationary_point_status'], 'NEAR_ZERO_IMAGINARY_MODES')\n\n    def test_linear_modes(self):\n        self.assertEqual(A['_molecule_mode_counts']([dict(element='C', x=0,y=0,z=0),dict(element='O',x=0,y=0,z=1),dict(element='O',x=0,y=0,z=-1)]), (3, True, 4))\n\n    def test_orca_bohr_conversion(self):\n        a = parse(ORCA.replace('(ANGSTROEM)', '(A.U.)'))\n        self.assertAlmostEqual(a['final_geometry'][1]['x'], .8*A['BOHR_TO_ANGSTROM'])\n        self.assertEqual(a['source_geometry_units'], 'bohr')\n\n    def test_thermal_reference_mismatch(self):\n        a = parse(ORCA.replace('Electronic energy ... -75.000000000 Eh', 'Electronic energy ... -76.000000000 Eh'))\n        self.assertFalse(a['quality']['thermochemical_energy_compatible'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_missing_thermal_reference(self):\n        a = parse()\n        a['thermochemistry']['electronic_energy_hartree'] = None\n        a = A['validate_analysis'](a)\n        self.assertIsNone(a['quality']['thermochemical_energy_compatible'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_orca_enthalpy_does_not_omit_zpe(self):\n        t = A['_orca_thermo_block']('Electronic energy ... -75.0 Eh\\nThermal Enthalpy correction ... 0.001 Eh')\n        self.assertIsNone(t['enthalpy_hartree'])\n\n    def test_orca_enthalpy_from_total_u(self):\n        t = A['_orca_thermo_block']('Electronic energy ... -75.0 Eh\\nTotal thermal energy -74.98 Eh\\nThermal Enthalpy correction ... 0.001 Eh\\nFinal entropy term ... 0.02 Eh')\n        self.assertAlmostEqual(t['enthalpy_hartree'], -74.979)\n        self.assertAlmostEqual(t['gibbs_hartree'], -74.999)\n\n    def test_orca_enthalpy_from_total_correction(self):\n        t = A['_orca_thermo_block']('Electronic energy ... -75.0 Eh\\nTotal correction 0.02 Eh\\nThermal Enthalpy correction ... 0.001 Eh')\n        self.assertAlmostEqual(t['enthalpy_hartree'], -74.979)\n\n    def test_orca_correction_fields_have_consistent_meanings(self):\n        t=parse()['thermochemistry']\n        self.assertAlmostEqual(t['pv_correction_hartree'],.00094421)\n        self.assertAlmostEqual(t['enthalpy_correction_hartree'],.02294421)\n\n    def test_orca_solvent_protocol_blocks_gas_equilibrium(self):\n        a=parse(ORCA.replace('! PBE0 def2-SVP Opt Freq','! PBE0 def2-SVP Opt Freq CPCM(Water)'))\n        self.assertEqual(a['solvation_model'],'CPCM')\n        self.assertEqual(a['solvent'],'Water')\n        self.assertEqual(a['quality']['standard_state'],'CONTINUUM_ELECTRONIC_PLUS_GAS_THERMAL_REFERENCE')\n\n    def test_orca_ir_intensity_column(self):\n        self.assertEqual(tuple(parse()['ir_spectrum'][0]), (1200.,10.))\n\n    def test_ir_missing_intensity_not_fabricated(self):\n        a = parse(ORCA.replace('Mode freq eps Int T**2 TX TY TZ','unrecognized table header'))\n        self.assertEqual(a['ir_spectrum'], [])\n\n    def test_exact_correlated_method(self):\n        self.assertEqual(parse(ORCA.replace('! PBE0', '! DLPNO-CCSD(T1)'))['method'], 'DLPNO-CCSD(T1)')\n\n    def test_orca_jobs_do_not_inherit(self):\n        a = parse(ORCA + '\\nO   R   C   A\\n| 1> ! HF def2-SVP SP\\nSCF CONVERGED AFTER 4 CYCLES\\nFINAL SINGLE POINT ENERGY -74.0\\nORCA TERMINATED NORMALLY\\n')\n        self.assertEqual(a['job_blocks_count'], 2)\n        self.assertEqual(a['frequencies_cm1'], [])\n        self.assertIsNone(a['thermochemistry']['gibbs_hartree'])\n\n    def test_psi4_energy_and_symmetry(self):\n        a = parse(PSI4,'psi4.out')\n        self.assertEqual(a['engine'], 'Psi4')\n        self.assertAlmostEqual(a['orbitals']['homo_ev'], -.25*A['HARTREE_TO_EV'])\n        self.assertAlmostEqual(a['orbitals']['lumo_ev'], .05*A['HARTREE_TO_EV'])\n\n    def test_psi4_correlated_energy_is_not_scf(self):\n        text = PSI4.replace('Psi4 exiting successfully', 'MP2 total energy = -75.25\\nPsi4 exiting successfully')\n        a = parse(text)\n        self.assertEqual(a['method'], 'MP2')\n        self.assertAlmostEqual(a['energies']['final_energy_hartree'], -75.25)\n\n    def test_psi4_bohr_units(self):\n        a = parse(PSI4.replace('(in Angstrom)', '(in Bohr)'))\n        self.assertAlmostEqual(a['final_geometry'][1]['x'], .8*A['BOHR_TO_ANGSTROM'])\n\n    def test_psi4_explicit_ev_orbitals(self):\n        orbitals = A['_psi4_orbitals_v59']('==> Orbital Energies [eV] <==\\nDoubly Occupied:\\n1A1 -5.0\\nVirtual:\\n2A1 1.0\\n')\n        self.assertAlmostEqual(orbitals['homo_ev'],-5.)\n        self.assertAlmostEqual(orbitals['lumo_ev'],1.)\n\n    def test_psi4_spin_reset_for_final_table(self):\n        text='==> Orbital Energies [Eh] <==\\nAlpha Occupied: 1A1 -1.0\\nAlpha Virtual: 2A1 0.1\\nOther property\\n==> Orbital Energies [Eh] <==\\nDoubly Occupied: 1A1 -0.5\\nVirtual: 2A1 0.2\\n'\n        orbitals=A['_psi4_orbitals_v59'](text)\n        self.assertEqual(orbitals['orbitals'][0]['occ'],2.)\n\n    def test_psi4_unknown_geometry_units(self):\n        a = parse(PSI4.replace('Geometry (in Angstrom)', 'Final optimized geometry'))\n        self.assertEqual(a['geometry_units'], 'UNKNOWN')\n        self.assertIsNone(a['expected_vibration_count'])\n\n    def test_psi4_missing_cell_alignment(self):\n        f, ir = A['_parse_psi4_vibrations']('Freq [cm^-1] 100.0 ---- 300.0\\nIR activ [km/mol] 10.0 20.0 30.0\\n')\n        self.assertEqual(f,[100.,300.])\n        self.assertEqual(ir,[(100.,10.),(300.,30.)])\n\n    def test_psi4_multiple_jobs(self):\n        a = parse(PSI4 + '\\nPsi4: An Open-Source Ab Initio Electronic Structure Package\\n@RHF Final Energy: -1.0\\nPsi4 exiting successfully\\n')\n        self.assertEqual(a['job_blocks_count'],2)\n        self.assertEqual(a['final_geometry'],[])\n\n    def test_dipole_atomic_units(self):\n        d = A['_dipole_strict']('Total Dipole Moment : -1.0 2.0 0.0','ORCA')\n        self.assertAlmostEqual(d['magnitude_debye'],math.sqrt(5)*2.541746473)\n\n    def test_psi4_unknown_dipole_units(self):\n        self.assertEqual(A['_dipole_strict']('Dipole Moment:\\nX: 1.0 Y: 2.0 Z: 0.0 Total: 2.2','Psi4'),{})\n\n    def test_gaussian_energy_and_thermal_sum(self):\n        a = parse(GAUSSIAN,'water.log')\n        self.assertEqual(a['engine'],'Gaussian')\n        self.assertAlmostEqual(a['energies']['final_energy_hartree'],-75.)\n        self.assertTrue(a['quality']['thermochemistry_reliable'])\n\n    def test_gaussian_no_false_completion(self):\n        self.assertIsNone(parse(GAUSSIAN.replace('Normal termination of Gaussian 16',''))['normal_termination'])\n\n    def test_gaussian_link1(self):\n        second = '\\n--Link1--\\n #p hf/sto-3g sp\\n ----\\n SCF Done: E(RHF) = -74.0 A.U. after 3 cycles\\n Normal termination of Gaussian 16\\n'\n        a = parse(GAUSSIAN + second)\n        self.assertEqual(a['job_blocks_count'],2)\n        self.assertIsNone(a['thermochemistry']['gibbs_hartree'])\n\n    def test_gaussian_unsupported_composite(self):\n        a = parse(GAUSSIAN.replace('#p b3lyp/6-31g(d) opt freq','#p ONIOM(b3lyp/6-31g(d):UFF) opt freq'))\n        self.assertIsNone(a['energies']['final_energy_hartree'])\n\n    def test_reaction_balanced_and_comparable(self):\n        a = parse(); b = copy.deepcopy(a); b['filename']='isomer.out'\n        for k in ('final_energy_hartree',): b['energies'][k]+=.01\n        for k in ('electronic_energy_hartree','electronic_reference_hartree','enthalpy_hartree','gibbs_hartree'): b['thermochemistry'][k]+=.01\n        b=A['validate_analysis'](b)\n        r=A['evaluate_reaction_terms']([(1,'water')],[(1,'isomer')],{'water':a,'isomer':b},'water -> isomer')\n        self.assertAlmostEqual(r['delta_e_kj_mol'],.01*A['HARTREE_TO_KJMOL'])\n        self.assertAlmostEqual(r['delta_g_kj_mol'],.01*A['HARTREE_TO_KJMOL'])\n        self.assertAlmostEqual(r['log10_keq'],-.01*A['HARTREE_TO_KJMOL']*1000/(A['GAS_CONSTANT_J_MOL_K']*298.15*math.log(10)))\n\n    def test_reaction_mismatched_theory(self):\n        a=parse(); b=copy.deepcopy(a); b['basis']='def2-TZVP'\n        r=A['evaluate_reaction_terms']([(1,'a')],[(1,'b')],{'a':a,'b':b},'a -> b')\n        self.assertIsNone(r['delta_e_kj_mol']); self.assertIsNone(r['keq'])\n\n    def test_reaction_unbalanced_atoms(self):\n        a=parse(); b=copy.deepcopy(a); b['final_geometry'].pop()\n        with self.assertRaises(ValueError): A['evaluate_reaction_terms']([(1,'a')],[(1,'b')],{'a':a,'b':b},'a -> b')\n\n    def test_reaction_unbalanced_charge(self):\n        a=parse(); b=copy.deepcopy(a); b['system']['charge']=1\n        with self.assertRaises(ValueError): A['evaluate_reaction_terms']([(1,'a')],[(1,'b')],{'a':a,'b':b},'a -> b')\n\n    def test_nonfinite_is_json_null(self):\n        a=parse(); a['energies']['extra']=float('nan')\n        result=A['validate_analysis'](a)\n        self.assertIsNone(result['energies']['extra'])\n        json.dumps(result,allow_nan=False)\n\n    def test_spectrum_area_and_wavelength_jacobian(self):\n        import numpy as np\n        integrate = np.trapezoid if hasattr(np,'trapezoid') else np.trapz\n        grid=np.linspace(.001,5,30000)\n        density=A['_rf_gaussian_density']([(2.,.2),(3.,.1)],grid,.15)\n        self.assertAlmostEqual(float(integrate(density,grid)),.3,places=6)\n        lam=(1239.841984/grid)[::-1]\n        transformed=(density*grid**2/1239.841984)[::-1]\n        self.assertAlmostEqual(float(integrate(transformed,lam)),.3,places=6)\n\n\nclass WorkerChecks(unittest.TestCase):\n    def test_gaussian_maxdisk_bytes(self):\n        self.assertIn('MaxDisk=100000B',R['_cap_gaussian_maxdisk']('#p hf/sto-3g MaxDisk=100000B\\n\\nTitle\\n'))\n\n    def test_gaussian_link1_disk_caps(self):\n        text='#p hf/sto-3g MaxDisk=1TB\\n\\nTitle\\n--Link1--\\n#p hf/sto-3g MaxDisk=100MB\\n\\nTitle\\n'\n        capped=R['_cap_gaussian_maxdisk'](text)\n        self.assertIn('MaxDisk=20000MB',capped); self.assertIn('MaxDisk=100MB',capped)\n\n    def test_orca_maxdisk_existing(self):\n        text='%scf\\n MaxDisk 1000\\n MaxIter 100\\nend\\n! HF\\n'\n        self.assertEqual(R['_cap_orca_maxdisk'](text),text)\n\n    def test_orca_inline_maxdisk_not_duplicated(self):\n        text='%scf MaxIter 100 MaxDisk 1000 end\\n! HF\\n'\n        self.assertEqual(R['_cap_orca_maxdisk'](text),text)\n\n    def test_exact_input_and_prepared_execution(self):\n        with tempfile.TemporaryDirectory() as d:\n            raw='! HF\\r\\n'.encode('utf-16')\n            R.update(WORK_DIR=d,INPUT_FILE='job.inp',PREPARED_INPUT_TEXT='! HF\\n',ENCODED_FILES_JSON=base64.b64encode(json.dumps({'job.inp':base64.b64encode(raw).decode()}).encode()).decode())\n            R['_stage_uploaded_inputs']()\n            self.assertEqual(Path(d,'outputs','inputs','job.inp').read_bytes(),raw)\n            self.assertEqual(Path(d,'job.inp').read_bytes(),b'! HF\\n')\n\n    def test_lossless_file_parts(self):\n        with tempfile.TemporaryDirectory() as d:\n            R['WORK_DIR']=d; p=Path(d,'data.gbw'); raw=bytes(range(256))*8; p.write_bytes(raw)\n            blocks=[]\n            for part,i,n in R['_iter_file_parts'](str(p),chunk_bytes=300): blocks.append(Path(part).read_bytes())\n            self.assertEqual(b''.join(blocks),raw)\n\n    def test_nested_artifacts_are_preserved(self):\n        with tempfile.TemporaryDirectory() as d:\n            R['WORK_DIR']=d\n            source=Path(d,'sub','job.gbw'); source.parent.mkdir(); source.write_bytes(b'checkpoint')\n            results=Path(d,'outputs'); results.mkdir()\n            R['_collect_calculation_files'](str(results))\n            self.assertEqual((results/'calculation/sub/job.gbw').read_bytes(),b'checkpoint')\n\n    def test_report_paths_are_complete(self):\n        self.assertEqual(set(R['_bundle_file_paths']({'pdf':'p','analysis_json':'j','manifest':'m','publication_files':['a'],'csv_files':{'x':'c'}})),{'p','j','m','a','c'})\n\n    def test_redaction(self):\n        self.assertNotIn('test-only-secret',R['_redact_message']('https://api.telegram.org/bottest-only-secret/sendDocument'))\n\n\n"
+
+exec(compile(ANALYZER_MODULE_CODE,'<scientific_analyzer>','exec'), globals())
+
+def _run_self_tests():
+    """Use isolated namespaces: no Telegram, Kaggle, auth or engine execution."""
+    import ast
+    import unittest
+    namespace = {'__name__': 'chembot_self_test'}
+    exec(compile(ANALYZER_MODULE_CODE, '<self_test_analyzer>', 'exec'), namespace)
+    analyzer = dict(namespace)
+    runner = {'__name__': 'chembot_self_test_worker', 'BOT_TOKEN': 'test-only-secret',
+              'CHAT_ID': 1, 'JOB_ENGINE': 'orca', 'INPUT_FILE': 'job.inp',
+              'KAGGLE_NOTEBOOK_URL': 'https://www.kaggle.com/code/test/job'}
+    nodes = []
+    for node in ast.parse(KAGGLE_RUNNER_CODE).body:
+        if isinstance(node, ast.Try):
+            break
+        nodes.append(node)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<self_test_worker>', 'exec'), runner)
+    checks = {'__name__': 'chembot_self_test', 'A': analyzer, 'R': runner}
+    exec(compile(SELF_TEST_CODE, '<self_test_suite>', 'exec'), checks)
+    suite = unittest.TestSuite()
+    for name in ('ScientificChecks', 'WorkerChecks'):
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(checks[name]))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+def _offline_cli():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='ChemBot 7.1.0: Telegram/Kaggle chemistry bot and conservative output analyzer.',
+        epilog='Bot configuration: CHEMBOT_BOT_TOKEN, KAGGLE_USERNAME, KAGGLE_API_TOKEN (or KAGGLE_KEY), '
+               'CHEMBOT_ALLOWED_IDS=your Telegram user ID; CHEMBOT_ADMIN_ID=your ID. '
+               'Render Web Services automatically use HTTPS webhooks. Run without arguments to start the bot.')
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--self-test', action='store_true', help='run synthetic scientific and worker regression checks without credentials')
+    actions.add_argument('--analyze', metavar='OUTPUT', help='analyze one ORCA/Psi4/Gaussian text output locally, without bot credentials')
+    actions.add_argument('--print-requirements', action='store_true', help='print Python package requirements suitable for a build step')
+    parser.add_argument('--outdir', default='chembot_report', help='new/empty report destination for --analyze')
+    args = parser.parse_args()
+    if args.print_requirements:
+        print('pyTelegramBotAPI>=4.16,<5\nkaggle>=2.2.4,<3\nmatplotlib>=3.7,<4\nreportlab>=4.0,<5\nnumpy>=1.24,<3\nrequests>=2.31,<3')
+        return 0
+    if args.self_test:
+        ensure_dependencies(report_only=True)
+        return _run_self_tests()
+    if args.analyze:
+        ensure_dependencies(report_only=True)
+        path = Path(args.analyze).expanduser().resolve()
+        if not path.is_file():
+            parser.error('The analysis input is not a local file.')
+        if path.stat().st_size > 128 * 1024 * 1024:
+            parser.error('The analysis input exceeds 128 MiB; it will not be silently truncated.')
+        outdir = Path(args.outdir).expanduser().resolve()
+        if outdir.exists() and any(outdir.iterdir()):
+            parser.error('--outdir must be new or empty to protect existing reports.')
+        raw = path.read_bytes()
+        text = decode_job_input(raw)
+        analysis = parse_output_text(text, path.name)
+        if analysis.get('engine') not in ('ORCA', 'Psi4', 'Gaussian'):
+            parser.error('No supported chemistry engine was recognized in this output.')
+        analysis['source_bytes_sha256'] = hashlib.sha256(raw).hexdigest()
+        bundle = generate_report_bundle(analysis, outdir, path.stem)
+        print(section_summary(analysis))
+        print('Report:', bundle['pdf'])
+        print('Analysis:', bundle['analysis_json'])
+        print('Manifest:', bundle['manifest'])
+        if bundle.get('figures_zip'):
+            print('Publication exports:', bundle['figures_zip'])
+        return 0
+    parser.print_help()
+    return 0
+
+
+if __name__ == '__main__' and len(sys.argv) > 1:
+    raise SystemExit(_offline_cli())
+
+ensure_dependencies()
+
+# ---------------------------------------------------------------------------
+# Kaggle authentication: reproduce the working pattern of the original bot.
+# Credentials/files are created BEFORE importing KaggleApi.
+# ---------------------------------------------------------------------------
+def _prepare_original_kaggle_auth():
+    """Keep modern tokens and genuine legacy keys distinct; never derive either."""
+    if not KAGGLE_USERNAME:
+        return {"username":"", "modern_token":"", "legacy_key":"", "paths":[]}
+    raw_token = (KAGGLE_API_TOKEN or "").strip()
+    raw_key = (KAGGLE_KEY or "").strip()
+    modern_token = ""
+    legacy_key = ""
+    for value in (raw_token, raw_key):
+        if value.startswith("KGAT_"):
+            modern_token = modern_token or value
+        elif re.fullmatch(r"[0-9a-fA-F]{32}", value or ""):
+            legacy_key = legacy_key or value
+        elif value == raw_token and value:
+            modern_token = value
+    os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+    if modern_token:
+        os.environ["KAGGLE_API_TOKEN"] = modern_token
+    else:
+        os.environ.pop("KAGGLE_API_TOKEN", None)
+    if legacy_key:
+        os.environ["KAGGLE_KEY"] = legacy_key
+    else:
+        os.environ.pop("KAGGLE_KEY", None)
+    written = []
+    kaggle_home = Path.home()
+    for directory in (kaggle_home / ".config" / "kaggle", kaggle_home / ".kaggle"):
+        directory.mkdir(parents=True, exist_ok=True)
+        if legacy_key:
+            path = directory / "kaggle.json"
+            path.write_text(json.dumps({"username":KAGGLE_USERNAME,"key":legacy_key}), encoding="utf-8")
+            path.chmod(0o600)
+            written.append(str(path))
+    if modern_token:
+        path = kaggle_home / ".kaggle" / "access_token"
+        path.write_text(modern_token, encoding="utf-8")
+        path.chmod(0o600)
+        written.append(str(path))
+    return {"username":KAGGLE_USERNAME,"modern_token":modern_token,"legacy_key":legacy_key,"paths":written}
+
+
+KAGGLE_AUTH_INFO = _prepare_original_kaggle_auth()
+
+# IMPORTANT: KaggleApi is imported only after the username/token/key and
+# credential files above already exist, exactly as requested.
+import telebot
+from telebot import types
+
+if not BOT_TOKEN:
+    raise RuntimeError("Set CHEMBOT_BOT_TOKEN before running the bot.")
+
+_DEFAULT_ALLOWED_IDS = set()
+
+def _parse_id_set(raw_value, fallback, variable_name):
+    raw_value = str(raw_value or '').strip()
+    if not raw_value:
+        return set(fallback)
+    try:
+        ids = {int(token.strip()) for token in re.split(r'[,;\s]+', raw_value) if token.strip()}
+    except ValueError as exc:
+        raise RuntimeError(f'{variable_name} must contain comma-separated Telegram numeric IDs.') from exc
+    if not ids:
+        raise RuntimeError(f'{variable_name} was set but did not contain any Telegram numeric IDs.')
+    return ids
+
+
+ALLOWED_IDS = _parse_id_set(os.environ.get('CHEMBOT_ALLOWED_IDS'), _DEFAULT_ALLOWED_IDS, 'CHEMBOT_ALLOWED_IDS')
+try:
+    ADMIN_ID = int(os.environ.get('CHEMBOT_ADMIN_ID', '0') or '0')
+except ValueError as exc:
+    raise RuntimeError('CHEMBOT_ADMIN_ID must be a Telegram numeric ID.') from exc
+if ADMIN_ID < 0:
+    raise RuntimeError('CHEMBOT_ADMIN_ID must be a positive user ID, not a group ID.')
+if ADMIN_ID > 0:
+    ALLOWED_IDS.add(ADMIN_ID)
+if not any(user_id > 0 for user_id in ALLOWED_IDS):
+    raise RuntimeError('Set CHEMBOT_ALLOWED_IDS to your Telegram user ID or set CHEMBOT_ADMIN_ID. Group IDs alone cannot authorize users.')
+ORCA_DATASET_SLUG = os.environ.get(
+    "ORCA_DATASET_SLUG", "abdulsalsmsalih/orca-6-1-0"
+)
+GAUSSIAN_DATASET_SLUG = os.environ.get(
+    "GAUSSIAN_DATASET_SLUG",
+    f"{KAGGLE_USERNAME or 'abdulsalsmsalih'}/gauusian16",
+)
+MAX_TELEGRAM_DOWNLOAD = 20_000_000
+MAX_AUX_STORAGE = 20 * 1024 * 1024
+MAX_TEXT_OUT = 20_000_000
+
+user_aux_storage = {}
+user_drive_links = {}
+recent_kaggle_jobs = {}
+analysis_sessions = {}
+analysis_group_batches = {}
+analysis_group_lock = threading.RLock()
+ANALYSIS_GROUP_DEBOUNCE_SECONDS = 2.5
+# Protect short-lived shared state used by Telegram handler threads.
+session_lock = threading.RLock()
+state_lock = threading.RLock()
+render_lock = threading.RLock()  # Matplotlib/ReportLab rendering is serialized for thread safety.
+
+# Telegram can deliver several documents almost simultaneously.  Use enough
+# worker threads to accept a batch, while every Kaggle submission receives its
+# own KaggleApi instance and its own temporary directory.
+try:
+    _requested_worker_threads = int(os.environ.get('CHEMBOT_WORKER_THREADS', '8'))
+except ValueError as exc:
+    raise RuntimeError('CHEMBOT_WORKER_THREADS must be an integer from 2 to 32.') from exc
+BOT_WORKER_THREADS = min(32, max(2, _requested_worker_threads))
+
+
+def detect_job_engine(filename, text=""):
+    """Identify calculation inputs from their extension and Gaussian route card."""
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    suffix = Path(name).suffix
+    if suffix == ".dat":
+        return "psi4"
+    if suffix in {".gjf", ".com", ".gau"}:
+        return "gaussian"
+    if suffix == ".inp":
+        contents = str(text or "")
+        # ORCA comments also begin with '#'. An ORCA command/geometry wins
+        # over a comment that happens to mention Gaussian-like keywords.
+        if (re.search(r'(?im)^\s*!\s*\S', contents) or
+            re.search(r'(?im)^\s*%\s*(?:pal|maxcore|scf|geom|tddft|cpcm|basis|freq)\b', contents) or
+            re.search(r'(?im)^\s*\*\s*(?:xyz|xyzfile|int)\b', contents)):
+            return "orca"
+        # Only route-like cards identify a Gaussian input with .inp suffix.
+        if re.search(r'(?im)^\s*#\s*(?:[PNT](?:\s|$)|[A-Za-z][\w()+.\-]*/[\w()+.*\-]+|(?:opt|freq|td|sp)\b)', contents):
+            return "gaussian"
+        return "orca"
+    return None
+
+
+
+# Names used by older ChemBot versions.  They are safe to prune when they are
+# clearly local staging directories, because the Kaggle kernel has already
+# received a copy after kernels_push() returns.
+LEGACY_JOB_PREFIXES = ("orca-job-", "psi4-job-", "chem-job-")
+
+
+def _safe_rmtree(path):
+    if not path:
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def cleanup_stale_local_job_dirs():
+    """Remove staging directories left by older/interrupted launcher runs.
+
+    Current-working-directory legacy jobs are removed immediately.  Temporary
+    directory jobs are removed only when older than one hour so another live
+    launcher process is not disturbed.
+    """
+    removed = []
+    now = time.time()
+    roots = [(Path(tempfile.gettempdir()), 21600.0)]
+    seen = set()
+    for root, min_age in roots:
+        try:
+            root = root.resolve()
+        except Exception:
+            continue
+        if str(root) in seen:
+            continue
+        seen.add(str(root))
+        try:
+            entries = list(root.iterdir())
+        except Exception:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir() or not entry.name.startswith(LEGACY_JOB_PREFIXES):
+                    continue
+                marker = entry / '.chembot-staging'
+                if not marker.is_file() or marker.read_text(encoding='utf-8') != 'ChemBot staging directory':
+                    continue
+                # Restrict deletion to the exact naming family generated by the bot.
+                suffix = entry.name.split('-', 2)[-1]
+                if not re.fullmatch(r'[A-Za-z0-9_]+', suffix or ''):
+                    continue
+                age = max(0.0, now - entry.stat().st_mtime)
+                if age < min_age:
+                    continue
+                _safe_rmtree(str(entry))
+                if not entry.exists():
+                    removed.append(str(entry))
+            except Exception:
+                continue
+    return removed
+
+
+def snapshot_user_job_context(chat_id, user_id):
+    """Snapshot the preparation context belonging to this user and chat."""
+    key = (chat_id, user_id)
+    with state_lock:
+        aux = dict(user_aux_storage.get(key, {}))
+        drive = str(user_drive_links.get(key, '') or '')
+    return aux, drive
+
+# ============================================================
+# Shared analyzer source. It is executed locally and injected into Kaggle jobs.
+# ============================================================
+
+
+# ------------------------- Psi4 dependency detection -------------------------
+PSI4_EXTRA_RULES = [
+    (re.compile(r"(?:-d3bj|-d3zero|-d3m|-d3\b|s-dftd3|dftd3)", re.I), "dftd3-python"),
+    (re.compile(r"(?:-d4\b|dftd4)", re.I), "dftd4-python"),
+    (re.compile(r"(?:\bgcp\b|mctc-gcp)", re.I), "gcp-correction"),
+    (re.compile(r"(?:geometric|optimizer\s*=\s*['\"]?geometric)", re.I), "geometric"),
+    (re.compile(r"\bqcengine\b", re.I), "qcengine"),
+    (re.compile(r"\bqcelemental\b", re.I), "qcelemental"),
+]
+
+
+def detect_psi4_extras(inp_text):
+    found = []
+    for rx, pkg in PSI4_EXTRA_RULES:
+        if rx.search(inp_text) and pkg not in found:
+            found.append(pkg)
+    return found
+
+
+# ------------------------- Kaggle runner code -------------------------
+
 def _redact_kaggle_error(text):
-    rendered = str(text or '')
-    secrets = [KAGGLE_API_TOKEN, KAGGLE_KEY,
-               KAGGLE_AUTH_INFO.get('modern_token'), KAGGLE_AUTH_INFO.get('legacy_key')]
+    rendered = str(text or "")
+    secrets = [BOT_TOKEN, KAGGLE_API_TOKEN, KAGGLE_KEY,
+               KAGGLE_AUTH_INFO.get("modern_token"), KAGGLE_AUTH_INFO.get("legacy_key")]
     for secret in secrets:
         if secret and len(secret) >= 8:
-            rendered = rendered.replace(secret, '[REDACTED]')
-    return rendered
+            rendered = rendered.replace(secret, "[REDACTED]")
+    return re.sub(r"https://api[.]telegram[.]org/bot[^/\s]+", "https://api.telegram.org/bot[REDACTED]", rendered)
 
 
 def _auth_mode_summary():
     if KAGGLE_AUTH_INFO.get('modern_token') and KAGGLE_AUTH_INFO.get('legacy_key'):
-        return 'original dual auth (API token + legacy kaggle.json)'
+        return 'modern token + genuine legacy credentials'
     if KAGGLE_AUTH_INFO.get('modern_token'):
-        return 'original-style API token auth'
+        return 'modern API token'
     if KAGGLE_AUTH_INFO.get('legacy_key'):
-        return 'original-style username/key auth'
+        return 'legacy username/key'
     return 'not configured'
 
 
 def _new_authenticated_kaggle_api(api_factory=None):
-    """Use the same KaggleApi.authenticate() pattern as the original bot."""
     if not KAGGLE_USERNAME:
-        raise RuntimeError('KAGGLE_USERNAME is empty in Render.')
-    if not (KAGGLE_AUTH_INFO.get('modern_token') or KAGGLE_AUTH_INFO.get('legacy_key')):
-        raise RuntimeError(
-            'No Kaggle credential was found. Set KAGGLE_API_TOKEN or KAGGLE_KEY in Render.'
-        )
-    factory = api_factory or KaggleApi
-    client = factory()
-    client.authenticate()
+        raise RuntimeError("KAGGLE_USERNAME is empty.")
+    if not (KAGGLE_AUTH_INFO.get("modern_token") or KAGGLE_AUTH_INFO.get("legacy_key")):
+        raise RuntimeError("Set KAGGLE_API_TOKEN or a genuine legacy KAGGLE_KEY.")
+    if api_factory is None:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api_factory = KaggleApi
+    client = api_factory()
+    try:
+        client.authenticate()
+    except SystemExit as exc:
+        raise RuntimeError("Kaggle credential loading failed; check the token/key and username.") from exc
+    actual_user = (getattr(client, 'config_values', None) or {}).get('username')
+    if actual_user and str(actual_user).lower() != KAGGLE_USERNAME:
+        raise RuntimeError('Kaggle credentials belong to a different username than KAGGLE_USERNAME.')
     return client
 
 
-def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, drive_link, api_factory=None, is_gaussian=False):
+def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, drive_link, api_factory=None, is_gaussian=False, prepared_input_text=None):
     """Package and push a Kaggle kernel using the original bot's KaggleApi flow."""
     job_id = 'chem-job-' + uuid.uuid4().hex[:16]
     job_dir = None
     try:
         job_dir = tempfile.mkdtemp(prefix=job_id + '_')
+        Path(job_dir, '.chembot-staging').write_text('ChemBot staging directory', encoding='utf-8')
         engine = 'gaussian' if is_gaussian else ('psi4' if is_psi4 else 'orca')
         dataset_sources = ([GAUSSIAN_DATASET_SLUG] if is_gaussian else ([] if is_psi4 else [ORCA_DATASET_SLUG]))
         code_file = 'notebook.ipynb' if is_gaussian else 'script.py'
@@ -4471,15 +6543,16 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
         header = (
             'BOT_TOKEN=' + repr(BOT_TOKEN) + '\n'
             'CHAT_ID=' + repr(chat_id) + '\n'
-            'INPUT_FILE=' + repr(os.path.basename(input_name)) + '\n'
+            'INPUT_FILE=' + repr(os.path.basename(str(input_name).replace('\\', '/'))) + '\n'
+            'PREPARED_INPUT_TEXT=' + repr(prepared_input_text) + '\n'
             'ENCODED_FILES_JSON=' + repr(encoded_files_json) + '\n'
             'DRIVE_LINK=' + repr(drive_link) + '\n'
             'PSI4_EXTRAS=' + repr(extras) + '\n'
             'JOB_ENGINE=' + repr(engine) + '\n'
             'KAGGLE_NOTEBOOK_URL=' + repr(f'https://www.kaggle.com/code/{KAGGLE_USERNAME}/{job_id}') + '\n'
         )
-        analyzer_code = '' if is_gaussian else ANALYZER_MODULE_CODE
-        script = header + '\n' + analyzer_code + '\n' + KAGGLE_RUNNER_CODE
+        analyzer_code = ANALYZER_MODULE_CODE
+        script = 'from __future__ import annotations\n' + header + '\n' + analyzer_code.replace('from __future__ import annotations\n', '') + '\n' + KAGGLE_RUNNER_CODE
         if is_gaussian:
             notebook = {
                 'cells': [{
@@ -4519,7 +6592,7 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
             ('invalid_kernel_sources', 'Invalid kernel source(s)'),
             ('invalid_competition_sources', 'Invalid competition source(s)'),
         ):
-            value = getattr(response, attr, None)
+            value = response.get(attr) if isinstance(response, dict) else getattr(response, attr, None)
             if value:
                 if isinstance(value, (list, tuple)):
                     value = ', '.join(map(str, value))
@@ -4528,8 +6601,8 @@ def submit_kaggle_job(input_name, encoded_files_json, chat_id, is_psi4, extras, 
             raise RuntimeError(' ; '.join(problems))
 
         # Prefer the actual response URL/ref when the API supplies it.
-        url = getattr(response, 'url', None)
-        ref = getattr(response, 'ref', None)
+        url = response.get('url') if isinstance(response, dict) else getattr(response, 'url', None)
+        ref = response.get('ref') if isinstance(response, dict) else getattr(response, 'ref', None)
         if ref and '/' in str(ref):
             owner, slug = str(ref).split('/', 1)
             job_id = slug
@@ -4554,15 +6627,278 @@ _stale_removed = cleanup_stale_local_job_dirs()
 if _stale_removed:
     print(f"Removed {len(_stale_removed)} stale ChemBot staging director(ies).")
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_WORKER_THREADS)
+# Per-conversation preparation ordering and publication downloads.
+# Tickets are reserved at update ingress, before threaded handlers download.
+# The Condition is released throughout downloads, rendering and Kaggle push.
+_context_condition = threading.Condition(threading.RLock())
+_context_work_queues = {}
+_update_dispatch_lock = threading.RLock()
+_seen_update_ids = OrderedDict()
+
+
+def _context_key(message):
+    return (message.chat.id, message.from_user.id)
+
+
+def _reserve_context_work(message):
+    key = _context_key(message)
+    ticket = object()
+    with _context_condition:
+        _context_work_queues.setdefault(key, []).append(ticket)
+    message._chembot_context_ticket = (key, ticket)
+    return key, ticket
+
+
+def _begin_context_work(key, ticket):
+    with _context_condition:
+        _context_condition.wait_for(
+            lambda: bool(_context_work_queues.get(key))
+            and _context_work_queues[key][0] is ticket
+        )
+
+
+def _finish_context_work(key, ticket):
+    with _context_condition:
+        queue = _context_work_queues.get(key, [])
+        if ticket in queue:
+            queue.remove(ticket)
+        if not queue:
+            _context_work_queues.pop(key, None)
+        _context_condition.notify_all()
+
+
+def _has_context_handler(message):
+    if not getattr(message, 'from_user', None) or not getattr(message, 'chat', None):
+        return False
+    if getattr(message, 'document', None) is not None:
+        return True
+    text = getattr(message, 'text', None) or ''
+    command = text.split()[0].split('@')[0].lower() if text.split() else ''
+    return command in {'/start', '/clearaux', '/jobs', '/reaction', '/export', '/publication'} or text.startswith(('http://', 'https://'))
+
+
+def _install_context_ordering(bot_instance):
+    original = bot_instance.process_new_updates
+
+    def process_ordered(updates):
+        # Telegram can retry a webhook after a slow/lost HTTP acknowledgment.
+        # Deduplicate ingress before reserving tickets or starting Kaggle jobs.
+        with _update_dispatch_lock:
+            fresh, new_ids, reservations = [], [], []
+            for update in updates:
+                update_id = getattr(update, 'update_id', None)
+                if update_id is not None and (update_id in _seen_update_ids or update_id in new_ids):
+                    continue
+                fresh.append(update)
+                if update_id is not None:
+                    new_ids.append(update_id)
+                message = getattr(update, 'message', None)
+                if message is not None and _has_context_handler(message):
+                    if getattr(message, '_chembot_context_ticket', None) is None:
+                        reservations.append(_reserve_context_work(message))
+                    _register_analysis_group(message)
+            if not fresh:
+                return None
+            try:
+                result = original(fresh)
+            except Exception:
+                for key, ticket in reservations:
+                    _finish_context_work(key, ticket)
+                raise
+            for update_id in new_ids:
+                _seen_update_ids[update_id] = time.time()
+            while len(_seen_update_ids) > 10000:
+                _seen_update_ids.popitem(last=False)
+            return result
+
+    bot_instance.process_new_updates = process_ordered
+
+
+def _ordered_context_handler(function):
+    def ordered(message):
+        if not getattr(message, 'from_user', None) or not getattr(message, 'chat', None):
+            return function(message)
+        reservation = getattr(message, '_chembot_context_ticket', None)
+        if reservation is None:
+            reservation = _reserve_context_work(message)
+        _register_analysis_group(message)
+        key, ticket = reservation
+        _begin_context_work(key, ticket)
+        try:
+            return function(message)
+        finally:
+            _finish_analysis_group_error(message)
+            _finish_context_work(key, ticket)
+            message._chembot_context_ticket = None
+    ordered.__name__ = function.__name__
+    ordered.__doc__ = function.__doc__
+    return ordered
+
+
+def _start_analysis_group_timer(key, batch):
+    timer = batch.get('timer')
+    if timer is not None:
+        timer.cancel()
+    timer = threading.Timer(ANALYSIS_GROUP_DEBOUNCE_SECONDS, _finalize_analysis_group, args=(key,))
+    timer.daemon = True
+    batch['timer'] = timer
+    timer.start()
+
+
+def _register_analysis_group(message):
+    gid = getattr(message, 'media_group_id', None)
+    document = getattr(message, 'document', None)
+    filename = getattr(document, 'file_name', '') or ''
+    if not gid or not filename.lower().endswith(('.out','.log')):
+        return None
+    if getattr(message, '_chembot_group_registration', None) is not None:
+        return message._chembot_group_registration[0]
+    key = (message.chat.id, message.from_user.id, str(gid))
+    registration = uuid.uuid4().hex
+    with analysis_group_lock:
+        batch = analysis_group_batches.setdefault(key, {
+            'chat_id': message.chat.id, 'user_id': message.from_user.id,
+            'group_id': str(gid), 'sids': [], 'pending': set(), 'timer': None,
+        })
+        batch.setdefault('pending', set()).add(registration)
+        if batch.get('timer') is not None:
+            batch['timer'].cancel()
+            batch['timer'] = None
+    message._chembot_group_registration = (key, registration)
+    message._chembot_group_completed = False
+    return key
+
+
+def _finish_analysis_group_error(message):
+    registration = getattr(message, '_chembot_group_registration', None)
+    if not registration or getattr(message, '_chembot_group_completed', False):
+        return
+    key, ticket = registration
+    with analysis_group_lock:
+        batch = analysis_group_batches.get(key)
+        if batch is not None:
+            batch.setdefault('pending', set()).discard(ticket)
+            if not batch['pending']:
+                if batch.get('sids'):
+                    _start_analysis_group_timer(key, batch)
+                else:
+                    analysis_group_batches.pop(key, None)
+    message._chembot_group_completed = True
+
+
+def _callback_owner_allowed(call, sess):
+    sender = getattr(call, 'from_user', None)
+    message = getattr(call, 'message', None)
+    chat = getattr(message, 'chat', None)
+    uid = getattr(sender, 'id', None)
+    chat_id = getattr(chat, 'id', None)
+    if uid is None or chat_id != sess.get('chat_id'):
+        return False
+    permitted = uid in ALLOWED_IDS or uid == ADMIN_ID
+    return permitted and (uid == sess.get('user_id') or uid == ADMIN_ID)
+
+
+def _publication_export_paths(sess):
+    bundle = sess.get('bundle') or {}
+    candidates = []
+    for key in ('publication_files', 'csv_files'):
+        values = bundle.get(key) or []
+        if isinstance(values, dict):
+            values = list(values.values())
+        if isinstance(values, (str, os.PathLike)):
+            values = [values]
+        candidates.extend(values)
+    for key, value in bundle.items():
+        if ('csv' in str(key).lower() or key == 'figures_zip') and isinstance(value, (str, os.PathLike)):
+            candidates.append(value)
+    # Fallback for scientific reporters that return plots plus companion files.
+    for value in (sess.get('plots') or {}).values():
+        if isinstance(value, (str, os.PathLike)):
+            stem = os.path.splitext(str(value))[0]
+            candidates.extend(stem + suffix for suffix in ('.svg', '.pdf', '.csv', '.png', '_curve.csv', '_sticks.csv', '_plot_settings.json'))
+    paths = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, (str, os.PathLike)):
+            continue
+        path = os.path.abspath(os.fspath(candidate))
+        if path not in seen and os.path.isfile(path):
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _send_publication_exports(chat_id, sess, individual=False):
+    paths = _publication_export_paths(sess)
+    if not paths:
+        bot.send_message(chat_id, 'No publication files are available for this analysis.')
+        return False
+    if individual:
+        files = [path for path in paths if not path.lower().endswith('.zip')]
+        for path in files:
+            with open(path, 'rb') as handle:
+                bot.send_document(chat_id, handle, caption=os.path.basename(path))
+        return bool(files)
+    supplied_archive = (sess.get('bundle') or {}).get('figures_zip')
+    if (isinstance(supplied_archive, (str, os.PathLike)) and os.path.isfile(supplied_archive)
+            and not (sess.get('bundle') or {}).get('publication_exports_dirty')):
+        with open(supplied_archive, 'rb') as handle:
+            bot.send_document(chat_id, handle, caption='Publication exports: original figures and numerical source data.')
+        return True
+    import zipfile
+    archive = os.path.join(sess['dir'], 'publication_exports.zip')
+    # Build the complete archive from this bundle; supplied figures ZIPs can
+    # themselves be included without dropping CSVs and later overlay exports.
+    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as output:
+        names = set()
+        for index, path in enumerate(paths, 1):
+            if path.lower().endswith('.zip') or os.path.realpath(path) == os.path.realpath(archive):
+                continue
+            name = os.path.basename(path)
+            if name in names:
+                name = str(index) + '_' + name
+            names.add(name)
+            output.write(path, arcname=name)
+    with open(archive, 'rb') as handle:
+        bot.send_document(chat_id, handle, caption='Publication exports: original figures and numerical source data.')
+    return True
+
+
+def _register_overlay_exports(sess, image_path):
+    if not image_path:
+        return
+    stem = os.path.splitext(str(image_path))[0]
+    with session_lock:
+        bundle = sess.setdefault('bundle', {})
+        files = bundle.setdefault('publication_files', [])
+        if not isinstance(files, list):
+            files = list(files) if isinstance(files, (tuple, set)) else []
+            bundle['publication_files'] = files
+        for suffix in ('.svg', '.pdf', '.csv', '.png', '_curve.csv', '_sticks.csv', '_plot_settings.json'):
+            path = stem + suffix
+            if os.path.isfile(path) and path not in files:
+                files.append(path)
+                bundle['publication_exports_dirty'] = True
+
+class _RedactedTelegramErrors:
+    def handle(self, exception):
+        print('Telegram handler error:', _redact_kaggle_error(exception))
+        return True
+
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_WORKER_THREADS,
+                      exception_handler=_RedactedTelegramErrors())
+
+_install_context_ordering(bot)
 try:
-    _startup_kaggle_api = _new_authenticated_kaggle_api()
+    if not KAGGLE_USERNAME or not (KAGGLE_AUTH_INFO.get('modern_token') or KAGGLE_AUTH_INFO.get('legacy_key')):
+        raise RuntimeError('Kaggle username and token/key are not configured.')
     KAGGLE_STARTUP_AUTH_OK = True
     KAGGLE_STARTUP_AUTH_ERROR = ''
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v6.2.7 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle auth={'OK' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v7.1.0 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle credentials={'configured' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -4570,7 +6906,9 @@ def authorized(message):
     sender = getattr(message, 'from_user', None)
     chat_id = getattr(chat, 'id', None)
     user_id = getattr(sender, 'id', None)
-    return chat_id in ALLOWED_IDS or user_id in ALLOWED_IDS
+    # A permitted group is a location, not permission for all of its members.
+    return bool(user_id is not None and (user_id in ALLOWED_IDS or user_id == ADMIN_ID)
+                and (chat_id is not None and (chat_id > 0 or chat_id in ALLOWED_IDS)))
 
 
 def _send_submission_link(chat_id, message_text):
@@ -4606,6 +6944,7 @@ def _own_kaggle_job_links():
 
 
 @bot.message_handler(commands=['jobs'])
+@_ordered_context_handler
 def jobs_command(message):
     if not authorized(message): return
     uid=message.from_user.id; chat_id=message.chat.id
@@ -4635,7 +6974,8 @@ def out_menu(session_id, a):
         ("🌡 Thermochemistry", "thermo"), ("〰️ Vibrations / IR", "vib"),
         ("🌈 TD-DFT / UV-Vis", "uv"), ("🧬 Frontier energies", "orb"), ("⚛️ Structure / Charges", "structure"),
         ("📈 Optimization", "optplot"), ("🩺 Diagnostics", "diag"),
-        ("📄 Full PDF", "pdf"), ("🖼 All plots", "plots"),
+        ("📄 Full PDF", "pdf"), ("🖼 Original plots", "plots"),
+        ("📦 Publication ZIP", "pub"), ("📄 Figure/data files", "pubfiles"),
         ("📊 Compare spectra", "compare"),
     ]
     for label, action in buttons:
@@ -4672,9 +7012,18 @@ def uv_menu(session_id):
 
 
 def comparison_menu(session_id):
-    kb=types.InlineKeyboardMarkup(row_width=2)
-    for label,action in [("🌈 TD-DFT norm σ10","uv10n"),("🌈 TD-DFT raw σ10","uv10r"),("🌈 TD-DFT norm σ20","uv20n"),("〰️ FT-IR norm σ12","ir12n"),("〰️ FT-IR raw σ12","ir12r"),("〰️ FT-IR norm σ20","ir20n"),("🧹 Clear older analyses","clear")]:
-        kb.add(types.InlineKeyboardButton(label,callback_data=f"c:{session_id}:{action}"))
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    choices = [
+        ('TD-DFT normalized σ0.15 eV', 'uv15n'),
+        ('TD-DFT raw σ0.15 eV', 'uv15r'),
+        ('TD-DFT normalized σ0.30 eV', 'uv30n'),
+        ('FT-IR normalized σ12 cm⁻¹', 'ir12n'),
+        ('FT-IR raw σ12 cm⁻¹', 'ir12r'),
+        ('FT-IR normalized σ20 cm⁻¹', 'ir20n'),
+        ('Clear older analyses', 'clear'),
+    ]
+    for label, action in choices:
+        kb.add(types.InlineKeyboardButton(label, callback_data=f'c:{session_id}:{action}'))
     return kb
 
 def _comparison_analyses(sess, kind):
@@ -4684,37 +7033,64 @@ def _comparison_analyses(sess, kind):
     rows=[x for x in rows if x['analysis'].get('tddft_states' if kind=='uv' else 'ir_spectrum')]
     return [x['analysis'] for x in rows]
 
-def _send_comparison(chat_id,sess,action):
-    if action=='clear':
-        with session_lock:
-            for sid0,x in list(analysis_sessions.items()):
-                if x is sess: continue
-                if x.get('chat_id')==sess.get('chat_id') and x.get('user_id')==sess.get('user_id'):
-                    shutil.rmtree(x.get('dir',''),ignore_errors=True); analysis_sessions.pop(sid0,None)
-        bot.send_message(chat_id,'Older comparison analyses cleared.')
+def _send_comparison(chat_id, sess, action):
+    if action == 'clear':
+        with render_lock:
+            with session_lock:
+                stale = [(sid, row) for sid, row in analysis_sessions.items()
+                         if row is not sess and row.get('chat_id') == sess.get('chat_id')
+                         and row.get('user_id') == sess.get('user_id')]
+                for sid, row in stale:
+                    analysis_sessions.pop(sid, None)
+            for _, row in stale:
+                shutil.rmtree(row.get('dir', ''), ignore_errors=True)
+        bot.send_message(chat_id, 'Older comparison analyses cleared.')
         return
-    kind='uv' if action.startswith('uv') else 'ir'; sigma=20.0 if '20' in action else (10.0 if kind=='uv' else 12.0); normalize=action.endswith('n')
-    arr=_comparison_analyses(sess,kind)
-    if len(arr)<2:
-        bot.send_message(chat_id,'Upload at least two compatible .out files for this spectrum type.')
+    choices = {
+        'uv15n': ('uv', 0.15, True), 'uv15r': ('uv', 0.15, False),
+        'uv30n': ('uv', 0.30, True), 'uv30r': ('uv', 0.30, False),
+        'ir12n': ('ir', 12.0, True), 'ir12r': ('ir', 12.0, False),
+        'ir20n': ('ir', 20.0, True), 'ir20r': ('ir', 20.0, False),
+        # Old message buttons retain usable actions with the corrected units.
+        'uv10n': ('uv', 0.15, True), 'uv10r': ('uv', 0.15, False),
+        'uv20n': ('uv', 0.30, True), 'uv20r': ('uv', 0.30, False),
+    }
+    if action not in choices:
+        bot.send_message(chat_id, 'Unknown comparison action. Open the comparison menu again.')
         return
-    out=os.path.join(sess['dir'],f'comparison_{kind}_{int(sigma)}_{"norm" if normalize else "raw"}.png')
+    kind, sigma, normalize = choices[action]
+    analyses = _comparison_analyses(sess, kind)
+    if len(analyses) < 2:
+        bot.send_message(chat_id, 'Upload at least two compatible .out files for this spectrum type.')
+        return
+    sigma_slug = f'{sigma:g}'.replace('.', 'p')
+    out = os.path.join(sess['dir'], f'comparison_{kind}_{sigma_slug}_{"norm" if normalize else "raw"}.png')
     with render_lock:
-        p=make_overlay_plot(arr,kind,out,normalize=normalize,sigma=sigma)
-    if not p:
-        bot.send_message(chat_id,'Could not create an overlay from the parsed spectra.')
+        path = make_overlay_plot(analyses, kind, out, normalize=normalize, sigma=sigma)
+    if not path:
+        bot.send_message(chat_id, 'Could not create an overlay from the parsed spectra.')
         return
-    with open(p,'rb') as f: bot.send_photo(chat_id,f,caption=f'{"TD-DFT / UV-Vis" if kind=="uv" else "FT-IR"} overlay · {len(arr)} files · sigma={sigma:g} · {"normalized" if normalize else "raw"}')
+    _register_overlay_exports(sess, path)
+    label = 'TD-DFT / UV-Vis' if kind == 'uv' else 'FT-IR'
+    unit = 'eV' if kind == 'uv' else 'cm⁻¹'
+    with open(path, 'rb') as handle:
+        bot.send_document(chat_id, handle, caption=f'{label} overlay · {len(analyses)} files · σ={sigma:g} {unit} · {"normalized" if normalize else "raw"}')
 
-def create_analysis_session(chat_id, user_id, filename, text):
+def create_analysis_session(chat_id, user_id, filename, text, source_bytes=None):
     a=parse_output_text(text,filename)
-    if a.get('engine') not in ('ORCA','Psi4'):
-        raise ValueError('Could not identify this .out file as ORCA or Psi4 output. Send the original text output, not a converted/trimmed report.')
+    if a.get('engine') not in ('ORCA','Psi4','Gaussian'):
+        raise ValueError('Could not identify this .out file as ORCA, Psi4 or Gaussian output. Send the original text output, not a converted/trimmed report.')
+    if source_bytes is not None:
+        a['source_bytes_sha256'] = hashlib.sha256(source_bytes).hexdigest()
     sid=uuid.uuid4().hex[:10]
     d=tempfile.mkdtemp(prefix='chembot_analysis_')
-    with render_lock:
-        bundle=generate_report_bundle(a,d,Path(filename).stem)
-        plots=bundle['plots']; pdf=bundle['pdf']
+    try:
+        with render_lock:
+            bundle=generate_report_bundle(a,d,Path(filename).stem)
+            plots=bundle['plots']; pdf=bundle['pdf']
+    except Exception:
+        _safe_rmtree(d)
+        raise
     with session_lock:
         analysis_sessions[sid]={
             'chat_id':chat_id,'user_id':user_id,'analysis':a,'dir':d,
@@ -4726,6 +7102,11 @@ def create_analysis_session(chat_id, user_id, filename, text):
                 try: shutil.rmtree(analysis_sessions[old]['dir'],ignore_errors=True)
                 except Exception: pass
                 analysis_sessions.pop(old,None)
+        own = sorted((key for key, row in analysis_sessions.items()
+                      if row.get('chat_id') == chat_id and row.get('user_id') == user_id),
+                     key=lambda key: analysis_sessions[key]['created'])
+        for old in own[:-50]:
+            _safe_rmtree(analysis_sessions.pop(old)['dir'])
     return sid,a
 
 
@@ -4736,22 +7117,32 @@ def _recent_analyses(chat_id, user_id, max_age_seconds=600, max_items=10):
     return sorted(rows,key=lambda x:x.get('created',0))[-max_items:]
 
 
-def _send_group_overlays(chat_id,sessions,group_id):
-    analyses=[s['analysis'] for s in sessions]; workdir=sessions[-1]['dir']; produced=[]
-    for kind,sigma,label in [('uv',10.0,'TD-DFT / UV-Vis'),('ir',16.0,'FT-IR')]:
-        compatible=[a for a in analyses if a.get('tddft_states' if kind=='uv' else 'ir_spectrum')]
-        if len(compatible)<2: continue
-        out=os.path.join(workdir,f'group_{group_id}_{kind}_overlay.png')
-        with render_lock: path=make_overlay_plot(compatible,kind,out,normalize=True,sigma=sigma)
+def _send_group_overlays(chat_id, sessions, group_id):
+    analyses = [row['analysis'] for row in sessions]
+    sess = sessions[-1]
+    produced = []
+    for kind, sigma, unit, label in [('uv', 0.15, 'eV', 'TD-DFT / UV-Vis'), ('ir', 12.0, 'cm⁻¹', 'FT-IR')]:
+        compatible = [a for a in analyses if a.get('tddft_states' if kind == 'uv' else 'ir_spectrum')]
+        if len(compatible) < 2:
+            continue
+        out = os.path.join(sess['dir'], f'group_{group_id}_{kind}_overlay.png')
+        with render_lock:
+            path = make_overlay_plot(compatible, kind, out, normalize=True, sigma=sigma)
         if path:
-            names=', '.join(Path(a.get('filename','spectrum')).stem for a in compatible)
-            with open(path,'rb') as fh: bot.send_photo(chat_id,fh,caption=(f'{label} comparison · {len(compatible)} files\n{names}')[:1024])
+            _register_overlay_exports(sess, path)
+            names = ', '.join(Path(a.get('filename', 'spectrum')).stem for a in compatible)
+            caption = f'{label} comparison · {len(compatible)} files · σ={sigma:g} {unit}\n{names}'
+            with open(path, 'rb') as handle:
+                bot.send_document(chat_id, handle, caption=caption[:1024])
             produced.append(label)
     return produced
 
 
 def _finalize_analysis_group(key):
-    with analysis_group_lock: batch=analysis_group_batches.pop(key,None)
+    with analysis_group_lock:
+        batch=analysis_group_batches.get(key)
+        if batch and batch.get('pending'): return
+        batch=analysis_group_batches.pop(key,None)
     if not batch: return
     with session_lock: sessions=[analysis_sessions[sid] for sid in batch.get('sids',[]) if sid in analysis_sessions]
     if not sessions: return
@@ -4769,141 +7160,59 @@ def _finalize_analysis_group(key):
     bot.send_message(batch['chat_id'],'Reaction thermodynamics: /reaction A + B -> C + D\nUse .out filename stems as species names.')
 
 
-def _queue_analysis_group(message,sid):
-    gid=getattr(message,'media_group_id',None)
-    if not gid: return False
-    key=(message.chat.id,message.from_user.id,str(gid))
+def _queue_analysis_group(message, sid):
+    key = _register_analysis_group(message)
+    if key is None:
+        return False
+    _, ticket = message._chembot_group_registration
     with analysis_group_lock:
-        batch=analysis_group_batches.setdefault(key,{'chat_id':message.chat.id,'user_id':message.from_user.id,'group_id':str(gid),'sids':[],'timer':None})
-        if sid not in batch['sids']: batch['sids'].append(sid)
-        if batch.get('timer'):
-            try: batch['timer'].cancel()
-            except Exception: pass
-        timer=threading.Timer(ANALYSIS_GROUP_DEBOUNCE_SECONDS,_finalize_analysis_group,args=(key,)); timer.daemon=True; batch['timer']=timer; timer.start()
+        batch = analysis_group_batches.get(key)
+        if batch is None:
+            return False
+        if sid not in batch['sids']:
+            batch['sids'].append(sid)
+        batch.setdefault('pending', set()).discard(ticket)
+        if not batch['pending']:
+            _start_analysis_group_timer(key, batch)
+    message._chembot_group_completed = True
     return True
 
 
 def _parse_reaction_equation(equation):
-    parts=re.split(r'\s*(?:<=>|<->|-->|->|=>|=)\s*',equation.strip())
-    if len(parts)!=2 or not all(parts): raise ValueError('Use reaction syntax: A + 2 B -> C + D')
-    def side(s):
-        out=[]
-        for raw in s.split('+'):
-            raw=raw.strip(); m=re.match(r'^(?:(\d+(?:\.\d+)?)\s*\*?\s*)?(.+?)$',raw)
-            if not m: raise ValueError('Could not parse reaction term: '+raw)
-            coeff=float(m.group(1) or 1.0)
-            if not math.isfinite(coeff) or coeff<=0:
-                raise ValueError('Stoichiometric coefficients must be positive and finite.')
-            out.append((coeff,m.group(2).strip()))
-        return out
+    parts=re.split(r"\s*(?:<=>|<->|-->|->|=>|=)\s*",equation.strip())
+    if len(parts)!=2 or not all(parts):
+        raise ValueError("Use reaction syntax: A + 2 B -> C + D")
+    def side(value):
+        terms=re.split(r"\s+\+\s+",value.strip())
+        if len(terms)==1 and "+" in value and not value.rstrip().endswith("+"):
+            terms=re.split(r"\s*\+\s*",value)
+        result=[]
+        for term in terms:
+            match=re.fullmatch(r"(?:(\d+(?:[.]\d+)?)\s*(?:\*\s*|\s+))?(.+)",term.strip())
+            if not match:
+                raise ValueError("Could not parse reaction term: "+term)
+            coefficient=float(match.group(1) or 1.0)
+            if not math.isfinite(coefficient) or coefficient<=0:
+                raise ValueError("Stoichiometric coefficients must be positive and finite.")
+            result.append((coefficient,match.group(2).strip()))
+        return result
     return side(parts[0]),side(parts[1])
 
 
 def _reaction_thermo_from_sessions(chat_id,user_id,equation):
     reactants,products=_parse_reaction_equation(equation)
     rows=_recent_analyses(chat_id,user_id,max_age_seconds=21600,max_items=50)
-    byname={Path(x['analysis'].get('filename','')).stem.lower():x['analysis'] for x in rows}
-    def resolve(name):
-        key=Path(name).stem.lower()
-        if key not in byname: raise ValueError(f'No parsed output found for {name!r}; upload its .out first.')
-        return byname[key]
-    species=[resolve(name) for _,name in reactants+products]
-    if any(not a.get('normal_termination') for a in species):
-        raise ValueError('Every participating output must confirm normal termination before reaction thermodynamics is calculated.')
-    warnings=[]
-    levels={(a.get('method') or 'N/A',a.get('basis') or 'N/A') for a in species}
-    comparable=len(levels)==1
-    if not comparable:
-        warnings.append('Mixed levels of theory: '+', '.join(f'{m}/{b}' for m,b in sorted(levels)))
-    solvation={(a.get('solvation_model'),a.get('solvent')) for a in species}
-    if len(solvation)>1:
-        warnings.append('Solvation conditions differ or were not identified for every species.')
-        comparable=False
-    if any(not a.get('method') or not a.get('basis') for a in species):
-        warnings.append('Method/basis could not be verified for every species.')
-        comparable=False
-
-    def atom_counts(a):
-        counts={}
-        for row in a.get('final_geometry',[]) or []:
-            element=row.get('element') if isinstance(row,dict) else (row[0] if isinstance(row,(list,tuple)) and row else None)
-            if not element: continue
-            raw_symbol=str(element).strip()
-            if raw_symbol.endswith(':'): continue
-            symbol=raw_symbol.capitalize()
-            if symbol in ('Da','X','Gh'): continue
-            if not re.fullmatch(r'[A-Z][a-z]?',symbol): continue
-            counts[symbol]=counts.get(symbol,0.0)+1.0
-        return counts
-    balance={}; geometry_complete=True
-    for sign,terms in ((-1.0,reactants),(1.0,products)):
-        for coeff,name in terms:
-            counts=atom_counts(resolve(name))
-            if not counts:
-                geometry_complete=False
-                continue
-            for element,n in counts.items():
-                balance[element]=balance.get(element,0.0)+sign*coeff*n
-    if geometry_complete:
-        imbalance={k:v for k,v in balance.items() if abs(v)>1e-6}
-        if imbalance:
-            details=', '.join(f'{k}{v:+g}' for k,v in sorted(imbalance.items()))
-            raise ValueError('Reaction is not atom balanced (products-reactants): '+details)
-    else:
-        warnings.append('Atom balance could not be checked because at least one final geometry is missing.')
-
-    charges=[]
-    for sign,terms in ((-1.0,reactants),(1.0,products)):
-        for coeff,name in terms:
-            q=_float((resolve(name).get('system') or {}).get('charge'))
-            if q is not None and math.isfinite(q):
-                charges.append(sign*coeff*q)
-    if len(charges)!=len(species):
-        warnings.append('Charge balance could not be checked because at least one charge is missing.')
-    elif abs(sum(charges))>1e-6:
-        raise ValueError(f'Reaction is not charge balanced (products-reactants): {sum(charges):+g}.')
-
-    def delta(getter):
-        total=0.0
-        for coeff,name in products:
-            v=_float(getter(resolve(name)))
-            if v is None or not math.isfinite(v): return None
-            total+=coeff*v
-        for coeff,name in reactants:
-            v=_float(getter(resolve(name)))
-            if v is None or not math.isfinite(v): return None
-            total-=coeff*v
-        return total
-    e=delta(lambda a:(a.get('energies') or {}).get('final_energy_hartree'))
-    e0=delta(lambda a: ((a.get('energies') or {}).get('final_energy_hartree')+(a.get('thermochemistry') or {}).get('zpe_hartree')) if (a.get('energies') or {}).get('final_energy_hartree') is not None and (a.get('thermochemistry') or {}).get('zpe_hartree') is not None else None)
-    temps=[_float((a.get('thermochemistry') or {}).get('temperature_K')) for a in species]
-    temp=temps[0] if (all(t is not None and math.isfinite(t) and t>0 for t in temps)
-                       and max(temps)-min(temps)<1e-4) else None
-    if temp is None:
-        warnings.append('Temperature is missing or inconsistent; Delta H, Delta G, Delta S and K_eq were not evaluated.')
-    h=delta(lambda a:(a.get('thermochemistry') or {}).get('enthalpy_hartree')) if temp is not None else None
-    g=delta(lambda a:(a.get('thermochemistry') or {}).get('gibbs_hartree')) if temp is not None else None
-    if not comparable:
-        e=e0=h=g=None
-        warnings.append('Reaction differences were not evaluated because theory or solvation conditions are inconsistent or incomplete.')
-    conv=HARTREE_TO_KJMOL
-    out={'equation':equation,'delta_e_kj_mol':e*conv if e is not None else None,'delta_e0_kj_mol':e0*conv if e0 is not None else None,'delta_h_kj_mol':h*conv if h is not None else None,'delta_g_kj_mol':g*conv if g is not None else None,'temperature_K':temp}
-    out['delta_s_j_mol_k']=((h-g)*conv*1000.0/temp) if h is not None and g is not None and temp and temp>0 else None
-    if g is not None and temp and comparable:
-        try: out['keq']=math.exp(-(g*conv*1000.0)/(8.314462618*temp))
-        except OverflowError: out['keq']=float('inf') if g<0 else 0.0
-    else:
-        out['keq']=None
-    out['warnings']=warnings
-    return out
+    byname={Path(row["analysis"].get("filename","")).stem.lower():row["analysis"] for row in rows}
+    return evaluate_reaction_terms(reactants,products,byname,equation)
 
 
 @bot.message_handler(commands=['reaction'])
+@_ordered_context_handler
 def reaction_command(message):
     if not authorized(message): return
     equation=(message.text or '').partition(' ')[2].strip()
     if not equation:
-        bot.reply_to(message,'Usage: /reaction A + B -> C + D\nNames must match uploaded .out filename stems.'); return
+        bot.reply_to(message,'Usage: /reaction A + B -> C + D\nNames must match uploaded output filename stems; separate terms with spaces around +.'); return
     try:
         r=_reaction_thermo_from_sessions(message.chat.id,message.from_user.id,equation)
         lines=[f"Reaction: {r['equation']}"]
@@ -4912,6 +7221,8 @@ def reaction_command(message):
         lines.append(f"Delta S: {r['delta_s_j_mol_k']:.3f} J mol^-1 K^-1" if r.get('delta_s_j_mol_k') is not None else 'Delta S: unavailable')
         if r.get('temperature_K') is not None: lines.append(f"T: {r['temperature_K']:.2f} K")
         if r.get('keq') is not None: lines.append(f"K_eq: {r['keq']:.6e}")
+        elif r.get('log10_keq') is not None: lines.append(f"log10(K_eq): {r['log10_keq']:.6g}")
+        if r.get('pressure_atm') is not None: lines.append(f"Reference pressure: {r['pressure_atm']:.6g} atm")
         if r.get('warnings'):
             lines.append('Warnings:')
             lines.extend('• '+w for w in r['warnings'])
@@ -4921,19 +7232,21 @@ def reaction_command(message):
 
 
 @bot.message_handler(commands=['start'])
+@_ordered_context_handler
 def start(message):
     if not authorized(message): return
     uid=message.from_user.id
+    context_key=_context_key(message)
     with state_lock:
-        user_aux_storage.pop(uid,None)
-        user_drive_links.pop(uid,None)
+        user_aux_storage.pop(context_key,None)
+        user_drive_links.pop(context_key,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v6.2.7\n"
+        "🧪 Computational Chemistry Bot v7.1.0\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp, Psi4 .dat, or a GaussianView .gjf/.com/.gau file to run on private Kaggle jobs.\n"
         "• The private Kaggle run link arrives as soon as Kaggle accepts the job; use /jobs to retrieve recent links.\n"
         "• Jobs run in /kaggle/working; engine packages stay under /tmp. Working disk is monitored at 20,000 MB.\n"
-        "• Send ORCA/Psi4 .out for scientific analysis, plots and PDF. Gaussian returns .log/.chk/.fchk for GaussianView 6.\n"
+        "• Send ORCA/Psi4 .out or Gaussian .log for checked analysis. Publication exports include PNG 600 dpi, SVG/PDF and CSV.\n"
         "• Upload multiple .out files to overlay TD-DFT/UV-Vis or FT-IR spectra.\n"
         "• Send .xyz/.allxyz/.gbw/.chk/.fchk before jobs when needed; the same snapshot is available to the whole batch.\n"
         "• Psi4 D3/D4/gCP/geomeTRIC dependencies are detected and installed automatically.\n"
@@ -4947,12 +7260,12 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v6.2.7-STRICT-20260927\n'
+        'ChemBot build: v7.1.0-FINAL-20261013\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
         f'API access_token prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("modern_token")) else "no"}\n'
-        f'Startup KaggleApi.authenticate(): {"OK" if KAGGLE_STARTUP_AUTH_OK else "FAILED"}\n'
+        f'Kaggle credentials configured (not an API permission test): {"OK" if KAGGLE_STARTUP_AUTH_OK else "FAILED"}\n'
         f'ORCA dataset: {ORCA_DATASET_SLUG}\n'
         f'Gaussian dataset: {GAUSSIAN_DATASET_SLUG}'
     )
@@ -4964,7 +7277,7 @@ def help_command(message):
     bot.reply_to(message,
         "Supported inputs: ORCA .inp; Psi4 .dat; Gaussian .gjf/.com/.gau or a Gaussian route-card .inp.\n"
         "Auxiliary/restart inputs: .xyz, .allxyz, .gbw, .chk, .fchk.\n"
-        "Analysis input: ORCA/Psi4 .out. Gaussian .log is returned without an analyzer.\n"
+        "Analysis input: ORCA/Psi4 .out or Gaussian .log; common text formats are validated before reporting.\n"
         "The private Kaggle link is sent immediately after submission; /jobs retrieves recent links.\n"
         "Kaggle layout: engine packages in /tmp; calculations/results in /kaggle/working; disk guard 20,000 MB.\n"
         "Use /clearaux to discard stored auxiliary/restart context after a batch.\n\n"
@@ -4973,24 +7286,27 @@ def help_command(message):
 
 
 @bot.message_handler(commands=['clearaux'])
+@_ordered_context_handler
 def clear_aux(message):
     if not authorized(message): return
     uid = message.from_user.id
+    context_key = _context_key(message)
     with state_lock:
-        n = len(user_aux_storage.get(uid, {}))
-        had_link = bool(user_drive_links.get(uid))
-        user_aux_storage.pop(uid, None)
-        user_drive_links.pop(uid, None)
+        n = len(user_aux_storage.get(context_key, {}))
+        had_link = bool(user_drive_links.get(context_key))
+        user_aux_storage.pop(context_key, None)
+        user_drive_links.pop(context_key, None)
     bot.reply_to(message, f"🧹 Cleared {n} auxiliary file(s)" + (" and the restart URL." if had_link else "."))
 
 
 @bot.message_handler(func=lambda m: bool(m.text and m.text.startswith(('http://','https://'))))
+@_ordered_context_handler
 def handle_link(message):
     if not authorized(message): return
     if not (message.text or '').strip().lower().startswith('https://'):
         bot.reply_to(message,'Restart archive URLs must use HTTPS.'); return
     with state_lock:
-        user_drive_links[message.from_user.id]=message.text.strip()
+        user_drive_links[_context_key(message)]=message.text.strip()
     bot.reply_to(message,"🔗 Restart archive URL stored. It will be snapshotted into each subsequent job until /clearaux or /start.")
 
 
@@ -5005,6 +7321,8 @@ def callback(call):
             bot.answer_callback_query(call.id,"Analysis session expired.",show_alert=True); return
         if call.message.chat.id != sess['chat_id']:
             bot.answer_callback_query(call.id,"This analysis belongs to another chat.",show_alert=True); return
+        if not _callback_owner_allowed(call, sess):
+            bot.answer_callback_query(call.id, 'Only the analysis owner or an authorized administrator can use this menu.', show_alert=True); return
         a=sess['analysis']; bot.answer_callback_query(call.id)
         if kind=='a':
             if action=='summary': split_send(call.message.chat.id,section_summary(a),'📋 Summary')
@@ -5018,12 +7336,14 @@ def callback(call):
             elif action=='optplot':
                 p=sess['plots'].get('optimization');
                 if p:
-                    with open(p,'rb') as f: bot.send_photo(call.message.chat.id,f,caption='Optimization energy profile')
+                    with open(p,'rb') as f: bot.send_document(call.message.chat.id,f,caption='Optimization energy profile')
             elif action=='plots':
                 for name,p in sess['plots'].items():
-                    with open(p,'rb') as f: bot.send_photo(call.message.chat.id,f,caption=name.replace('_',' ').title())
+                    with open(p,'rb') as f: bot.send_document(call.message.chat.id,f,caption=name.replace('_',' ').title())
             elif action=='pdf':
                 with open(sess['pdf'],'rb') as f: bot.send_document(call.message.chat.id,f,caption='Complete computational chemistry analysis report')
+            elif action=='pub': _send_publication_exports(call.message.chat.id, sess)
+            elif action=='pubfiles': _send_publication_exports(call.message.chat.id, sess, individual=True)
             elif action=='compare': bot.send_message(call.message.chat.id,'Choose overlay type. The latest compatible .out analyses (up to 10) are used:',reply_markup=comparison_menu(sid))
         elif kind=='t': split_send(call.message.chat.id,section_thermo(a,action),'🌡 Thermochemistry')
         elif kind=='s':
@@ -5031,7 +7351,7 @@ def callback(call):
             elif action=='irplot':
                 p=sess['plots'].get('ir')
                 if p:
-                    with open(p,'rb') as f: bot.send_photo(call.message.chat.id,f,caption='Calculated IR spectrum')
+                    with open(p,'rb') as f: bot.send_document(call.message.chat.id,f,caption='Calculated IR spectrum')
                 else: bot.send_message(call.message.chat.id,'IR intensities were not recognized in this output.')
         elif kind=='c':
             _send_comparison(call.message.chat.id,sess,action)
@@ -5040,44 +7360,69 @@ def callback(call):
             elif action=='uvplot':
                 p=sess['plots'].get('uvvis')
                 if p:
-                    with open(p,'rb') as f: bot.send_photo(call.message.chat.id,f,caption='Simulated UV-Vis spectrum')
+                    with open(p,'rb') as f: bot.send_document(call.message.chat.id,f,caption='Simulated UV-Vis spectrum')
                 else: bot.send_message(call.message.chat.id,'No UV-Vis plot is available.')
     except Exception as e:
         error_id=uuid.uuid4().hex[:10]
-        print('Callback failure reference',error_id,':',repr(e))
+        print('Callback failure reference',error_id,':',_redact_kaggle_error(e))
         try: bot.answer_callback_query(call.id,'Could not complete this action. Please retry.',show_alert=True)
         except Exception: pass
 
 
+@bot.message_handler(commands=['export', 'publication'])
+@_ordered_context_handler
+def publication_command(message):
+    if not authorized(message):
+        return
+    requested = (message.text or '').partition(' ')[2].strip().casefold()
+    with session_lock:
+        sessions = [row for row in analysis_sessions.values()
+                    if row.get('chat_id') == message.chat.id and row.get('user_id') == message.from_user.id]
+    if requested:
+        sessions = [row for row in sessions
+                    if Path(row['analysis'].get('filename', '')).stem.casefold() == requested]
+    if not sessions:
+        bot.reply_to(message, 'Upload an ORCA/Psi4 .out or Gaussian .log file first. Use /export [filename stem] to download publication files.')
+        return
+    sess = max(sessions, key=lambda row: row.get('created', 0))
+    try:
+        _send_publication_exports(message.chat.id, sess)
+    except Exception as exc:
+        reference = uuid.uuid4().hex[:10]
+        print('Publication export failed', reference, type(exc).__name__)
+        bot.reply_to(message, 'Could not send publication exports. Please retry. Reference: ' + reference)
+
 @bot.message_handler(content_types=['document'])
+@_ordered_context_handler
 def handle_document(message):
     if not authorized(message): return
     uid=message.from_user.id; chat_id=message.chat.id
+    context_key=(chat_id,uid)
     original_name=message.document.file_name or 'file'
     filename=original_name.lower()
     size=message.document.file_size or 0
 
-    # Direct scientific analysis of ORCA/Psi4 output
-    if filename.endswith('.out'):
+    # Direct scientific analysis of ORCA/Psi4/Gaussian output
+    if filename.endswith(('.out','.log')):
         if size>MAX_TEXT_OUT:
             bot.reply_to(message,'The .out file exceeds the current 20 MB direct-analysis safety limit.'); return
         try:
             info=bot.get_file(message.document.file_id)
             raw=bot.download_file(info.file_path)
-            text=raw.decode('utf-8',errors='replace')
+            if len(raw) > MAX_TEXT_OUT:
+                raise ValueError('Downloaded text exceeds the direct-analysis size limit.')
+            text=decode_job_input(raw)
             detected_engine=detect_engine(text)
-            if detected_engine not in ('ORCA','Psi4'):
-                bot.reply_to(message,'❌ This .out file could not be identified as ORCA or Psi4 output. Please send the original plain-text .out file without conversion or truncation.')
+            if detected_engine not in ('ORCA','Psi4','Gaussian'):
+                bot.reply_to(message,'❌ This .out file could not be identified as ORCA, Psi4 or Gaussian output. Please send the original plain-text .out file without conversion or truncation.')
                 return
             bot.reply_to(message,f'🔬 {detected_engine} output detected. Parsing scientific results and generating figures/PDF...')
-            sid,a=create_analysis_session(chat_id,uid,original_name,text)
-            if not _queue_analysis_group(message,sid):
-                bot.send_message(chat_id,section_summary(a),reply_markup=out_menu(sid,a))
+            sid,a=create_analysis_session(chat_id,uid,original_name,text,source_bytes=raw)
+            _queue_analysis_group(message,sid)
+            bot.send_message(chat_id,section_summary(a),reply_markup=out_menu(sid,a))
         except Exception as e:
-            import traceback
-            print('Direct .out analysis failure for', original_name)
-            traceback.print_exc()
             error_id=uuid.uuid4().hex[:10]
+            print('Direct analysis error', error_id, _redact_kaggle_error(e))
             bot.reply_to(message,'Analysis failed while processing this output. Please retry or resend it. Reference: '+error_id)
         return
 
@@ -5087,20 +7432,24 @@ def handle_document(message):
             bot.reply_to(message,'This auxiliary file exceeds Telegram Bot API 20 MB download limit. Use a restart ZIP URL instead.'); return
         try:
             info=bot.get_file(message.document.file_id); raw=bot.download_file(info.file_path)
+            if len(raw) > MAX_TELEGRAM_DOWNLOAD:
+                raise ValueError('Downloaded attachment exceeds the auxiliary size limit.')
             with state_lock:
-                bucket=user_aux_storage.setdefault(uid,{})
-                projected=sum(len(base64.b64decode(v)) for v in bucket.values())+len(raw)
+                bucket=user_aux_storage.setdefault(context_key,{})
+                aux_name=os.path.basename(original_name.replace('\\','/'))
+                replaced= len(base64.b64decode(bucket.get(aux_name, '')))
+                projected=sum(len(base64.b64decode(v)) for v in bucket.values())-replaced+len(raw)
                 if projected>MAX_AUX_STORAGE:
                     too_large=True
                     current_files=list(bucket)
                 else:
                     too_large=False
-                    bucket[os.path.basename(original_name)]=base64.b64encode(raw).decode('ascii')
+                    bucket[aux_name]=base64.b64encode(raw).decode('ascii')
                     current_files=list(bucket)
             if too_large:
                 bot.reply_to(message,'Auxiliary in-memory files would exceed 20 MB. Send a restart ZIP URL for larger data.'); return
             bot.reply_to(message,f"✅ Stored {original_name}. Current auxiliary files: {', '.join(current_files)}. They remain available to every submitted job until /clearaux or /start.")
-        except Exception as e: bot.reply_to(message,'Upload error: '+str(e))
+        except Exception as e: bot.reply_to(message,'Upload error: '+_redact_kaggle_error(e))
         return
 
     # Calculation jobs
@@ -5109,6 +7458,8 @@ def handle_document(message):
             bot.reply_to(message,'Input exceeds Telegram Bot API download limit.'); return
         try:
             info=bot.get_file(message.document.file_id); raw=bot.download_file(info.file_path); inp=decode_job_input(raw)
+            if len(raw) > MAX_TELEGRAM_DOWNLOAD:
+                raise ValueError('Downloaded input exceeds the calculation-input size limit.')
             engine=detect_job_engine(original_name,inp)
             if engine is None:
                 bot.reply_to(message,'Unsupported calculation input. Send ORCA .inp, Psi4 .dat, or Gaussian .gjf/.com/.gau input.'); return
@@ -5121,23 +7472,21 @@ def handle_document(message):
             # Take one immutable context snapshot for this message. Multiple
             # simultaneous .inp/.dat handlers therefore cannot consume each
             # other's auxiliary files or restart URL.
-            aux_snapshot, drive = snapshot_user_job_context(uid)
+            aux_snapshot, drive = snapshot_user_job_context(chat_id,uid)
 
-            # Helpful NEB end-point convenience, retaining original behavior.
-            if engine=='orca' and 'neb-ts' in inp.lower() and '%neb' not in inp.lower():
-                xyzs=[n for n in aux_snapshot if n.lower().endswith(('.xyz','.allxyz'))]
-                if len(xyzs)==1:
-                    inp += f'\n\n%neb\n  NEB_End_XYZ "{xyzs[0]}"\nend\n'
-                    bot.send_message(chat_id,f"NEB-TS endpoint automatically linked: {xyzs[0]}")
-
-            payload={os.path.basename(original_name):base64.b64encode(inp.encode()).decode('ascii')}
+            # End-point geometries must be explicit in the scientific input.
+            # Keep the received attachment bytes and the normalized execution text.
+            input_basename = os.path.basename(original_name.replace('\\', '/'))
+            if input_basename in aux_snapshot:
+                raise ValueError('The main calculation input collides with an auxiliary filename.')
+            payload={input_basename:base64.b64encode(raw).decode('ascii')}
             payload.update(aux_snapshot)
             encoded=base64.b64encode(json.dumps(payload).encode()).decode('ascii')
             # submit_kaggle_job uses a UUID slug, a private tempfile directory,
             # a fresh KaggleApi client, and a finally-cleanup for this job only.
             job_id,job_url=submit_kaggle_job(
                 original_name, encoded, chat_id, is_psi4, extras, drive,
-                is_gaussian=is_gaussian
+                is_gaussian=is_gaussian, prepared_input_text=inp
             )
             with state_lock:
                 links=recent_kaggle_jobs.setdefault((chat_id,uid),[])
@@ -5149,10 +7498,10 @@ def handle_document(message):
                     "Send /jobs to retrieve recent job links.")
             _send_submission_link(chat_id,notice)
         except Exception as e:
-            bot.reply_to(message,'Submission error: '+str(e))
+            bot.reply_to(message,'Submission error: '+_redact_kaggle_error(e))
         return
 
-    bot.reply_to(message,'Supported files: ORCA .inp, Psi4 .dat, Gaussian .gjf/.com/.gau (or Gaussian route-card .inp), .out, .xyz, .allxyz, .gbw, .chk, .fchk')
+    bot.reply_to(message,'Supported files: ORCA .inp, Psi4 .dat, Gaussian .gjf/.com/.gau, .out/.log, .xyz, .allxyz, .gbw, .chk, .fchk')
 
 
 # ------------------------- Runtime transport -------------------------
@@ -5167,6 +7516,8 @@ def _transport_mode():
     mode = os.environ.get("CHEMBOT_MODE", "auto").strip().lower()
     if mode in {"webhook", "polling"}:
         return mode
+    if mode != 'auto':
+        raise RuntimeError('CHEMBOT_MODE must be auto, webhook, or polling.')
     # Render web services expose a public hostname/URL. A manual public URL
     # can also be supplied for other hosts.
     if (os.environ.get("CHEMBOT_PUBLIC_URL", "").strip()
@@ -5179,6 +7530,8 @@ def _transport_mode():
 def _webhook_secret():
     configured = os.environ.get("CHEMBOT_WEBHOOK_SECRET", "").strip()
     if configured:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,256}', configured):
+            raise RuntimeError('CHEMBOT_WEBHOOK_SECRET must use 1-256 letters, digits, underscores or hyphens.')
         return configured
     # Stable across overlapping Render instances, but never printed or exposed.
     return hashlib.sha256((BOT_TOKEN + "|ChemBot|Webhook|v4.7").encode("utf-8")).hexdigest()[:48]
@@ -5187,6 +7540,8 @@ def _webhook_secret():
 def _webhook_path():
     configured = os.environ.get("CHEMBOT_WEBHOOK_PATH", "").strip().strip("/")
     if configured:
+        if not re.fullmatch(r'[A-Za-z0-9_/-]+', configured) or configured in {'health', 'healthz'}:
+            raise RuntimeError('CHEMBOT_WEBHOOK_PATH contains unsupported characters or a reserved health route.')
         return "/" + configured
     token_hash = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:24]
     return "/telegram/" + token_hash
@@ -5205,6 +7560,10 @@ def run_render_webhook():
             "Webhook mode requires CHEMBOT_PUBLIC_URL, RENDER_EXTERNAL_URL, or "
             "RENDER_EXTERNAL_HOSTNAME. On Render, deploy as a Web Service."
         )
+    parsed_public_url = urlsplit(external_url)
+    if (parsed_public_url.scheme != 'https' or not parsed_public_url.hostname or parsed_public_url.username
+            or parsed_public_url.query or parsed_public_url.fragment):
+        raise RuntimeError('The public webhook base URL must be an HTTPS URL without credentials, query or fragment.')
 
     secret = _webhook_secret()
     path = _webhook_path()
@@ -5213,11 +7572,11 @@ def run_render_webhook():
     max_update_bytes = int(os.environ.get("CHEMBOT_MAX_WEBHOOK_BYTES", str(2 * 1024 * 1024)))
 
     class TelegramWebhookHandler(BaseHTTPRequestHandler):
-        server_version = "ChemBotWebhook/4.7"
+        server_version = "ChemBotWebhook/7.1.0"
 
         def log_message(self, fmt, *args):
-            # Keep Render logs compact and avoid printing the secret path.
-            print("[webhook] " + (fmt % args))
+            # BaseHTTPRequestHandler includes the secret route in request logs.
+            return
 
         def _reply(self, status, body=b"OK", content_type="text/plain; charset=utf-8"):
             self.send_response(status)
@@ -5231,7 +7590,7 @@ def run_render_webhook():
                 payload = json.dumps({
                     "ok": True,
                     "service": "ChemBot",
-                    "version": "5.3",
+                    "version": "7.1.0",
                     "transport": "webhook",
                 }).encode("utf-8")
                 return self._reply(200, payload, "application/json; charset=utf-8")
@@ -5242,7 +7601,7 @@ def run_render_webhook():
                 return self._reply(404, b"Not Found")
 
             header_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if header_secret != secret:
+            if not hmac.compare_digest(header_secret, secret):
                 return self._reply(403, b"Forbidden")
 
             try:
@@ -5256,16 +7615,19 @@ def run_render_webhook():
             try:
                 raw = self.rfile.read(content_length)
                 update = telebot.types.Update.de_json(raw.decode("utf-8"))
+                if update is None or not isinstance(update.update_id, int):
+                    return self._reply(400, b'Invalid Update')
                 # TeleBot is configured threaded=True; handlers are delegated to
                 # its worker pool, allowing the HTTP request to acknowledge fast.
                 bot.process_new_updates([update])
             except Exception as exc:
-                print(f"Webhook update processing error: {exc!r}")
+                print('Webhook update processing error:', _redact_kaggle_error(exc))
                 return self._reply(500, b"Update processing failed")
 
             return self._reply(200, b"OK")
 
     server = ThreadingHTTPServer(("0.0.0.0", port), TelegramWebhookHandler)
+    server.daemon_threads = True
 
     # setWebhook replaces any previous webhook atomically. Both the old and new
     # Render instance use the same URL/secret during zero-downtime deployment,
@@ -5274,12 +7636,14 @@ def run_render_webhook():
         url=webhook_url,
         secret_token=secret,
         drop_pending_updates=False,
+        max_connections=1,
+        allowed_updates=['message', 'callback_query'],
     )
     if not ok:
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v6.2.7 webhook mode active on port {port}.")
+    print(f"CHEMBOT v7.1.0 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -5320,9 +7684,9 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v6.2.7 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v7.1.0 polling mode active. Ensure no other instance uses this bot token.")
     try:
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+        bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
         if getattr(exc, "error_code", None) == 409 or "other getUpdates request" in str(exc):
             raise RuntimeError(
