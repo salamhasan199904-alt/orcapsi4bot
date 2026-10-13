@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChemBot 7.1.1 — final scientific/Telegram/Kaggle script (2026-10-13).
+"""ChemBot 7.1.2 — final scientific/Telegram/Kaggle script (2026-10-13).
 
 Python 3.10+ (3.11/3.12 recommended). Start: python chembot.py
 Render: Web Service, start command python chembot.py, health route /health.
@@ -12,6 +12,8 @@ Set CHEMBOT_AUTO_INSTALL=0 when dependencies were installed during the build.
 Private notebooks contain the delivery token and input; keep them private.
 Commands: --help, --self-test, --print-requirements, --analyze file.out --outdir report.
 Self-tests use synthetic fixtures and never contact Telegram, Kaggle or engines.
+Gaussian setup installs missing tcsh, repairs runtime script line endings, and
+preserves installer diagnostics in outputs/gaussian_setup.log.
 The parser supports common printed output sections, not every engine protocol.
 Reports retain warnings for missing evidence; export formatting does not validate
 an unsuitable method, basis, molecule, stationary point or scientific hypothesis.
@@ -58,7 +60,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ============================================================
-# Chemistry Telegram/Kaggle Bot v7.1.1
+# Chemistry Telegram/Kaggle Bot v7.1.2
 # ============================================================
 
 
@@ -2222,8 +2224,8 @@ def section_orbitals(a):
 # thermochemistry_blocks and job_blocks retain independent provenance.
 BOHR_TO_ANGSTROM = 0.529177210903
 FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
-PARSER_VERSION = '7.1.1'
-REPORT_GENERATOR_VERSION = '7.1.1'
+PARSER_VERSION = '7.1.2'
+REPORT_GENERATOR_VERSION = '7.1.2'
 _LEGACY_ANALYZER_PARSE = parse_output_text
 
 
@@ -3447,7 +3449,7 @@ import re
 from pathlib import Path
 
 ANALYSIS_SCHEMA_VERSION = "2.0"
-PARSER_VERSION = "7.1.1"
+PARSER_VERSION = "7.1.2"
 HARTREE_TO_KJMOL = 2625.499638
 HARTREE_TO_EV = 27.211386245988
 GAS_CONSTANT_J_MOL_K = 8.314462618
@@ -3962,7 +3964,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-REPORT_GENERATOR_VERSION = "7.1.1"
+REPORT_GENERATOR_VERSION = "7.1.2"
 _RF_HARTREE_TO_KJMOL = 2625.499638
 _RF_HC_EV_NM = 1239.841984
 _RF_EV_TO_CM1 = 8065.544005
@@ -4845,7 +4847,7 @@ def generate_report_bundle(a, outdir, base_name=None):
 KAGGLE_RUNNER_CODE = r'''
 
 
-import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib, re, signal, threading
+import os, sys, json, time, base64, shutil, zipfile, tarfile, glob, subprocess, traceback, urllib.request, urllib.parse, hashlib, re, signal, threading, shlex, stat
 from pathlib import Path
 import uuid
 START_TIME=time.time()
@@ -4969,6 +4971,126 @@ def _find_gaussian_archive(input_root='/kaggle/input'):
                            'Files visible: '+found)
     matches.sort()
     return matches[0][2]
+
+
+def _ensure_gaussian_csh():
+    """Gaussian's UNIX installer and companion scripts require C shell."""
+    shell = shutil.which('csh')
+    if shell:
+        return shell
+    apt = shutil.which('apt-get')
+    if not apt or not hasattr(os, 'geteuid') or os.geteuid() != 0:
+        raise RuntimeError('Gaussian requires csh, which is missing. Automatic setup needs apt-get and root access; install tcsh so that /bin/csh is available.')
+    print('[Kaggle] Gaussian: installing the missing C shell (tcsh).', flush=True)
+    apt_options = ['-o', 'Acquire::Retries=1', '-o', 'Acquire::http::Timeout=30',
+                   '-o', 'Acquire::https::Timeout=30']
+    try:
+        safe_install([apt] + apt_options + ['update', '-qq'], max_seconds=300)
+        safe_install([apt] + apt_options + ['install', '-y', '--no-install-recommends', 'tcsh'], max_seconds=300)
+    except Exception as exc:
+        raise RuntimeError('Could not install the C shell required by Gaussian. Check Kaggle Internet access and the package-manager error: ' + _redact_message(exc)) from None
+    shell = shutil.which('csh')
+    if not shell:
+        raise RuntimeError('tcsh installation completed, but csh is still unavailable. Gaussian needs a working /bin/csh interpreter.')
+    return shell
+
+
+def _prepare_gaussian_runtime_files(gaussian_home):
+    """Repair only the extracted runtime, preserving binary bytes and links."""
+    normalized = 0
+    for parent, dirs, files in os.walk(gaussian_home, followlinks=False):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(parent, d))]
+        os.chmod(parent, (stat.S_IMODE(os.stat(parent).st_mode) & 0o770) | 0o700)
+        for name in files:
+            path = os.path.join(parent, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            mode = (stat.S_IMODE(os.stat(path).st_mode) & 0o770) | 0o600
+            with open(path, 'rb') as handle:
+                header = handle.read(4096)
+            text_header = header.removeprefix(b'\xef\xbb\xbf')
+            shell_file = text_header.startswith(b'#!')
+            known_script = (os.path.basename(parent) == 'bsd' and
+                            name in {'install', 'g16.profile', 'g16.login'})
+            if header.startswith(b'\x7fELF') or shell_file or name in {'g16', 'formchk'}:
+                mode |= 0o110
+            os.chmod(path, mode)
+            if (shell_file or known_script) and os.path.getsize(path) <= 2 * 1024 * 1024:
+                raw = Path(path).read_bytes()
+                if b'\x00' not in raw:
+                    clean = raw.removeprefix(b'\xef\xbb\xbf').replace(b'\r\n', b'\n')
+                    if clean != raw:
+                        Path(path).write_bytes(clean)
+                        normalized += 1
+    if normalized:
+        print('[Kaggle] Gaussian: normalized Linux script line endings in %d runtime files.' % normalized, flush=True)
+    return normalized
+
+
+def _gaussian_install_command(install_script):
+    """Honor the installer shell instead of relying on the kernel shebang."""
+    with open(install_script, 'rb') as handle:
+        header = handle.read(4096)
+    if header.startswith(b'\x7fELF'):
+        return [install_script]
+    if b'\x00' in header:
+        raise RuntimeError('Gaussian bsd/install is neither a Linux ELF executable nor a text script. Check the Linux archive.')
+    first = header.removeprefix(b'\xef\xbb\xbf').split(b'\n', 1)[0].rstrip(b'\r')
+    if not first.startswith(b'#!'):
+        # The documented UNIX installation procedure runs in C shell.
+        return [_ensure_gaussian_csh(), '-f', install_script]
+    try:
+        parts = shlex.split(first[2:].decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError('Invalid interpreter line in Gaussian bsd/install: ' + str(exc)) from None
+    if parts and os.path.basename(parts[0]) == 'env':
+        parts = parts[1:]
+        if parts and parts[0] == '-S':
+            parts = parts[1:]
+    if not parts or parts[0].startswith('-'):
+        raise RuntimeError('Unrecognized interpreter line in Gaussian bsd/install.')
+    requested, arguments = parts[0], parts[1:]
+    name = os.path.basename(requested)
+    interpreter = shutil.which(requested)
+    if not interpreter:
+        interpreter = shutil.which(name)
+    if not interpreter and name in {'csh', 'tcsh'}:
+        interpreter = _ensure_gaussian_csh()
+    if not interpreter:
+        raise RuntimeError('Gaussian bsd/install exists, but its interpreter is missing: ' + requested)
+    print('[Kaggle] Gaussian installer interpreter: ' + interpreter, flush=True)
+    return [interpreter] + arguments + [install_script]
+
+
+def _run_gaussian_installer(install_script, gaussian_home, gaussian_env):
+    if not os.path.isfile(install_script):
+        if os.path.lexists(install_script):
+            raise RuntimeError('Gaussian bsd/install is a broken link or is not a regular file: ' + install_script)
+        print('[Kaggle] Gaussian: bsd/install is absent; using the supplied installed runtime.', flush=True)
+        return None
+    command = _gaussian_install_command(install_script)
+    log_path = os.path.join(WORK_DIR, 'outputs', 'gaussian_setup.log')
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    try:
+        with open(log_path, 'wb') as log:
+            log.write(('Installer: ' + install_script + '\nInterpreter: ' + command[0] + '\n').encode('utf-8'))
+            log.flush()
+            proc = subprocess.Popen(command, cwd=gaussian_home, env=gaussian_env,
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                rc = proc.wait(timeout=_phase_timeout(300, reserve_seconds=SAFETY_MARGIN))
+            except (subprocess.TimeoutExpired, TimeoutError):
+                _stop_process_group(proc)
+                proc.wait(timeout=5)
+                raise TimeoutError('Gaussian bsd/install exceeded its time budget. See outputs/gaussian_setup.log.') from None
+    except FileNotFoundError:
+        raise RuntimeError('Gaussian bsd/install exists but could not start. Its interpreter or Linux executable loader is unavailable. See outputs/gaussian_setup.log.') from None
+    if rc != 0:
+        with open(log_path, 'rb') as log:
+            log.seek(max(0, os.path.getsize(log_path) - 2500))
+            excerpt = log.read().decode('utf-8', errors='replace')
+        raise RuntimeError('Gaussian bsd/install failed (exit %d):\n%s\nSee outputs/gaussian_setup.log.' % (rc, _redact_message(excerpt)))
+    return log_path
 
 
 def _cap_gaussian_maxdisk(inp):
@@ -5812,26 +5934,23 @@ try:
         gaussian_env['CHEMBOT_G16_PROFILE']=GAUSSIAN_PROFILE
         gaussian_env['CHEMBOT_GAUSS_SCRDIR']=GAUSSIAN_SCRATCH_DIR
 
+        _prepare_gaussian_runtime_files(gaussian_home)
+        _ensure_gaussian_csh()
         install_script=os.path.join(gaussian_bsd,'install')
-        if os.path.isfile(install_script):
-            try: os.chmod(install_script,0o755)
-            except OSError: pass
-            install=subprocess.run([install_script],cwd=gaussian_home,env=gaussian_env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=_phase_timeout(300))
-            if install.returncode!=0:
-                raise RuntimeError('Gaussian bsd/install failed:\n'+(install.stdout or '')[-2500:])
+        _run_gaussian_installer(install_script,gaussian_home,gaussian_env)
         gaussian_exe=os.path.join(gaussian_home,'g16')
         if not os.path.exists(gaussian_exe):
             raise RuntimeError('Gaussian installation did not produce g16 at '+gaussian_exe)
-        try: os.chmod(gaussian_exe,0o755)
+        try: os.chmod(gaussian_exe,0o750)
         except OSError: pass
         gaussian_env['CHEMBOT_G16_EXE']=gaussian_exe
         gaussian_formchk=os.path.join(gaussian_home,'formchk')
         gaussian_env['CHEMBOT_FORMCHK_EXE']=gaussian_formchk if os.path.isfile(gaussian_formchk) else ''
         if gaussian_env['CHEMBOT_FORMCHK_EXE']:
-            try: os.chmod(gaussian_formchk,0o755)
+            try: os.chmod(gaussian_formchk,0o750)
             except OSError: pass
         # The official profile initializes Gaussian paths and runtime variables.
-        GAUSSIAN_LAUNCH_SCRIPT='source "$CHEMBOT_G16_PROFILE" >/dev/null 2>&1 || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v g16 >/dev/null 2>&1; then exec g16; fi; [ -x "$CHEMBOT_G16_EXE" ] || exit 127; exec "$CHEMBOT_G16_EXE"'
+        GAUSSIAN_LAUNCH_SCRIPT='source "$CHEMBOT_G16_PROFILE" || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v g16 >/dev/null 2>&1; then exec g16; fi; [ -x "$CHEMBOT_G16_EXE" ] || exit 127; exec "$CHEMBOT_G16_EXE"'
         cmd=['bash','-c',GAUSSIAN_LAUNCH_SCRIPT]
         send_msg('[Kaggle] Gaussian 16 runtime prepared from '+os.path.basename(gaussian_archive))
     else:
@@ -6026,7 +6145,7 @@ try:
                 if fn.lower().endswith('.chk'):
                     checkpoints.append(os.path.join(parent,fn))
         converted=0
-        formchk_script='source "$CHEMBOT_G16_PROFILE" >/dev/null 2>&1 || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v formchk >/dev/null 2>&1; then exec formchk "$1" "$2"; fi; [ -x "$CHEMBOT_FORMCHK_EXE" ] || exit 127; exec "$CHEMBOT_FORMCHK_EXE" "$1" "$2"'
+        formchk_script='source "$CHEMBOT_G16_PROFILE" || exit 126; export GAUSS_SCRDIR="$CHEMBOT_GAUSS_SCRDIR"; if command -v formchk >/dev/null 2>&1; then exec formchk "$1" "$2"; fi; [ -x "$CHEMBOT_FORMCHK_EXE" ] || exit 127; exec "$CHEMBOT_FORMCHK_EXE" "$1" "$2"'
         for chk_path in sorted(set(checkpoints)):
             fchk_path=os.path.splitext(chk_path)[0]+'.fchk'
             try:
@@ -6162,7 +6281,7 @@ finally:
         shutil.rmtree(GAUSSIAN_SCRATCH_DIR, ignore_errors=True)
 '''
 
-SELF_TEST_CODE = "import base64, copy, hashlib, json, math, os, tempfile, unittest\nfrom pathlib import Path\nORCA = '''O   R   C   A\nProgram Version 6.1.0\n| 1> ! PBE0 def2-SVP Opt Freq\n| 2> * xyz 0 1\nYour calculation utilizes the basis: def2-SVP\nSCF CONVERGED AFTER 8 CYCLES\nFINAL SINGLE POINT ENERGY -75.000000000\nTHE OPTIMIZATION HAS CONVERGED\nCARTESIAN COORDINATES (ANGSTROEM)\nO 0.0 0.0 0.0\nH 0.8 0.0 0.6\nH -0.8 0.0 0.6\n\nVIBRATIONAL FREQUENCIES\n0: 0.0 cm**-1\n1: 0.0 cm**-1\n2: 0.0 cm**-1\n3: 0.0 cm**-1\n4: 0.0 cm**-1\n5: 0.0 cm**-1\n6: 1200.0 cm**-1\n7: 3200.0 cm**-1\n8: 3300.0 cm**-1\n\nIR SPECTRUM\nMode freq eps Int T**2 TX TY TZ\n6: 1200.0 0.001 10.0 0.002 (0.1 0.2 0.3)\n7: 3200.0 0.003 20.0 0.004 (0.2 0.3 0.4)\n8: 3300.0 0.005 30.0 0.006 (0.3 0.4 0.5)\n\nORBITAL ENERGIES\nNO OCC E(Eh) E(eV)\n0 2.0000 -1.000000 -27.211386\n1 2.0000 -0.250000 -6.802847\n2 0.0000 0.050000 1.360569\n\nABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS\nState Energy Wavelength fosc\n1 20000.0 500.0 0.2\n2 25000.0 400.0 0.1\n\nTHERMOCHEMISTRY AT 298.15K\nTemperature ... 298.15 K\nPressure ... 1.0 atm\nElectronic energy ... -75.000000000 Eh\nZero point energy ... 0.018 Eh\nTotal thermal energy -74.978 Eh\nThermal Enthalpy correction ... 0.00094421 Eh\nTotal Enthalpy ... -74.97705579 Eh\nFinal Gibbs free energy ... -75.0 Eh\nStandard-RRHO\nORCA TERMINATED NORMALLY\n'''\n\nPSI4 = '''Psi4: An Open-Source Ab Initio Electronic Structure Package\nPsi4 1.11\nset basis sto-3g\nReference: RHF\nGeometry (in Angstrom), charge = 0, multiplicity = 1:\nO 0.0 0.0 0.0\nH 0.8 0.0 0.6\nH -0.8 0.0 0.6\n\nEnergy and wave function converged.\n@RHF Final Energy: -75.000000\n==> Orbital Energies [Eh] <==\nDoubly Occupied:\n1A1 -1.0 2A1 -0.25\nVirtual:\n\n3A1 0.05 1B2 0.10\n\nProperty section\nOptimization is complete\nPsi4 exiting successfully\n'''\n\nGAUSSIAN = '''Gaussian 16: synthetic format regression\n #p b3lyp/6-31g(d) opt freq\n ------------------------------------\n Standard basis: 6-31G(d) (6D, 7F)\n Charge = 0 Multiplicity = 1\n SCF Done: E(RB3LYP) = -75.000000 A.U. after 10 cycles\n Optimization completed.\n Standard orientation:\n ---------------------------------------------------------------------\n Center Atomic Atomic Coordinates (Angstroms)\n Number Number Type X Y Z\n ---------------------------------------------------------------------\n 1 8 0 0.0 0.0 0.0\n 2 1 0 0.8 0.0 0.6\n 3 1 0 -0.8 0.0 0.6\n ---------------------------------------------------------------------\n Harmonic frequencies (cm**-1), IR intensities (KM/Mole)\n                      1             2              3\n Frequencies --   1200.0       3200.0         3300.0\n IR Inten    --     10.0         20.0           30.0\n - Thermochemistry -\n Temperature 298.15 Kelvin. Pressure 1.0 Atm.\n Zero-point correction= 0.018000 (Hartree/Particle)\n Thermal correction to Energy= 0.022000\n Thermal correction to Enthalpy= 0.02294421\n Thermal correction to Gibbs Free Energy= 0.000000\n Sum of electronic and zero-point Energies= -74.982000\n Sum of electronic and thermal Energies= -74.978000\n Sum of electronic and thermal Enthalpies= -74.97705579\n Sum of electronic and thermal Free Energies= -75.000000\n Normal termination of Gaussian 16\n'''\n\ndef parse(text=ORCA, name='water.out'):\n    return A['parse_output_text'](text, name)\n\n\nclass ScientificChecks(unittest.TestCase):\n    def test_orca_minimum_and_thermochemistry(self):\n        a = parse()\n        self.assertEqual(a['quality']['status'], 'PASS')\n        self.assertEqual(a['expected_vibration_count'], 3)\n        self.assertEqual(a['stationary_point_status'], 'LIKELY_MINIMUM')\n        self.assertTrue(a['quality']['thermochemistry_reliable'])\n        self.assertAlmostEqual(a['energies']['final_energy_hartree'], -75.0)\n\n    def test_source_hash(self):\n        self.assertEqual(parse()['source_sha256'], hashlib.sha256(ORCA.encode()).hexdigest())\n\n    def test_finite_fortran_numbers(self):\n        self.assertEqual(A['_float']('-1.5D+02'), -150.)\n        self.assertIsNone(A['_float']('NaN'))\n        self.assertIsNone(A['_float']('inf'))\n\n    def test_termination_is_not_input_comment(self):\n        a = parse(ORCA.replace('ORCA TERMINATED NORMALLY', '| 9> # ORCA TERMINATED NORMALLY'))\n        self.assertIsNone(a['normal_termination'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_failed_calculation(self):\n        a = parse(ORCA.replace('ORCA TERMINATED NORMALLY', 'ORCA finished by error termination'))\n        self.assertEqual(a['quality']['status'], 'FAIL')\n\n    def test_opt_failure_despite_normal_termination(self):\n        a = parse(ORCA.replace('THE OPTIMIZATION HAS CONVERGED', 'The optimization did not converge'))\n        self.assertEqual(a['quality']['status'], 'FAIL')\n\n    def test_scf_failure_withholds_descriptors(self):\n        a = parse(ORCA.replace('SCF CONVERGED AFTER 8 CYCLES', 'SCF NOT CONVERGED'))\n        self.assertEqual(a['conceptual_dft'], {})\n\n    def test_unknown_scf_withholds_minimum(self):\n        a = parse(ORCA.replace('SCF CONVERGED AFTER 8 CYCLES', ''))\n        self.assertEqual(a['stationary_point_status'], 'UNVERIFIED_ELECTRONIC_STATE')\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_incomplete_frequencies(self):\n        a = parse(ORCA.replace('8: 3300.0 cm**-1', ''))\n        self.assertFalse(a['quality']['frequency_complete'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_one_imaginary_is_candidate(self):\n        a = parse(ORCA.replace('6: 1200.0 cm**-1', '6: -120.0 cm**-1'))\n        self.assertEqual(a['stationary_point_status'], 'FIRST_ORDER_SADDLE_CANDIDATE')\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_small_negative_is_not_ignored(self):\n        a = parse(ORCA.replace('6: 1200.0 cm**-1', '6: -3.0 cm**-1'))\n        self.assertEqual(a['stationary_point_status'], 'NEAR_ZERO_IMAGINARY_MODES')\n\n    def test_linear_modes(self):\n        self.assertEqual(A['_molecule_mode_counts']([dict(element='C', x=0,y=0,z=0),dict(element='O',x=0,y=0,z=1),dict(element='O',x=0,y=0,z=-1)]), (3, True, 4))\n\n    def test_orca_bohr_conversion(self):\n        a = parse(ORCA.replace('(ANGSTROEM)', '(A.U.)'))\n        self.assertAlmostEqual(a['final_geometry'][1]['x'], .8*A['BOHR_TO_ANGSTROM'])\n        self.assertEqual(a['source_geometry_units'], 'bohr')\n\n    def test_thermal_reference_mismatch(self):\n        a = parse(ORCA.replace('Electronic energy ... -75.000000000 Eh', 'Electronic energy ... -76.000000000 Eh'))\n        self.assertFalse(a['quality']['thermochemical_energy_compatible'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_missing_thermal_reference(self):\n        a = parse()\n        a['thermochemistry']['electronic_energy_hartree'] = None\n        a = A['validate_analysis'](a)\n        self.assertIsNone(a['quality']['thermochemical_energy_compatible'])\n        self.assertFalse(a['quality']['thermochemistry_reliable'])\n\n    def test_orca_enthalpy_does_not_omit_zpe(self):\n        t = A['_orca_thermo_block']('Electronic energy ... -75.0 Eh\\nThermal Enthalpy correction ... 0.001 Eh')\n        self.assertIsNone(t['enthalpy_hartree'])\n\n    def test_orca_enthalpy_from_total_u(self):\n        t = A['_orca_thermo_block']('Electronic energy ... -75.0 Eh\\nTotal thermal energy -74.98 Eh\\nThermal Enthalpy correction ... 0.001 Eh\\nFinal entropy term ... 0.02 Eh')\n        self.assertAlmostEqual(t['enthalpy_hartree'], -74.979)\n        self.assertAlmostEqual(t['gibbs_hartree'], -74.999)\n\n    def test_orca_enthalpy_from_total_correction(self):\n        t = A['_orca_thermo_block']('Electronic energy ... -75.0 Eh\\nTotal correction 0.02 Eh\\nThermal Enthalpy correction ... 0.001 Eh')\n        self.assertAlmostEqual(t['enthalpy_hartree'], -74.979)\n\n    def test_orca_correction_fields_have_consistent_meanings(self):\n        t=parse()['thermochemistry']\n        self.assertAlmostEqual(t['pv_correction_hartree'],.00094421)\n        self.assertAlmostEqual(t['enthalpy_correction_hartree'],.02294421)\n\n    def test_orca_solvent_protocol_blocks_gas_equilibrium(self):\n        a=parse(ORCA.replace('! PBE0 def2-SVP Opt Freq','! PBE0 def2-SVP Opt Freq CPCM(Water)'))\n        self.assertEqual(a['solvation_model'],'CPCM')\n        self.assertEqual(a['solvent'],'Water')\n        self.assertEqual(a['quality']['standard_state'],'CONTINUUM_ELECTRONIC_PLUS_GAS_THERMAL_REFERENCE')\n\n    def test_orca_ir_intensity_column(self):\n        self.assertEqual(tuple(parse()['ir_spectrum'][0]), (1200.,10.))\n\n    def test_ir_missing_intensity_not_fabricated(self):\n        a = parse(ORCA.replace('Mode freq eps Int T**2 TX TY TZ','unrecognized table header'))\n        self.assertEqual(a['ir_spectrum'], [])\n\n    def test_exact_correlated_method(self):\n        self.assertEqual(parse(ORCA.replace('! PBE0', '! DLPNO-CCSD(T1)'))['method'], 'DLPNO-CCSD(T1)')\n\n    def test_orca_jobs_do_not_inherit(self):\n        a = parse(ORCA + '\\nO   R   C   A\\n| 1> ! HF def2-SVP SP\\nSCF CONVERGED AFTER 4 CYCLES\\nFINAL SINGLE POINT ENERGY -74.0\\nORCA TERMINATED NORMALLY\\n')\n        self.assertEqual(a['job_blocks_count'], 2)\n        self.assertEqual(a['frequencies_cm1'], [])\n        self.assertIsNone(a['thermochemistry']['gibbs_hartree'])\n\n    def test_psi4_energy_and_symmetry(self):\n        a = parse(PSI4,'psi4.out')\n        self.assertEqual(a['engine'], 'Psi4')\n        self.assertAlmostEqual(a['orbitals']['homo_ev'], -.25*A['HARTREE_TO_EV'])\n        self.assertAlmostEqual(a['orbitals']['lumo_ev'], .05*A['HARTREE_TO_EV'])\n\n    def test_psi4_correlated_energy_is_not_scf(self):\n        text = PSI4.replace('Psi4 exiting successfully', 'MP2 total energy = -75.25\\nPsi4 exiting successfully')\n        a = parse(text)\n        self.assertEqual(a['method'], 'MP2')\n        self.assertAlmostEqual(a['energies']['final_energy_hartree'], -75.25)\n\n    def test_psi4_bohr_units(self):\n        a = parse(PSI4.replace('(in Angstrom)', '(in Bohr)'))\n        self.assertAlmostEqual(a['final_geometry'][1]['x'], .8*A['BOHR_TO_ANGSTROM'])\n\n    def test_psi4_explicit_ev_orbitals(self):\n        orbitals = A['_psi4_orbitals_v59']('==> Orbital Energies [eV] <==\\nDoubly Occupied:\\n1A1 -5.0\\nVirtual:\\n2A1 1.0\\n')\n        self.assertAlmostEqual(orbitals['homo_ev'],-5.)\n        self.assertAlmostEqual(orbitals['lumo_ev'],1.)\n\n    def test_psi4_spin_reset_for_final_table(self):\n        text='==> Orbital Energies [Eh] <==\\nAlpha Occupied: 1A1 -1.0\\nAlpha Virtual: 2A1 0.1\\nOther property\\n==> Orbital Energies [Eh] <==\\nDoubly Occupied: 1A1 -0.5\\nVirtual: 2A1 0.2\\n'\n        orbitals=A['_psi4_orbitals_v59'](text)\n        self.assertEqual(orbitals['orbitals'][0]['occ'],2.)\n\n    def test_psi4_unknown_geometry_units(self):\n        a = parse(PSI4.replace('Geometry (in Angstrom)', 'Final optimized geometry'))\n        self.assertEqual(a['geometry_units'], 'UNKNOWN')\n        self.assertIsNone(a['expected_vibration_count'])\n\n    def test_psi4_missing_cell_alignment(self):\n        f, ir = A['_parse_psi4_vibrations']('Freq [cm^-1] 100.0 ---- 300.0\\nIR activ [km/mol] 10.0 20.0 30.0\\n')\n        self.assertEqual(f,[100.,300.])\n        self.assertEqual(ir,[(100.,10.),(300.,30.)])\n\n    def test_psi4_multiple_jobs(self):\n        a = parse(PSI4 + '\\nPsi4: An Open-Source Ab Initio Electronic Structure Package\\n@RHF Final Energy: -1.0\\nPsi4 exiting successfully\\n')\n        self.assertEqual(a['job_blocks_count'],2)\n        self.assertEqual(a['final_geometry'],[])\n\n    def test_dipole_atomic_units(self):\n        d = A['_dipole_strict']('Total Dipole Moment : -1.0 2.0 0.0','ORCA')\n        self.assertAlmostEqual(d['magnitude_debye'],math.sqrt(5)*2.541746473)\n\n    def test_psi4_unknown_dipole_units(self):\n        self.assertEqual(A['_dipole_strict']('Dipole Moment:\\nX: 1.0 Y: 2.0 Z: 0.0 Total: 2.2','Psi4'),{})\n\n    def test_gaussian_energy_and_thermal_sum(self):\n        a = parse(GAUSSIAN,'water.log')\n        self.assertEqual(a['engine'],'Gaussian')\n        self.assertAlmostEqual(a['energies']['final_energy_hartree'],-75.)\n        self.assertTrue(a['quality']['thermochemistry_reliable'])\n\n    def test_gaussian_no_false_completion(self):\n        self.assertIsNone(parse(GAUSSIAN.replace('Normal termination of Gaussian 16',''))['normal_termination'])\n\n    def test_gaussian_link1(self):\n        second = '\\n--Link1--\\n #p hf/sto-3g sp\\n ----\\n SCF Done: E(RHF) = -74.0 A.U. after 3 cycles\\n Normal termination of Gaussian 16\\n'\n        a = parse(GAUSSIAN + second)\n        self.assertEqual(a['job_blocks_count'],2)\n        self.assertIsNone(a['thermochemistry']['gibbs_hartree'])\n\n    def test_gaussian_unsupported_composite(self):\n        a = parse(GAUSSIAN.replace('#p b3lyp/6-31g(d) opt freq','#p ONIOM(b3lyp/6-31g(d):UFF) opt freq'))\n        self.assertIsNone(a['energies']['final_energy_hartree'])\n\n    def test_reaction_balanced_and_comparable(self):\n        a = parse(); b = copy.deepcopy(a); b['filename']='isomer.out'\n        for k in ('final_energy_hartree',): b['energies'][k]+=.01\n        for k in ('electronic_energy_hartree','electronic_reference_hartree','enthalpy_hartree','gibbs_hartree'): b['thermochemistry'][k]+=.01\n        b=A['validate_analysis'](b)\n        r=A['evaluate_reaction_terms']([(1,'water')],[(1,'isomer')],{'water':a,'isomer':b},'water -> isomer')\n        self.assertAlmostEqual(r['delta_e_kj_mol'],.01*A['HARTREE_TO_KJMOL'])\n        self.assertAlmostEqual(r['delta_g_kj_mol'],.01*A['HARTREE_TO_KJMOL'])\n        self.assertAlmostEqual(r['log10_keq'],-.01*A['HARTREE_TO_KJMOL']*1000/(A['GAS_CONSTANT_J_MOL_K']*298.15*math.log(10)))\n\n    def test_reaction_mismatched_theory(self):\n        a=parse(); b=copy.deepcopy(a); b['basis']='def2-TZVP'\n        r=A['evaluate_reaction_terms']([(1,'a')],[(1,'b')],{'a':a,'b':b},'a -> b')\n        self.assertIsNone(r['delta_e_kj_mol']); self.assertIsNone(r['keq'])\n\n    def test_reaction_unbalanced_atoms(self):\n        a=parse(); b=copy.deepcopy(a); b['final_geometry'].pop()\n        with self.assertRaises(ValueError): A['evaluate_reaction_terms']([(1,'a')],[(1,'b')],{'a':a,'b':b},'a -> b')\n\n    def test_reaction_unbalanced_charge(self):\n        a=parse(); b=copy.deepcopy(a); b['system']['charge']=1\n        with self.assertRaises(ValueError): A['evaluate_reaction_terms']([(1,'a')],[(1,'b')],{'a':a,'b':b},'a -> b')\n\n    def test_nonfinite_is_json_null(self):\n        a=parse(); a['energies']['extra']=float('nan')\n        result=A['validate_analysis'](a)\n        self.assertIsNone(result['energies']['extra'])\n        json.dumps(result,allow_nan=False)\n\n    def test_spectrum_area_and_wavelength_jacobian(self):\n        import numpy as np\n        integrate = np.trapezoid if hasattr(np,'trapezoid') else np.trapz\n        grid=np.linspace(.001,5,30000)\n        density=A['_rf_gaussian_density']([(2.,.2),(3.,.1)],grid,.15)\n        self.assertAlmostEqual(float(integrate(density,grid)),.3,places=6)\n        lam=(1239.841984/grid)[::-1]\n        transformed=(density*grid**2/1239.841984)[::-1]\n        self.assertAlmostEqual(float(integrate(transformed,lam)),.3,places=6)\n\n\nclass WorkerChecks(unittest.TestCase):\n    def test_gaussian_maxdisk_bytes(self):\n        self.assertIn('MaxDisk=100000B',R['_cap_gaussian_maxdisk']('#p hf/sto-3g MaxDisk=100000B\\n\\nTitle\\n'))\n\n    def test_gaussian_link1_disk_caps(self):\n        text='#p hf/sto-3g MaxDisk=1TB\\n\\nTitle\\n--Link1--\\n#p hf/sto-3g MaxDisk=100MB\\n\\nTitle\\n'\n        capped=R['_cap_gaussian_maxdisk'](text)\n        self.assertIn('MaxDisk=20000MB',capped); self.assertIn('MaxDisk=100MB',capped)\n\n    def test_orca_maxdisk_existing(self):\n        text='%scf\\n MaxDisk 1000\\n MaxIter 100\\nend\\n! HF\\n'\n        self.assertEqual(R['_cap_orca_maxdisk'](text),text)\n\n    def test_orca_inline_maxdisk_not_duplicated(self):\n        text='%scf MaxIter 100 MaxDisk 1000 end\\n! HF\\n'\n        self.assertEqual(R['_cap_orca_maxdisk'](text),text)\n\n    def test_exact_input_and_prepared_execution(self):\n        with tempfile.TemporaryDirectory() as d:\n            raw='! HF\\r\\n'.encode('utf-16')\n            R.update(WORK_DIR=d,INPUT_FILE='job.inp',PREPARED_INPUT_TEXT='! HF\\n',ENCODED_FILES_JSON=base64.b64encode(json.dumps({'job.inp':base64.b64encode(raw).decode()}).encode()).decode())\n            R['_stage_uploaded_inputs']()\n            self.assertEqual(Path(d,'outputs','inputs','job.inp').read_bytes(),raw)\n            self.assertEqual(Path(d,'job.inp').read_bytes(),b'! HF\\n')\n\n    def test_lossless_file_parts(self):\n        with tempfile.TemporaryDirectory() as d:\n            R['WORK_DIR']=d; p=Path(d,'data.gbw'); raw=bytes(range(256))*8; p.write_bytes(raw)\n            blocks=[]\n            for part,i,n in R['_iter_file_parts'](str(p),chunk_bytes=300): blocks.append(Path(part).read_bytes())\n            self.assertEqual(b''.join(blocks),raw)\n\n    def test_nested_artifacts_are_preserved(self):\n        with tempfile.TemporaryDirectory() as d:\n            R['WORK_DIR']=d\n            source=Path(d,'sub','job.gbw'); source.parent.mkdir(); source.write_bytes(b'checkpoint')\n            results=Path(d,'outputs'); results.mkdir()\n            R['_collect_calculation_files'](str(results))\n            self.assertEqual((results/'calculation/sub/job.gbw').read_bytes(),b'checkpoint')\n\n    def test_report_paths_are_complete(self):\n        self.assertEqual(set(R['_bundle_file_paths']({'pdf':'p','analysis_json':'j','manifest':'m','publication_files':['a'],'csv_files':{'x':'c'}})),{'p','j','m','a','c'})\n\n    def test_redaction(self):\n        self.assertNotIn('test-only-secret',R['_redact_message']('https://api.telegram.org/bottest-only-secret/sendDocument'))\n\n\n"
+SELF_TEST_CODE = 'import base64, copy, hashlib, json, math, os, tempfile, unittest\nfrom pathlib import Path\nfrom unittest.mock import patch\nORCA = \'\'\'O   R   C   A\nProgram Version 6.1.0\n| 1> ! PBE0 def2-SVP Opt Freq\n| 2> * xyz 0 1\nYour calculation utilizes the basis: def2-SVP\nSCF CONVERGED AFTER 8 CYCLES\nFINAL SINGLE POINT ENERGY -75.000000000\nTHE OPTIMIZATION HAS CONVERGED\nCARTESIAN COORDINATES (ANGSTROEM)\nO 0.0 0.0 0.0\nH 0.8 0.0 0.6\nH -0.8 0.0 0.6\n\nVIBRATIONAL FREQUENCIES\n0: 0.0 cm**-1\n1: 0.0 cm**-1\n2: 0.0 cm**-1\n3: 0.0 cm**-1\n4: 0.0 cm**-1\n5: 0.0 cm**-1\n6: 1200.0 cm**-1\n7: 3200.0 cm**-1\n8: 3300.0 cm**-1\n\nIR SPECTRUM\nMode freq eps Int T**2 TX TY TZ\n6: 1200.0 0.001 10.0 0.002 (0.1 0.2 0.3)\n7: 3200.0 0.003 20.0 0.004 (0.2 0.3 0.4)\n8: 3300.0 0.005 30.0 0.006 (0.3 0.4 0.5)\n\nORBITAL ENERGIES\nNO OCC E(Eh) E(eV)\n0 2.0000 -1.000000 -27.211386\n1 2.0000 -0.250000 -6.802847\n2 0.0000 0.050000 1.360569\n\nABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS\nState Energy Wavelength fosc\n1 20000.0 500.0 0.2\n2 25000.0 400.0 0.1\n\nTHERMOCHEMISTRY AT 298.15K\nTemperature ... 298.15 K\nPressure ... 1.0 atm\nElectronic energy ... -75.000000000 Eh\nZero point energy ... 0.018 Eh\nTotal thermal energy -74.978 Eh\nThermal Enthalpy correction ... 0.00094421 Eh\nTotal Enthalpy ... -74.97705579 Eh\nFinal Gibbs free energy ... -75.0 Eh\nStandard-RRHO\nORCA TERMINATED NORMALLY\n\'\'\'\n\nPSI4 = \'\'\'Psi4: An Open-Source Ab Initio Electronic Structure Package\nPsi4 1.11\nset basis sto-3g\nReference: RHF\nGeometry (in Angstrom), charge = 0, multiplicity = 1:\nO 0.0 0.0 0.0\nH 0.8 0.0 0.6\nH -0.8 0.0 0.6\n\nEnergy and wave function converged.\n@RHF Final Energy: -75.000000\n==> Orbital Energies [Eh] <==\nDoubly Occupied:\n1A1 -1.0 2A1 -0.25\nVirtual:\n\n3A1 0.05 1B2 0.10\n\nProperty section\nOptimization is complete\nPsi4 exiting successfully\n\'\'\'\n\nGAUSSIAN = \'\'\'Gaussian 16: synthetic format regression\n #p b3lyp/6-31g(d) opt freq\n ------------------------------------\n Standard basis: 6-31G(d) (6D, 7F)\n Charge = 0 Multiplicity = 1\n SCF Done: E(RB3LYP) = -75.000000 A.U. after 10 cycles\n Optimization completed.\n Standard orientation:\n ---------------------------------------------------------------------\n Center Atomic Atomic Coordinates (Angstroms)\n Number Number Type X Y Z\n ---------------------------------------------------------------------\n 1 8 0 0.0 0.0 0.0\n 2 1 0 0.8 0.0 0.6\n 3 1 0 -0.8 0.0 0.6\n ---------------------------------------------------------------------\n Harmonic frequencies (cm**-1), IR intensities (KM/Mole)\n                      1             2              3\n Frequencies --   1200.0       3200.0         3300.0\n IR Inten    --     10.0         20.0           30.0\n - Thermochemistry -\n Temperature 298.15 Kelvin. Pressure 1.0 Atm.\n Zero-point correction= 0.018000 (Hartree/Particle)\n Thermal correction to Energy= 0.022000\n Thermal correction to Enthalpy= 0.02294421\n Thermal correction to Gibbs Free Energy= 0.000000\n Sum of electronic and zero-point Energies= -74.982000\n Sum of electronic and thermal Energies= -74.978000\n Sum of electronic and thermal Enthalpies= -74.97705579\n Sum of electronic and thermal Free Energies= -75.000000\n Normal termination of Gaussian 16\n\'\'\'\n\ndef parse(text=ORCA, name=\'water.out\'):\n    return A[\'parse_output_text\'](text, name)\n\n\nclass ScientificChecks(unittest.TestCase):\n    def test_orca_minimum_and_thermochemistry(self):\n        a = parse()\n        self.assertEqual(a[\'quality\'][\'status\'], \'PASS\')\n        self.assertEqual(a[\'expected_vibration_count\'], 3)\n        self.assertEqual(a[\'stationary_point_status\'], \'LIKELY_MINIMUM\')\n        self.assertTrue(a[\'quality\'][\'thermochemistry_reliable\'])\n        self.assertAlmostEqual(a[\'energies\'][\'final_energy_hartree\'], -75.0)\n\n    def test_source_hash(self):\n        self.assertEqual(parse()[\'source_sha256\'], hashlib.sha256(ORCA.encode()).hexdigest())\n\n    def test_finite_fortran_numbers(self):\n        self.assertEqual(A[\'_float\'](\'-1.5D+02\'), -150.)\n        self.assertIsNone(A[\'_float\'](\'NaN\'))\n        self.assertIsNone(A[\'_float\'](\'inf\'))\n\n    def test_termination_is_not_input_comment(self):\n        a = parse(ORCA.replace(\'ORCA TERMINATED NORMALLY\', \'| 9> # ORCA TERMINATED NORMALLY\'))\n        self.assertIsNone(a[\'normal_termination\'])\n        self.assertFalse(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_failed_calculation(self):\n        a = parse(ORCA.replace(\'ORCA TERMINATED NORMALLY\', \'ORCA finished by error termination\'))\n        self.assertEqual(a[\'quality\'][\'status\'], \'FAIL\')\n\n    def test_opt_failure_despite_normal_termination(self):\n        a = parse(ORCA.replace(\'THE OPTIMIZATION HAS CONVERGED\', \'The optimization did not converge\'))\n        self.assertEqual(a[\'quality\'][\'status\'], \'FAIL\')\n\n    def test_scf_failure_withholds_descriptors(self):\n        a = parse(ORCA.replace(\'SCF CONVERGED AFTER 8 CYCLES\', \'SCF NOT CONVERGED\'))\n        self.assertEqual(a[\'conceptual_dft\'], {})\n\n    def test_unknown_scf_withholds_minimum(self):\n        a = parse(ORCA.replace(\'SCF CONVERGED AFTER 8 CYCLES\', \'\'))\n        self.assertEqual(a[\'stationary_point_status\'], \'UNVERIFIED_ELECTRONIC_STATE\')\n        self.assertFalse(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_incomplete_frequencies(self):\n        a = parse(ORCA.replace(\'8: 3300.0 cm**-1\', \'\'))\n        self.assertFalse(a[\'quality\'][\'frequency_complete\'])\n        self.assertFalse(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_one_imaginary_is_candidate(self):\n        a = parse(ORCA.replace(\'6: 1200.0 cm**-1\', \'6: -120.0 cm**-1\'))\n        self.assertEqual(a[\'stationary_point_status\'], \'FIRST_ORDER_SADDLE_CANDIDATE\')\n        self.assertFalse(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_small_negative_is_not_ignored(self):\n        a = parse(ORCA.replace(\'6: 1200.0 cm**-1\', \'6: -3.0 cm**-1\'))\n        self.assertEqual(a[\'stationary_point_status\'], \'NEAR_ZERO_IMAGINARY_MODES\')\n\n    def test_linear_modes(self):\n        self.assertEqual(A[\'_molecule_mode_counts\']([dict(element=\'C\', x=0,y=0,z=0),dict(element=\'O\',x=0,y=0,z=1),dict(element=\'O\',x=0,y=0,z=-1)]), (3, True, 4))\n\n    def test_orca_bohr_conversion(self):\n        a = parse(ORCA.replace(\'(ANGSTROEM)\', \'(A.U.)\'))\n        self.assertAlmostEqual(a[\'final_geometry\'][1][\'x\'], .8*A[\'BOHR_TO_ANGSTROM\'])\n        self.assertEqual(a[\'source_geometry_units\'], \'bohr\')\n\n    def test_thermal_reference_mismatch(self):\n        a = parse(ORCA.replace(\'Electronic energy ... -75.000000000 Eh\', \'Electronic energy ... -76.000000000 Eh\'))\n        self.assertFalse(a[\'quality\'][\'thermochemical_energy_compatible\'])\n        self.assertFalse(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_missing_thermal_reference(self):\n        a = parse()\n        a[\'thermochemistry\'][\'electronic_energy_hartree\'] = None\n        a = A[\'validate_analysis\'](a)\n        self.assertIsNone(a[\'quality\'][\'thermochemical_energy_compatible\'])\n        self.assertFalse(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_orca_enthalpy_does_not_omit_zpe(self):\n        t = A[\'_orca_thermo_block\'](\'Electronic energy ... -75.0 Eh\\nThermal Enthalpy correction ... 0.001 Eh\')\n        self.assertIsNone(t[\'enthalpy_hartree\'])\n\n    def test_orca_enthalpy_from_total_u(self):\n        t = A[\'_orca_thermo_block\'](\'Electronic energy ... -75.0 Eh\\nTotal thermal energy -74.98 Eh\\nThermal Enthalpy correction ... 0.001 Eh\\nFinal entropy term ... 0.02 Eh\')\n        self.assertAlmostEqual(t[\'enthalpy_hartree\'], -74.979)\n        self.assertAlmostEqual(t[\'gibbs_hartree\'], -74.999)\n\n    def test_orca_enthalpy_from_total_correction(self):\n        t = A[\'_orca_thermo_block\'](\'Electronic energy ... -75.0 Eh\\nTotal correction 0.02 Eh\\nThermal Enthalpy correction ... 0.001 Eh\')\n        self.assertAlmostEqual(t[\'enthalpy_hartree\'], -74.979)\n\n    def test_orca_correction_fields_have_consistent_meanings(self):\n        t=parse()[\'thermochemistry\']\n        self.assertAlmostEqual(t[\'pv_correction_hartree\'],.00094421)\n        self.assertAlmostEqual(t[\'enthalpy_correction_hartree\'],.02294421)\n\n    def test_orca_solvent_protocol_blocks_gas_equilibrium(self):\n        a=parse(ORCA.replace(\'! PBE0 def2-SVP Opt Freq\',\'! PBE0 def2-SVP Opt Freq CPCM(Water)\'))\n        self.assertEqual(a[\'solvation_model\'],\'CPCM\')\n        self.assertEqual(a[\'solvent\'],\'Water\')\n        self.assertEqual(a[\'quality\'][\'standard_state\'],\'CONTINUUM_ELECTRONIC_PLUS_GAS_THERMAL_REFERENCE\')\n\n    def test_orca_ir_intensity_column(self):\n        self.assertEqual(tuple(parse()[\'ir_spectrum\'][0]), (1200.,10.))\n\n    def test_ir_missing_intensity_not_fabricated(self):\n        a = parse(ORCA.replace(\'Mode freq eps Int T**2 TX TY TZ\',\'unrecognized table header\'))\n        self.assertEqual(a[\'ir_spectrum\'], [])\n\n    def test_exact_correlated_method(self):\n        self.assertEqual(parse(ORCA.replace(\'! PBE0\', \'! DLPNO-CCSD(T1)\'))[\'method\'], \'DLPNO-CCSD(T1)\')\n\n    def test_orca_jobs_do_not_inherit(self):\n        a = parse(ORCA + \'\\nO   R   C   A\\n| 1> ! HF def2-SVP SP\\nSCF CONVERGED AFTER 4 CYCLES\\nFINAL SINGLE POINT ENERGY -74.0\\nORCA TERMINATED NORMALLY\\n\')\n        self.assertEqual(a[\'job_blocks_count\'], 2)\n        self.assertEqual(a[\'frequencies_cm1\'], [])\n        self.assertIsNone(a[\'thermochemistry\'][\'gibbs_hartree\'])\n\n    def test_psi4_energy_and_symmetry(self):\n        a = parse(PSI4,\'psi4.out\')\n        self.assertEqual(a[\'engine\'], \'Psi4\')\n        self.assertAlmostEqual(a[\'orbitals\'][\'homo_ev\'], -.25*A[\'HARTREE_TO_EV\'])\n        self.assertAlmostEqual(a[\'orbitals\'][\'lumo_ev\'], .05*A[\'HARTREE_TO_EV\'])\n\n    def test_psi4_correlated_energy_is_not_scf(self):\n        text = PSI4.replace(\'Psi4 exiting successfully\', \'MP2 total energy = -75.25\\nPsi4 exiting successfully\')\n        a = parse(text)\n        self.assertEqual(a[\'method\'], \'MP2\')\n        self.assertAlmostEqual(a[\'energies\'][\'final_energy_hartree\'], -75.25)\n\n    def test_psi4_bohr_units(self):\n        a = parse(PSI4.replace(\'(in Angstrom)\', \'(in Bohr)\'))\n        self.assertAlmostEqual(a[\'final_geometry\'][1][\'x\'], .8*A[\'BOHR_TO_ANGSTROM\'])\n\n    def test_psi4_explicit_ev_orbitals(self):\n        orbitals = A[\'_psi4_orbitals_v59\'](\'==> Orbital Energies [eV] <==\\nDoubly Occupied:\\n1A1 -5.0\\nVirtual:\\n2A1 1.0\\n\')\n        self.assertAlmostEqual(orbitals[\'homo_ev\'],-5.)\n        self.assertAlmostEqual(orbitals[\'lumo_ev\'],1.)\n\n    def test_psi4_spin_reset_for_final_table(self):\n        text=\'==> Orbital Energies [Eh] <==\\nAlpha Occupied: 1A1 -1.0\\nAlpha Virtual: 2A1 0.1\\nOther property\\n==> Orbital Energies [Eh] <==\\nDoubly Occupied: 1A1 -0.5\\nVirtual: 2A1 0.2\\n\'\n        orbitals=A[\'_psi4_orbitals_v59\'](text)\n        self.assertEqual(orbitals[\'orbitals\'][0][\'occ\'],2.)\n\n    def test_psi4_unknown_geometry_units(self):\n        a = parse(PSI4.replace(\'Geometry (in Angstrom)\', \'Final optimized geometry\'))\n        self.assertEqual(a[\'geometry_units\'], \'UNKNOWN\')\n        self.assertIsNone(a[\'expected_vibration_count\'])\n\n    def test_psi4_missing_cell_alignment(self):\n        f, ir = A[\'_parse_psi4_vibrations\'](\'Freq [cm^-1] 100.0 ---- 300.0\\nIR activ [km/mol] 10.0 20.0 30.0\\n\')\n        self.assertEqual(f,[100.,300.])\n        self.assertEqual(ir,[(100.,10.),(300.,30.)])\n\n    def test_psi4_multiple_jobs(self):\n        a = parse(PSI4 + \'\\nPsi4: An Open-Source Ab Initio Electronic Structure Package\\n@RHF Final Energy: -1.0\\nPsi4 exiting successfully\\n\')\n        self.assertEqual(a[\'job_blocks_count\'],2)\n        self.assertEqual(a[\'final_geometry\'],[])\n\n    def test_dipole_atomic_units(self):\n        d = A[\'_dipole_strict\'](\'Total Dipole Moment : -1.0 2.0 0.0\',\'ORCA\')\n        self.assertAlmostEqual(d[\'magnitude_debye\'],math.sqrt(5)*2.541746473)\n\n    def test_psi4_unknown_dipole_units(self):\n        self.assertEqual(A[\'_dipole_strict\'](\'Dipole Moment:\\nX: 1.0 Y: 2.0 Z: 0.0 Total: 2.2\',\'Psi4\'),{})\n\n    def test_gaussian_energy_and_thermal_sum(self):\n        a = parse(GAUSSIAN,\'water.log\')\n        self.assertEqual(a[\'engine\'],\'Gaussian\')\n        self.assertAlmostEqual(a[\'energies\'][\'final_energy_hartree\'],-75.)\n        self.assertTrue(a[\'quality\'][\'thermochemistry_reliable\'])\n\n    def test_gaussian_no_false_completion(self):\n        self.assertIsNone(parse(GAUSSIAN.replace(\'Normal termination of Gaussian 16\',\'\'))[\'normal_termination\'])\n\n    def test_gaussian_link1(self):\n        second = \'\\n--Link1--\\n #p hf/sto-3g sp\\n ----\\n SCF Done: E(RHF) = -74.0 A.U. after 3 cycles\\n Normal termination of Gaussian 16\\n\'\n        a = parse(GAUSSIAN + second)\n        self.assertEqual(a[\'job_blocks_count\'],2)\n        self.assertIsNone(a[\'thermochemistry\'][\'gibbs_hartree\'])\n\n    def test_gaussian_unsupported_composite(self):\n        a = parse(GAUSSIAN.replace(\'#p b3lyp/6-31g(d) opt freq\',\'#p ONIOM(b3lyp/6-31g(d):UFF) opt freq\'))\n        self.assertIsNone(a[\'energies\'][\'final_energy_hartree\'])\n\n    def test_reaction_balanced_and_comparable(self):\n        a = parse(); b = copy.deepcopy(a); b[\'filename\']=\'isomer.out\'\n        for k in (\'final_energy_hartree\',): b[\'energies\'][k]+=.01\n        for k in (\'electronic_energy_hartree\',\'electronic_reference_hartree\',\'enthalpy_hartree\',\'gibbs_hartree\'): b[\'thermochemistry\'][k]+=.01\n        b=A[\'validate_analysis\'](b)\n        r=A[\'evaluate_reaction_terms\']([(1,\'water\')],[(1,\'isomer\')],{\'water\':a,\'isomer\':b},\'water -> isomer\')\n        self.assertAlmostEqual(r[\'delta_e_kj_mol\'],.01*A[\'HARTREE_TO_KJMOL\'])\n        self.assertAlmostEqual(r[\'delta_g_kj_mol\'],.01*A[\'HARTREE_TO_KJMOL\'])\n        self.assertAlmostEqual(r[\'log10_keq\'],-.01*A[\'HARTREE_TO_KJMOL\']*1000/(A[\'GAS_CONSTANT_J_MOL_K\']*298.15*math.log(10)))\n\n    def test_reaction_mismatched_theory(self):\n        a=parse(); b=copy.deepcopy(a); b[\'basis\']=\'def2-TZVP\'\n        r=A[\'evaluate_reaction_terms\']([(1,\'a\')],[(1,\'b\')],{\'a\':a,\'b\':b},\'a -> b\')\n        self.assertIsNone(r[\'delta_e_kj_mol\']); self.assertIsNone(r[\'keq\'])\n\n    def test_reaction_unbalanced_atoms(self):\n        a=parse(); b=copy.deepcopy(a); b[\'final_geometry\'].pop()\n        with self.assertRaises(ValueError): A[\'evaluate_reaction_terms\']([(1,\'a\')],[(1,\'b\')],{\'a\':a,\'b\':b},\'a -> b\')\n\n    def test_reaction_unbalanced_charge(self):\n        a=parse(); b=copy.deepcopy(a); b[\'system\'][\'charge\']=1\n        with self.assertRaises(ValueError): A[\'evaluate_reaction_terms\']([(1,\'a\')],[(1,\'b\')],{\'a\':a,\'b\':b},\'a -> b\')\n\n    def test_nonfinite_is_json_null(self):\n        a=parse(); a[\'energies\'][\'extra\']=float(\'nan\')\n        result=A[\'validate_analysis\'](a)\n        self.assertIsNone(result[\'energies\'][\'extra\'])\n        json.dumps(result,allow_nan=False)\n\n    def test_spectrum_area_and_wavelength_jacobian(self):\n        import numpy as np\n        integrate = np.trapezoid if hasattr(np,\'trapezoid\') else np.trapz\n        grid=np.linspace(.001,5,30000)\n        density=A[\'_rf_gaussian_density\']([(2.,.2),(3.,.1)],grid,.15)\n        self.assertAlmostEqual(float(integrate(density,grid)),.3,places=6)\n        lam=(1239.841984/grid)[::-1]\n        transformed=(density*grid**2/1239.841984)[::-1]\n        self.assertAlmostEqual(float(integrate(transformed,lam)),.3,places=6)\n\n\nclass WorkerChecks(unittest.TestCase):\n    def test_gaussian_existing_installer_missing_interpreter_is_fixed(self):\n        import subprocess\n        with tempfile.TemporaryDirectory(prefix=\'gaussian test \') as d:\n            home=Path(d,\'g16\'); bsd=home/\'bsd\'; bsd.mkdir(parents=True)\n            installer=bsd/\'install\'\n            installer.write_bytes(b\'#!/missing/chembot/bin/sh\\r\\nprintf "installer-ready:%s\\\\n" "$g16root"\\r\\n\')\n            installer.chmod(0o750)\n            self.assertTrue(installer.is_file())\n            with self.assertRaises(FileNotFoundError):\n                subprocess.run([str(installer)],check=True)\n            self.assertEqual(R[\'_prepare_gaussian_runtime_files\'](str(home)),1)\n            with patch.dict(R,{\'WORK_DIR\':d}):\n                log=R[\'_run_gaussian_installer\'](str(installer),str(home),dict(os.environ,g16root=d))\n            self.assertIn(\'installer-ready:\'+d,Path(log).read_text())\n            self.assertNotIn(b\'\\r\\n\',installer.read_bytes())\n\n    def test_gaussian_runtime_binary_and_symlink_are_preserved(self):\n        import stat\n        with tempfile.TemporaryDirectory() as d:\n            home=Path(d,\'g16\'); bsd=home/\'bsd\'; bsd.mkdir(parents=True)\n            profile=bsd/\'g16.profile\'; profile.write_bytes(b\'\\xef\\xbb\\xbfexport g16root=/tmp\\r\\n\')\n            executable=home/\'l1.exe\'; raw=b\'\\x7fELF\\x00\\r\\n\\xff\'; executable.write_bytes(raw); executable.chmod(0o640)\n            link=home/\'linked.exe\'; link.symlink_to(\'l1.exe\')\n            self.assertEqual(R[\'_prepare_gaussian_runtime_files\'](str(home)),1)\n            self.assertEqual(executable.read_bytes(),raw)\n            self.assertTrue(link.is_symlink())\n            self.assertEqual(profile.read_bytes(),b\'export g16root=/tmp\\n\')\n            self.assertTrue(os.access(executable,os.X_OK))\n            for p in [home,bsd,profile,executable]:\n                self.assertEqual(stat.S_IMODE(p.stat().st_mode)&0o007,0)\n\n    def test_gaussian_csh_installer_honors_shell_and_flags(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\'); p.write_text(\'#!/missing/bin/csh -f\\nset hello = world\\n\')\n            with patch.object(R[\'shutil\'],\'which\',return_value=None), patch.dict(R,{\'_ensure_gaussian_csh\':lambda:\'/usr/bin/tcsh\'}):\n                self.assertEqual(R[\'_gaussian_install_command\'](str(p)),[\'/usr/bin/tcsh\',\'-f\',str(p)])\n\n    def test_gaussian_env_s_shebang_honors_shell(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\'); p.write_text(\'#!/usr/bin/env -S csh -f\\n\')\n            with patch.object(R[\'shutil\'],\'which\',return_value=None), patch.dict(R,{\'_ensure_gaussian_csh\':lambda:\'/usr/bin/tcsh\'}):\n                self.assertEqual(R[\'_gaussian_install_command\'](str(p)),[\'/usr/bin/tcsh\',\'-f\',str(p)])\n\n    def test_gaussian_csh_dependency_reused_without_install(self):\n        def forbidden(*args,**kwargs):\n            self.fail(\'An existing C shell must not trigger installation.\')\n        with patch.object(R[\'shutil\'],\'which\',return_value=\'/usr/bin/csh\'), patch.dict(R,{\'safe_install\':forbidden}):\n            self.assertEqual(R[\'_ensure_gaussian_csh\'](),\'/usr/bin/csh\')\n\n    def test_gaussian_missing_csh_is_installed_before_use(self):\n        calls=[]; installed=[False]\n        def which(name):\n            if name==\'apt-get\': return \'/usr/bin/apt-get\'\n            return \'/usr/bin/csh\' if installed[0] and name==\'csh\' else None\n        def install(command,**kwargs):\n            calls.append((command,kwargs))\n            if \'install\' in command: installed[0]=True\n        with patch.object(R[\'shutil\'],\'which\',side_effect=which), patch.object(R[\'os\'],\'geteuid\',return_value=0), patch.dict(R,{\'safe_install\':install}):\n            self.assertEqual(R[\'_ensure_gaussian_csh\'](),\'/usr/bin/csh\')\n        self.assertEqual(len(calls),2)\n        self.assertIn(\'update\',calls[0][0]); self.assertIn(\'tcsh\',calls[1][0])\n        self.assertTrue(all(call[1][\'max_seconds\']<=300 for call in calls))\n\n    def test_gaussian_missing_csh_without_privileges_has_clear_error(self):\n        def which(name): return \'/usr/bin/apt-get\' if name==\'apt-get\' else None\n        with patch.object(R[\'shutil\'],\'which\',side_effect=which), patch.object(R[\'os\'],\'geteuid\',return_value=1000):\n            with self.assertRaisesRegex(RuntimeError,\'csh.*missing\'):\n                R[\'_ensure_gaussian_csh\']()\n\n    def test_gaussian_csh_install_failure_is_not_hidden(self):\n        def which(name): return \'/usr/bin/apt-get\' if name==\'apt-get\' else None\n        def fail(*args,**kwargs): raise RuntimeError(\'test-only-secret: package unavailable\')\n        with patch.object(R[\'shutil\'],\'which\',side_effect=which), patch.object(R[\'os\'],\'geteuid\',return_value=0), patch.dict(R,{\'safe_install\':fail}):\n            with self.assertRaisesRegex(RuntimeError,\'C shell required\') as result:\n                R[\'_ensure_gaussian_csh\']()\n        self.assertNotIn(\'test-only-secret\',str(result.exception))\n        self.assertIn(\'package unavailable\',str(result.exception))\n\n    def test_gaussian_missing_installer_differs_from_broken_link(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\')\n            self.assertIsNone(R[\'_run_gaussian_installer\'](str(p),d,os.environ.copy()))\n            p.symlink_to(\'missing-target\')\n            with self.assertRaisesRegex(RuntimeError,\'broken link\'):\n                R[\'_run_gaussian_installer\'](str(p),d,os.environ.copy())\n\n    def test_gaussian_unknown_interpreter_has_clear_error(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\'); p.write_text(\'#!/missing/chembot_test_interpreter\\n\')\n            with self.assertRaisesRegex(RuntimeError,\'interpreter is missing\'):\n                R[\'_gaussian_install_command\'](str(p))\n\n    def test_gaussian_binary_installer_does_not_invoke_a_shell(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\'); p.write_bytes(b\'\\x7fELF\\x00binary\')\n            self.assertEqual(R[\'_gaussian_install_command\'](str(p)),[str(p)])\n\n    def test_gaussian_installer_nonzero_exit_preserves_stderr(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\'); p.write_text(\'#!/bin/sh\\necho installer-diagnostic >&2\\nexit 13\\n\')\n            with patch.dict(R,{\'WORK_DIR\':d}):\n                with self.assertRaisesRegex(RuntimeError,\'exit 13\') as result:\n                    R[\'_run_gaussian_installer\'](str(p),d,os.environ.copy())\n            self.assertIn(\'installer-diagnostic\',str(result.exception))\n            self.assertIn(\'installer-diagnostic\',Path(d,\'outputs\',\'gaussian_setup.log\').read_text())\n\n    def test_gaussian_installer_timeout_stops_the_process_group(self):\n        with tempfile.TemporaryDirectory() as d:\n            p=Path(d,\'install\'); p.write_text(\'#!/bin/sh\\nexec sleep 60\\n\')\n            with patch.dict(R,{\'WORK_DIR\':d,\'_phase_timeout\':lambda *args,**kwargs:.1}):\n                with self.assertRaisesRegex(TimeoutError,\'bsd/install exceeded\'):\n                    R[\'_run_gaussian_installer\'](str(p),d,os.environ.copy())\n\n    def test_gaussian_maxdisk_bytes(self):\n        self.assertIn(\'MaxDisk=100000B\',R[\'_cap_gaussian_maxdisk\'](\'#p hf/sto-3g MaxDisk=100000B\\n\\nTitle\\n\'))\n\n    def test_gaussian_link1_disk_caps(self):\n        text=\'#p hf/sto-3g MaxDisk=1TB\\n\\nTitle\\n--Link1--\\n#p hf/sto-3g MaxDisk=100MB\\n\\nTitle\\n\'\n        capped=R[\'_cap_gaussian_maxdisk\'](text)\n        self.assertIn(\'MaxDisk=20000MB\',capped); self.assertIn(\'MaxDisk=100MB\',capped)\n\n    def test_orca_maxdisk_existing(self):\n        text=\'%scf\\n MaxDisk 1000\\n MaxIter 100\\nend\\n! HF\\n\'\n        self.assertEqual(R[\'_cap_orca_maxdisk\'](text),text)\n\n    def test_orca_inline_maxdisk_not_duplicated(self):\n        text=\'%scf MaxIter 100 MaxDisk 1000 end\\n! HF\\n\'\n        self.assertEqual(R[\'_cap_orca_maxdisk\'](text),text)\n\n    def test_exact_input_and_prepared_execution(self):\n        with tempfile.TemporaryDirectory() as d:\n            raw=\'! HF\\r\\n\'.encode(\'utf-16\')\n            R.update(WORK_DIR=d,INPUT_FILE=\'job.inp\',PREPARED_INPUT_TEXT=\'! HF\\n\',ENCODED_FILES_JSON=base64.b64encode(json.dumps({\'job.inp\':base64.b64encode(raw).decode()}).encode()).decode())\n            R[\'_stage_uploaded_inputs\']()\n            self.assertEqual(Path(d,\'outputs\',\'inputs\',\'job.inp\').read_bytes(),raw)\n            self.assertEqual(Path(d,\'job.inp\').read_bytes(),b\'! HF\\n\')\n\n    def test_lossless_file_parts(self):\n        with tempfile.TemporaryDirectory() as d:\n            R[\'WORK_DIR\']=d; p=Path(d,\'data.gbw\'); raw=bytes(range(256))*8; p.write_bytes(raw)\n            blocks=[]\n            for part,i,n in R[\'_iter_file_parts\'](str(p),chunk_bytes=300): blocks.append(Path(part).read_bytes())\n            self.assertEqual(b\'\'.join(blocks),raw)\n\n    def test_nested_artifacts_are_preserved(self):\n        with tempfile.TemporaryDirectory() as d:\n            R[\'WORK_DIR\']=d\n            source=Path(d,\'sub\',\'job.gbw\'); source.parent.mkdir(); source.write_bytes(b\'checkpoint\')\n            results=Path(d,\'outputs\'); results.mkdir()\n            R[\'_collect_calculation_files\'](str(results))\n            self.assertEqual((results/\'calculation/sub/job.gbw\').read_bytes(),b\'checkpoint\')\n\n    def test_report_paths_are_complete(self):\n        self.assertEqual(set(R[\'_bundle_file_paths\']({\'pdf\':\'p\',\'analysis_json\':\'j\',\'manifest\':\'m\',\'publication_files\':[\'a\'],\'csv_files\':{\'x\':\'c\'}})),{\'p\',\'j\',\'m\',\'a\',\'c\'})\n\n    def test_redaction(self):\n        self.assertNotIn(\'test-only-secret\',R[\'_redact_message\'](\'https://api.telegram.org/bottest-only-secret/sendDocument\'))\n\n\n'
 
 exec(compile(ANALYZER_MODULE_CODE,'<scientific_analyzer>','exec'), globals())
 
@@ -6194,7 +6313,7 @@ def _run_self_tests():
 def _offline_cli():
     import argparse
     parser = argparse.ArgumentParser(
-        description='ChemBot 7.1.1: Telegram/Kaggle chemistry bot and conservative output analyzer.',
+        description='ChemBot 7.1.2: Telegram/Kaggle chemistry bot and conservative output analyzer.',
         epilog='Bot configuration: CHEMBOT_BOT_TOKEN, KAGGLE_USERNAME, KAGGLE_API_TOKEN (or KAGGLE_KEY), '
                'Optional owner overrides: CHEMBOT_ALLOWED_IDS=your Telegram user ID; CHEMBOT_ADMIN_ID=your ID. Original trusted IDs are used when omitted. '
                'Render Web Services automatically use HTTPS webhooks. Run without arguments to start the bot.')
@@ -6932,7 +7051,7 @@ try:
 except Exception as _auth_exc:
     KAGGLE_STARTUP_AUTH_OK = False
     KAGGLE_STARTUP_AUTH_ERROR = _redact_kaggle_error(_auth_exc)
-print(f"CHEMBOT v7.1.1 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle credentials={'configured' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
+print(f"CHEMBOT v7.1.2 is initialized with {BOT_WORKER_THREADS} Telegram workers; Kaggle credentials={'configured' if KAGGLE_STARTUP_AUTH_OK else 'FAILED'}")
 
 
 def authorized(message):
@@ -7275,7 +7394,7 @@ def start(message):
         user_aux_storage.pop(context_key,None)
         user_drive_links.pop(context_key,None)
     bot.reply_to(message,
-        "🧪 Computational Chemistry Bot v7.1.1\n"
+        "🧪 Computational Chemistry Bot v7.1.2\n"
         f"• Kaggle authentication mode: {_auth_mode_summary()}\n\n"
         "• Send ORCA .inp, Psi4 .dat, or a GaussianView .gjf/.com/.gau file to run on private Kaggle jobs.\n"
         "• The private Kaggle run link arrives as soon as Kaggle accepts the job; use /jobs to retrieve recent links.\n"
@@ -7294,7 +7413,7 @@ def version_command(message):
     if not authorized(message): return
     bot.reply_to(
         message,
-        'ChemBot build: v7.1.1-FINAL-20261013\n'
+        'ChemBot build: v7.1.2-FINAL-20261013\n'
         f'Kaggle username configured: {"yes" if bool(KAGGLE_USERNAME) else "no"}\n'
         f'Authentication mode: {_auth_mode_summary()}\n'
         f'Legacy kaggle.json prepared: {"yes" if bool(KAGGLE_AUTH_INFO.get("legacy_key")) else "no"}\n'
@@ -7606,7 +7725,7 @@ def run_render_webhook():
     max_update_bytes = int(os.environ.get("CHEMBOT_MAX_WEBHOOK_BYTES", str(2 * 1024 * 1024)))
 
     class TelegramWebhookHandler(BaseHTTPRequestHandler):
-        server_version = "ChemBotWebhook/7.1.1"
+        server_version = "ChemBotWebhook/7.1.2"
 
         def log_message(self, fmt, *args):
             # BaseHTTPRequestHandler includes the secret route in request logs.
@@ -7624,7 +7743,7 @@ def run_render_webhook():
                 payload = json.dumps({
                     "ok": True,
                     "service": "ChemBot",
-                    "version": "7.1.1",
+                    "version": "7.1.2",
                     "transport": "webhook",
                 }).encode("utf-8")
                 return self._reply(200, payload, "application/json; charset=utf-8")
@@ -7677,7 +7796,7 @@ def run_render_webhook():
         server.server_close()
         raise RuntimeError("Telegram setWebhook returned false.")
 
-    print(f"CHEMBOT v7.1.1 webhook mode active on port {port}.")
+    print(f"CHEMBOT v7.1.2 webhook mode active on port {port}.")
     print(f"Health check: {external_url}/health")
 
     shutting_down = threading.Event()
@@ -7718,7 +7837,7 @@ def run_polling():
         except Exception as exc:
             print(f"Warning: could not remove old webhook before polling: {exc}")
 
-    print("CHEMBOT v7.1.1 polling mode active. Ensure no other instance uses this bot token.")
+    print("CHEMBOT v7.1.2 polling mode active. Ensure no other instance uses this bot token.")
     try:
         bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as exc:
