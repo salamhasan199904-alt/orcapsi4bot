@@ -4,3 +4,4 @@ matplotlib>=3.7
 reportlab>=4.0
 numpy>=1.24
 requests>=2.31
+six==1.16.0
